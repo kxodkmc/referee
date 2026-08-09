@@ -1,0 +1,14 @@
+[package]
+name = "referee-core"
+version = "0.1.0"
+edition = "2021"
+description = "Industrial-grade microkernel: routing, backpressure, fault isolation"
+
+[dependencies]
+tokio       = { version = "1", features = ["full"] }
+dashmap     = "6"
+parking_lot = "0.12"
+thiserror   = "1"
+async-trait = "0.1"
+uuid        = { version = "1", features = ["v4"] }
+futures     = "0.3"
