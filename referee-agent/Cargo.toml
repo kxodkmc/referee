@@ -1,0 +1,45 @@
+[package]
+name = "referee-agent"
+version = "0.1.0"
+edition = "2021"
+description = "Agent runtime SDK on top of referee-core: LLM provider abstraction, sessions, tools"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# 默认启用第一批深度适配的厂商（OpenAI 兼容协议）
+default = ["xiaomi", "deepseek"]
+# 第一批厂商适配器
+xiaomi    = []
+deepseek  = []
+# 预留扩展点（Phase 0 不实现，保证接口稳定）
+openai        = []
+anthropic     = []
+responses     = []
+mcp-stdio     = []
+memory-persist = []
+
+[dependencies]
+# 内核（白名单内）
+referee-core = { path = "../referee-core" }
+# 白名单库
+tokio       = { version = "1", features = ["full"] }
+futures     = "0.3"
+async-trait = "0.1"
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+bytes       = "1"
+thiserror   = "1"
+tracing     = "0.1"
+dashmap     = "6"
+uuid        = { version = "1", features = ["v4", "serde"] }
+parking_lot = "0.12"
+metrics     = "0.22"
+# D1 已批准：HTTP 客户端（仅 referee-agent 使用，referee-core 不引入）
+reqwest     = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
+[dev-dependencies]
+tokio       = { version = "1", features = ["full", "test-util"] }
+tracing-subscriber = "0.3"
+parking_lot = "0.12"
