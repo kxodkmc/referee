@@ -8,8 +8,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use referee_core::{
-    CapabilityId, Envelope, Extension, InMemoryDlq, Kernel, KernelError, KernelResult,
-    MessageContext, SupervisionPolicy,
+    CapabilityId, Envelope, Extension, InMemoryDlq, Kernel, KernelContext, KernelError,
+    KernelResult, SupervisionPolicy,
 };
 
 // ───────────────────────────────────────────────
@@ -28,8 +28,8 @@ impl Extension for RecorderExtension {
         self.id
     }
 
-    async fn handle(&self, ctx: MessageContext) -> KernelResult<()> {
-        self.order.lock().push(ctx.envelope.priority);
+    async fn handle(&self, _ctx: KernelContext, env: Envelope) -> KernelResult<()> {
+        self.order.lock().push(env.priority);
         tokio::time::sleep(Duration::from_millis(1)).await;
         Ok(())
     }
@@ -47,7 +47,7 @@ impl Extension for FlakyExtension {
         self.id
     }
 
-    async fn handle(&self, _ctx: MessageContext) -> KernelResult<()> {
+    async fn handle(&self, _ctx: KernelContext, _env: Envelope) -> KernelResult<()> {
         if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
             panic!("simulated one-time crash");
         }
@@ -66,7 +66,7 @@ impl Extension for PanicExtension {
         self.id
     }
 
-    async fn handle(&self, _ctx: MessageContext) -> KernelResult<()> {
+    async fn handle(&self, _ctx: KernelContext, _env: Envelope) -> KernelResult<()> {
         panic!("simulated persistent crash");
     }
 }
@@ -83,7 +83,7 @@ impl Extension for SlowConsumerExtension {
         self.id
     }
 
-    async fn handle(&self, _ctx: MessageContext) -> KernelResult<()> {
+    async fn handle(&self, _ctx: KernelContext, _env: Envelope) -> KernelResult<()> {
         self.count.fetch_add(1, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(10)).await;
         Ok(())

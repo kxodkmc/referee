@@ -17,6 +17,8 @@ pub enum KernelError {
     InvalidResponse,
     #[error("system is shutting down")]
     SystemShuttingDown,
+    #[error("storage failure: wal append failed")]
+    Storage,
 }
 
 pub type KernelResult<T> = Result<T, KernelError>;

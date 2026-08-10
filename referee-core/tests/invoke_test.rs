@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use referee_core::{
-    CapabilityId, Envelope, Extension, Kernel, KernelError, KernelResult, MessageContext,
+    CapabilityId, Envelope, Extension, Kernel, KernelContext, KernelError, KernelResult,
     SupervisionPolicy,
 };
 use tokio::time::sleep;
@@ -22,11 +22,10 @@ impl Extension for EchoExtension {
         self.id
     }
 
-    async fn handle(&self, ctx: MessageContext) -> KernelResult<()> {
-        let req = ctx.envelope.clone();
+    async fn handle(&self, ctx: KernelContext, env: Envelope) -> KernelResult<()> {
         let mut resp = Envelope::new();
         // 遵循契约：响应信封必须携带请求的 correlation_id
-        resp.correlation_id = req.correlation_id;
+        resp.correlation_id = env.correlation_id;
         ctx.reply(resp)
     }
 }
@@ -44,7 +43,7 @@ impl Extension for DelayExtension {
         self.id
     }
 
-    async fn handle(&self, ctx: MessageContext) -> KernelResult<()> {
+    async fn handle(&self, ctx: KernelContext, _env: Envelope) -> KernelResult<()> {
         sleep(Duration::from_millis(200)).await;
         let resp = Envelope::new();
         ctx.reply(resp)

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use referee_core::{
-    CapabilityId, Envelope, Extension, Kernel, KernelError, KernelResult, MessageContext,
+    CapabilityId, Envelope, Extension, Kernel, KernelContext, KernelError, KernelResult,
     SupervisionPolicy,
 };
 
@@ -23,7 +23,7 @@ impl Extension for PanicExtension {
         self.id
     }
 
-    async fn handle(&self, _ctx: MessageContext) -> KernelResult<()> {
+    async fn handle(&self, _ctx: KernelContext, _env: Envelope) -> KernelResult<()> {
         panic!("simulated crash!");
     }
 }
@@ -42,7 +42,7 @@ impl Extension for DeadLoopExtension {
         self.id
     }
 
-    async fn handle(&self, _ctx: MessageContext) -> KernelResult<()> {
+    async fn handle(&self, _ctx: KernelContext, _env: Envelope) -> KernelResult<()> {
         // 纯 CPU 死循环，不主动 yield — 永久占用单个 Tokio Worker
         loop {
             std::hint::spin_loop();

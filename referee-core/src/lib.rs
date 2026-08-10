@@ -9,5 +9,6 @@ pub mod kernel;
 // 顶层快捷重导出
 pub use common::{Envelope, KernelError, KernelResult};
 pub use extension::dlq::{DlqSink, InMemoryDlq};
-pub use extension::{CapabilityId, Extension, MessageContext};
+pub use extension::{CapabilityId, Extension, KernelContext, MessageContext};
+pub use kernel::wal::{InMemoryWal, WalSink};
 pub use kernel::{Kernel, SupervisionPolicy};

@@ -11,6 +11,8 @@
 | Phase 2 | 原语与上下文（invoke） | ✅ 已完成 | — |
 | Phase 3 | 容错与隔离（catch_unwind） | ✅ 已完成 | — |
 | Phase 4 | 治理与生命周期闭环（优先级 / 自愈 / 停机 / DLQ） | ✅ 已完成 | — |
+| Phase 5 | 可观测层（tracing 全链路关联 + metrics 核心指标） | ✅ 已完成 | — |
+| Phase 6 | 健壮性深化与并发安全（KernelContext / 老化防饥饿 / 状态路由原子合并 / WAL） | ✅ 已完成 | — |
 
 ## Phase 1 — 骨架与背压验证（已完成）
 
@@ -162,52 +164,142 @@ cargo clippy --all-targets -- -D warnings            # 零警告
 cargo fmt --check                                    # 格式整洁
 ```
 
+## Phase 5 — 可观测层（已完成）
+
+### 交付范围
+
+| 项 | 状态 | 位置 |
+|----|------|------|
+| 新增依赖：`tracing` / `metrics`（门面），`tracing-subscriber`（dev） | ✅ | `referee-core/Cargo.toml` |
+| `CapabilityId` 实现 `Display` | ✅ | `referee-core/src/extension/mod.rs` |
+| `dispatch` 入口 `kernel_dispatch` Span（trace_id 穿透）+ `referee_dispatch_total` 计数 | ✅ | `referee-core/src/kernel/mod.rs` |
+| `handle_observed`：`extension_handle` Span + 延迟直方图 + Panic 计数器（先 catch_unwind 再 instrument） | ✅ | `referee-core/src/kernel/supervisor.rs` |
+| 优先级通道共享 `Arc<AtomicUsize>` 深度计数 + `referee_queue_depth` gauge | ✅ | `referee-core/src/kernel/priority.rs` |
+| 新增测试：Span 关联 / 队列深度 / 延迟与 Panic / 路由失败 | ✅ | `referee-core/tests/observability_test.rs` |
+
+### 验收清单（Phase 5 结果）
+
+| # | 检查项 | 预期 | 结果 |
+|---|--------|------|------|
+| 1 | `cargo build` | 零错误 | ✅ |
+| 2 | `cargo clippy --all-targets -- -D warnings` | 零警告 | ✅ |
+| 3 | `cargo fmt --check` | 格式整洁 | ✅ |
+| 4 | Span 穿透 | `kernel_dispatch` 与 `extension_handle` 的日志行共享同一 `trace_id` | ✅ |
+| 5 | 队列深度 | emit 5 条深度=5；消费后回落 0 | ✅ |
+| 6 | 处理延迟 | sleep 100ms 扩展耗时记录 ~0.1s，`outcome=ok` | ✅ |
+| 7 | Panic 指标 | `outcome=panic` 耗时记录 + `referee_extension_panics_total` 递增 | ✅ |
+| 8 | 路由失败 | 满队列时 `referee_dispatch_total{result=full}` 递增 | ✅ |
+| 9 | 全量回归 | Phase 1 ~ 5 共 17 条测试全绿 | ✅ |
+
+### 对执行文档的偏差（有意为之，均已验证）
+
+| 偏差 | 原因 |
+|------|------|
+| `metrics` 版本保持 0.22，测试自写内存 Recorder（约 80 行） | `metrics` 0.22 **没有** `testing` feature（0.23+ 才有）；自写 Recorder 实现 `metrics::Recorder` trait（register 去重 + 句柄共享），不引入新依赖 |
+| `dispatch` 用 `.instrument(span).await` 而非方案中的 `span.enter()` | async fn 中 `enter()` guard 在 await 挂起期间保持线程 current span，会污染同线程其他任务的日志归属；`instrument` 仅在 poll 时进入，语义正确 |
+| `priority.rs` 的 `update_depth` 用 `fetch_update + checked_sub` | 方案写法 `fetch_sub(1) - 1` 在 depth=0 时会回绕成天文数字；`checked_sub` 原子防下溢（正常协议下 recv 先于 send 成功，此为防御性兜底） |
+| 测试 1 用已知 `trace_id` 过滤断言行 | 并行测试输出混入同一 buffer，按本请求的 trace_id 精确匹配，杜绝 flaky |
+| 测试 2 用 `PrioritySender` 直连（不 recv）验证深度 | 「向扩展 emit 5 条且不消费」通过不 recv 的直连通道确定性复现，避免 supervisor 异步消费竞态 |
+| 测试初始化重定向 fmt 输出到共享 buffer | `TestWriter` 走 `print!` 依赖 libtest 捕获，无法程序化断言；自定义 `SharedWriter`（`MakeWriter` 写回 `Arc<Mutex<Vec<u8>>>`）+ `with_ansi(false)` |
+
+## Phase 6 — 健壮性深化与并发安全（已完成）
+
+### 交付范围
+
+| 项 | 状态 | 位置 |
+|----|------|------|
+| `KernelContext` 受限上下文注入 `handle`（emit / reply / spawn_blocking，无 invoke） | ✅ | `referee-core/src/extension/context.rs` |
+| `Extension` trait 签名变更：`handle(&self, ctx: KernelContext, env: Envelope)` | ✅ | `referee-core/src/extension/mod.rs` |
+| 自定义优先级队列：`Mutex<VecDeque>` + `Notify`，Low 老化优先防饥饿 + 关闭语义 | ✅ | `referee-core/src/kernel/priority.rs` |
+| 状态与路由原子合并：`RouteEntry{sender, state}`，dispatch 同锁判定 | ✅ | `referee-core/src/kernel/router.rs` |
+| Monitor 瘦身为全局治理状态（扩展状态并入 Router） | ✅ | `referee-core/src/kernel/monitor.rs` |
+| WAL：`WalSink` trait + `InMemoryWal`，dispatch 落盘 / 监督器 ACK / 恢复通道 | ✅ | `referee-core/src/kernel/wal.rs` |
+| `Envelope` 增加 `target`（恢复路由）与 `queued_at`（老化判定）；`KernelError::Storage` | ✅ | `referee-core/src/common/` |
+| Kernel：`with_wal` / `with_dlq_wal` 构造、dispatch 预检 + WAL、`start_with_recovery` | ✅ | `referee-core/src/kernel/mod.rs` |
+| 新增测试：老化防饥饿 / WAL 记录与 ACK / WAL 恢复 / emit 穿透 / spawn_blocking / 恢复失败 DLQ / 同 id 重注册 / Panic ACK | ✅ | `referee-core/tests/robustness_test.rs` |
+
+### 验收清单（Phase 6 结果）
+
+| # | 检查项 | 预期 | 结果 |
+|---|--------|------|------|
+| 1 | `cargo build` | 零错误 | ✅ |
+| 2 | `cargo clippy --all-targets -- -D warnings` | 零警告 | ✅ |
+| 3 | `cargo fmt --check` | 格式整洁 | ✅ |
+| 4 | 老化防饥饿 | 持续 High 负载下 Low 在 1s 阈值内被消费（`robustness_test` 用例 1） | ✅ |
+| 5 | WAL 记录 + ACK | dispatch 落盘 → handle 成功 → `pending_len()==0` | ✅ |
+| 6 | WAL 恢复 | 未确认消息重放至扩展，处理成功 ACK；二次恢复不重复投递 | ✅ |
+| 7 | 恢复失败兜底 | 恢复投递失败 → ACK（防无限重放）+ 进 DLQ | ✅ |
+| 8 | 受限通信 | `ctx.emit` 可送达目标扩展；`ctx.spawn_blocking` 可用 | ✅ |
+| 9 | 全量回归 | Phase 1 ~ 6 共 25 条测试全绿 | ✅ |
+
+### 对执行文档的偏差（有意为之，均已验证）
+
+| 偏差 | 原因 |
+|------|------|
+| `KernelContext` 保留 `reply` 方法 | 规划仅列 emit / spawn_blocking，但 invoke 原语（Phase 2 验收）依赖回信通道；`reply` 是非阻塞发送，不构成嵌套等待死锁，故保留 |
+| 老化实现修正：Low 头部超阈值**优先于** High 消费 | 规划代码只在 high/norm 空时检查 low 老化，无法解决持续 High 负载下的饥饿；改为老化优先 + 无竞争时 Low 直接消费（最多饿 1s） |
+| 通道关闭语义修正：最后一个 Sender drop 置 `closed` 标志 + `notify_one` | 规划代码「队列空即返回 None」错误（空 ≠ 关闭，会让监督循环立即退出）；`PrioritySender::Drop` 用 `Arc::strong_count==2` 判定最后一个 Sender |
+| `Monitor` 未完全废弃 | 扩展状态并入 Router（`RouteEntry`），但全局治理状态（Stopping 拦截）与 `is_stopping` 保留在 Monitor，语义独立 |
+| WAL `recover` 返回 `Vec<(Uuid, Envelope)>` | 规划返回 `Vec<Envelope>` 丢失日志 ID，恢复后无法 ACK 对应记录（会造成无限重放）；恢复消息携带原 WAL ID，处理成功自动 ACK |
+| WAL ACK 由监督器在 `handle` 成功后自动触发 | 规划称「通过 KernelContext 触发」但未给出方法；监督器统一 ACK 使扩展对持久化无感，panic 消息不 ACK（崩溃重放兜底） |
+| `Envelope` 增加 `target: Uuid` 与 `queued_at: Instant` | 规划代码引用 `env.target` / `ctx.envelope.queued_at` 但原结构无此字段；target 用 `Uuid` 而非 `CapabilityId`，避免 common → extension 分层反向依赖 |
+| dispatch 采用「状态预检 + 原子投递」两层 | WAL 落盘决策需先于投递判定状态（不为注定失败投递落盘）；最终投递仍以 `router.dispatch` 同锁原子判定为准（状态可能预检后变化） |
+| 队列 `recv` / `try_recv` 改为 `&self` | 自定义实现内部锁 + Notify，无需 `&mut self`；supervisor 调用处兼容 |
+| 路由条目引入注册代际（`gen`） | 同 id 注销后快速重注册时，旧监督任务退出若直接 `get_state==Running → Stopped` 会误置新条目；代际匹配才收敛（review 修复） |
+| Panic 消费尝试后同样 ACK | 进程内 `catch_unwind` 捕获的 panic 若留在 WAL 会无界滞留且存活期恢复重复投递；进程级崩溃时该行不执行，重放语义不变（review 修复） |
+| 扩展运行时注入 `KernelView`（不含 task 集合）而非 `Kernel` | 打破「task → Kernel → task 集合 → task」循环引用：死循环扩展在 Kernel 释放后仍可被 JoinSet drop 强制中止（review 修复） |
+
 ## 当前源码结构
 
 ```
 referee-core/
 ├── Cargo.toml
 ├── src/
-│   ├── lib.rs                  # 顶层重导出（Kernel / Envelope / CapabilityId / SupervisionPolicy / DlqSink / InMemoryDlq）
+│   ├── lib.rs                  # 顶层重导出（Kernel / Envelope / CapabilityId / KernelContext / SupervisionPolicy / DlqSink / InMemoryDlq / WalSink / InMemoryWal）
 │   ├── common/                 # 纯数据载体，不含逻辑句柄
-│   │   ├── error.rs            # KernelError（... / Timeout / InvalidResponse / SystemShuttingDown）
-│   │   └── envelope.rs         # Envelope：四 ID + priority + metadata
+│   │   ├── error.rs            # KernelError（... / SystemShuttingDown / Storage）
+│   │   └── envelope.rs         # Envelope：target/queued_at + 四 ID + priority + metadata
 │   ├── extension/              # SDK 侧契约
-│   │   ├── mod.rs              # CapabilityId（Copy）+ Extension trait（id / handle）
-│   │   ├── context.rs          # MessageContext：reply(self) 消费式回信，with_reply 注入回信通道
+│   │   ├── mod.rs              # CapabilityId（Copy + Display）+ Extension trait（handle(ctx, env)）
+│   │   ├── context.rs          # KernelContext（emit/reply/spawn_blocking）+ MessageContext（队列元素）
 │   │   └── dlq.rs              # DlqSink trait + InMemoryDlq（环形缓冲，容量受限防 OOM）
 │   └── kernel/                 # 内核聚合
-│       ├── monitor.rs          # ExtensionState 状态机 + GlobalState 全局治理状态（parking_lot::RwLock，读优先）
-│       ├── priority.rs         # PrioritySender/Receiver：三分桶有界通道，biased 严格优先级消费
-│       ├── router.rs           # DashMap<CapabilityId, PrioritySender>，dispatch 统一分发 + 被拒 Envelope 回传
-│       ├── shutdown.rs         # ShutdownTx/ShutdownRx：watch 广播停机信号，subscribe 派生多接收端
-│       ├── supervisor.rs       # ExtensionRuntime + SupervisionPolicy：重启决策 / 指数退避 / drain 模式
-│       └── mod.rs              # Kernel 入口（register/unregister/emit/invoke/shutdown_graceful/dispatch）
+│       ├── monitor.rs          # GlobalState 全局治理状态（Stopping 拦截）
+│       ├── priority.rs         # 自定义三分桶有界队列：老化防饥饿 + Notify 唤醒 + 深度 gauge
+│       ├── router.rs           # DashMap<CapabilityId, RouteEntry{sender,state}>，原子状态+路由分发
+│       ├── wal.rs              # WalSink trait + InMemoryWal（崩溃兜底 / 恢复通道）
+│       ├── shutdown.rs         # ShutdownTx/Rx：watch 广播停机信号，subscribe 派生多接收端
+│       ├── supervisor.rs       # ExtensionRuntime：KernelContext 组装 + WAL ACK + 重启决策 / drain
+│       └── mod.rs              # Kernel 入口（register/emit/invoke/shutdown_graceful/start_with_recovery/dispatch）
 └── tests/
     ├── backpressure_test.rs    # 3 条 Phase 1 测试
     ├── invoke_test.rs          # 3 条 Phase 2 测试
     ├── isolation_test.rs       # 2 条 Phase 3 测试
-    └── governance_test.rs      # 5 条 Phase 4 测试
+    ├── governance_test.rs      # 5 条 Phase 4 测试
+    ├── observability_test.rs   # 4 条 Phase 5 测试
+    └── robustness_test.rs      # 8 条 Phase 6 测试
 ```
 
-## 关键设计决策（P1 ~ P4 已落地）
+## 关键设计决策（P1 ~ P6 已落地）
 
 | 决策 | 理由 |
 |------|------|
 | `try_send` 而非 `send().await` | 背压即时拒绝，不阻塞调用方 |
-| `DashMap` + `PrioritySender` | 并发读路由零锁争用；PrioritySender 内部 Sender Clone 廉价 |
-| Monitor 用 `parking_lot::RwLock` | 状态读远多于写，读优先 |
+| 自定义优先级队列（`Mutex<VecDeque>` + `Notify`） | 需要头部 peek 做老化探测（`tokio::mpsc` 无此能力）；`notify_one` 存储 permit，无通知丢失竞态 |
+| Low 老化优先（1s 阈值） | 严格优先级在持续 High 负载下会永久饿死 Low；老化优先保证 Low 最多延迟 1s |
+| 状态与路由合并（`RouteEntry{sender,state}`） | register/unregister 与并发 dispatch 无盲区窗口，杜绝消息静默丢失 |
+| `KernelContext` 注入取代完整 Kernel | handle 内仅 emit / reply / spawn_blocking，编译期切断嵌套 invoke 死锁链条 |
+| WAL 先落盘再入队 | 进程级崩溃（OOM Kill / 断电）后未确认消息经恢复通道重放（at-least-once） |
+| 恢复通道绕过 WAL 追加 | 防止恢复消息被重复落盘形成死循环；恢复消息带原 WAL ID，成功即 ACK |
 | Router / Monitor 内部 `Arc` 包装 | 廉价 Clone，可在 spawned task 间共享 |
 | 运行循环在 register 中派生 | 通道创建后立即激活消费端，避免消息黑洞 |
 | 循环退出时标记 `Stopped` | unregister 移除路由 → Sender drop → 通道关闭 → 循环自然退出 |
-| `MessageContext.reply_to` 私有 | 仅 `reply()` 可访问，防误用 |
-| `Router::dispatch` 统一入口 | emit / invoke 共用同一底层发送路径，消除重复逻辑 |
 | `invoke` 用 `oneshot` + `timeout` | 响应与请求强关联；超时自动切断，无悬挂 Sender |
 | 优先级三分桶独立有界 | High 永不被满的 Low 桶阻塞；biased 消费杜绝优先级反转 |
 | 监督两层循环 | 外层保通道重启不丢消息；内层 catch_unwind 隔离 |
 | 停机用 `JoinSet` 统一跟踪 | register 收集全部运行时 task，shutdown 时统一 join / 超时 abort_all |
-| dispatch 三级拦截（停机 → 状态 → 路由） | 单一入口强制全局状态治理，所有拦截点统一写 DLQ |
-| `DlqSink` trait 注入 | 死信实现可替换（持久化 / 观测 / 测试），内核不绑定具体实现 |
+| dispatch 拦截链（停机 → 状态预检 → WAL → 原子投递） | 单一入口强制全局状态治理，所有拦截点统一写 DLQ |
+| `DlqSink` / `WalSink` trait 注入 | 死信与持久化实现可替换，内核不绑定具体后端 |
 
 ## 历史偏差记录
 
@@ -222,12 +314,13 @@ referee-core/
 
 ## 后续阶段待办
 
-> Phase 1 ~ 4 已全部完成，当前无待办。
+> Phase 1 ~ 6 已全部完成，当前无待办。
 
 ## 开工前核对清单
 
 1. `cargo build` / `cargo clippy --all-targets -- -D warnings` / `cargo fmt --check` 零告警
-2. 有界分配：无新引入无界 buffer / HashMap（优先级桶、DLQ 环形缓冲均容量受限）
+2. 有界分配：无新引入无界 buffer / HashMap（优先级桶、DLQ 环形缓冲、WAL 内存实现均容量受限或语义等价）
 3. Panic 隔离：不破坏 `catch_unwind` 边界
 4. 数据/行为分离：Envelope 仍为纯数据，不引入逻辑句柄
 5. 依赖变更须先同步 AGENTS.md 清单
+6. 死锁防线：扩展 `handle` 内仅 `emit` / `reply` / `spawn_blocking`，无 `invoke` 注入

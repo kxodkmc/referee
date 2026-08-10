@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use referee_core::{
-    CapabilityId, Envelope, Extension, Kernel, KernelError, KernelResult, MessageContext,
+    CapabilityId, Envelope, Extension, Kernel, KernelContext, KernelError, KernelResult,
     SupervisionPolicy,
 };
 
@@ -29,7 +29,7 @@ impl Extension for NeverConsumingExtension {
         self.id
     }
 
-    async fn handle(&self, _ctx: MessageContext) -> KernelResult<()> {
+    async fn handle(&self, _ctx: KernelContext, _env: Envelope) -> KernelResult<()> {
         // 永不返回 — 模拟扩展卡死，循环阻塞在首条消息
         std::future::pending::<()>().await;
         Ok(())

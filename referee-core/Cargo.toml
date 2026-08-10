@@ -12,3 +12,9 @@ thiserror   = "1"
 async-trait = "0.1"
 uuid        = { version = "1", features = ["v4"] }
 futures     = "0.3"
+# 可观测性门面：内核只依赖门面，后端由应用层在 main 中组装
+tracing     = "0.1"
+metrics     = "0.22"
+
+[dev-dependencies]
+tracing-subscriber = "0.3"
