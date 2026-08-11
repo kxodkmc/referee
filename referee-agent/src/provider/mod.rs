@@ -26,6 +26,7 @@ pub mod deepseek;
 #[cfg(feature = "xiaomi")]
 pub mod xiaomi;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -40,23 +41,30 @@ use thiserror::Error;
 
 /// 厂商 + 模型的唯一标识（路由 / 日志 / 缓存键）
 ///
-/// 设计为 `&'static str` 包装而非 enum：新增厂商无需修改本类型，
-/// 各适配器以 `const` 形式导出自己的标识。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ProviderId(&'static str);
+/// 设计为字符串包装而非 enum：新增厂商无需修改本类型，各适配器以 `const`
+/// 形式导出自己的标识；订阅计划等运行时接入身份（Token Plan / Code Plan 等）
+/// 通过 [`ProviderId::owned`] 构造，无需新增适配器或修改本类型。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProviderId(Cow<'static, str>);
 
 impl ProviderId {
     pub const fn new(v: &'static str) -> Self {
-        Self(v)
+        Self(Cow::Borrowed(v))
     }
-    pub fn as_str(&self) -> &'static str {
-        self.0
+
+    /// 运行时构造 — 订阅计划等动态接入身份（如 `"tokenplan/mimo-v2.5-pro"`）
+    pub fn owned(v: String) -> Self {
+        Self(Cow::Owned(v))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_ref()
     }
 }
 
 impl std::fmt::Display for ProviderId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0)
+        f.write_str(self.as_str())
     }
 }
 
@@ -399,6 +407,12 @@ pub enum LlmError {
     RateLimited { retry_after: Option<Duration> },
     #[error("bad request: {0}")]
     BadRequest(String),
+    /// 余额不足（HTTP 402）— 用户可行动错误：充值后重试，重试策略不生效
+    #[error("insufficient balance: {0}")]
+    InsufficientBalance(String),
+    /// 内容被审核拦截（HTTP 421，MiMo 特有语义）— 确定性错误，不重试
+    #[error("content blocked by moderation: {0}")]
+    ContentBlocked(String),
     #[error("server error ({status}): {body}")]
     Server { status: u16, body: String },
     #[error("authentication failed")]

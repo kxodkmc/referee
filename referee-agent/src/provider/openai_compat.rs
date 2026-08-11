@@ -246,7 +246,13 @@ async fn map_http_error(resp: reqwest::Response) -> LlmError {
         401 | 403 => LlmError::Auth,
         408 => LlmError::Timeout,
         429 => LlmError::RateLimited { retry_after },
-        400 | 402 | 422 => LlmError::BadRequest(format!("HTTP {status_code}: {body}")),
+        // 402 余额不足：两家（MiMo / DeepSeek）语义一致，均为确定性用户可行动错误
+        402 => LlmError::InsufficientBalance(format!("HTTP {status_code}: {body}")),
+        // 404 资源/能力不存在（MiMo：模型不支持图像输入）— 确定性错误，不重试
+        404 => LlmError::BadRequest(format!("HTTP {status_code}: {body}")),
+        // 421 内容审核拦截（MiMo 特有语义）— 确定性错误，不重试
+        421 => LlmError::ContentBlocked(format!("HTTP {status_code}: {body}")),
+        400 | 422 => LlmError::BadRequest(format!("HTTP {status_code}: {body}")),
         500..=599 => LlmError::Server {
             status: status_code,
             body,

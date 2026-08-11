@@ -3,7 +3,7 @@
 //! 重点覆盖 DeepSeek 独有特性：
 //! - `reasoning_effort` 参数（low/high/max，MiMo 不支持）
 //! - `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` 缓存命中指标
-//! - 402 余额不足 → `BadRequest` 归一（DeepSeek 特有错误码）
+//! - 402 余额不足 → `InsufficientBalance` 归一（与 MiMo 共享语义）
 //! - `thinking` 开关（与 MiMo 协议一致，但独立验证以隔离 regression）
 
 mod common;
@@ -334,10 +334,10 @@ async fn thinking_toggle_disabled_writes_disabled_type() {
 }
 
 // ───────────────────────────────────────────────
-// 测试 7：错误归一 — 402 余额不足 → BadRequest（DeepSeek 特有错误码）
+// 测试 7：错误归一 — 402 余额不足 → InsufficientBalance（两家共有语义）
 // ───────────────────────────────────────────────
 #[tokio::test]
-async fn error_normalization_402_balance_maps_to_bad_request() {
+async fn error_normalization_402_balance_maps_to_insufficient_balance() {
     let server = MockServer::start(|_| MockResponse::Raw {
         status: 402,
         headers: vec![("Content-Type".into(), "application/json".into())],
@@ -351,8 +351,8 @@ async fn error_normalization_402_balance_maps_to_bad_request() {
         .await
         .expect_err("should return error");
     assert!(
-        matches!(err, LlmError::BadRequest(ref s) if s.contains("402")),
-        "402 should map to BadRequest with status, got {err:?}"
+        matches!(err, LlmError::InsufficientBalance(ref s) if s.contains("402")),
+        "402 should map to InsufficientBalance with status, got {err:?}"
     );
 }
 

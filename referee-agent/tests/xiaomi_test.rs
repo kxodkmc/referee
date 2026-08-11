@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use referee_agent::provider::xiaomi::{
-    ids, XiaomiConfig, XiaomiModel, XiaomiProvider, MAX_OUTPUT_TOKENS,
+    ids, XiaomiConfig, XiaomiModel, XiaomiProvider, MAX_OUTPUT_TOKENS, TOKEN_PLAN_BASE_URL_AMS,
+    TOKEN_PLAN_BASE_URL_CN, TOKEN_PLAN_BASE_URL_SGP,
 };
 use referee_agent::provider::{
     ChatRequest, FinishReason, LLMProvider, LlmError, Message, RetryPolicy, StreamChunk,
@@ -329,6 +330,78 @@ async fn error_normalization_500_server() {
 }
 
 // ───────────────────────────────────────────────
+// 测试 5b：MiMo 特有错误码 — 402 余额不足 / 404 能力不存在 / 421 内容拦截
+// ───────────────────────────────────────────────
+#[tokio::test]
+async fn error_normalization_402_insufficient_balance() {
+    let server = MockServer::start(|_| MockResponse::Raw {
+        status: 402,
+        headers: vec![("Content-Type".into(), "application/json".into())],
+        body: br#"{"error":{"message":"insufficient balance"}}"#.to_vec(),
+    })
+    .await;
+
+    let provider = make_provider(&server);
+    let err = provider
+        .chat(ChatRequest::simple("test"))
+        .await
+        .expect_err("should return error");
+    assert!(
+        matches!(err, LlmError::InsufficientBalance(ref s) if s.contains("402")),
+        "got {err:?}"
+    );
+    // 余额不足是确定性错误，不得触发重试（重试策略强制 max_retries=0，此处主要断言归一）
+}
+
+#[tokio::test]
+async fn error_normalization_404_maps_to_bad_request_not_retryable_server() {
+    let server = MockServer::start(|_| MockResponse::Raw {
+        status: 404,
+        headers: vec![("Content-Type".into(), "application/json".into())],
+        body: br#"{"error":{"message":"model does not support image input"}}"#.to_vec(),
+    })
+    .await;
+
+    let provider = make_provider(&server);
+    let err = provider
+        .chat(ChatRequest::simple("test"))
+        .await
+        .expect_err("should return error");
+    assert!(
+        matches!(err, LlmError::BadRequest(ref s) if s.contains("404")),
+        "404 must map to BadRequest (deterministic, not retryable), got {err:?}"
+    );
+    assert!(
+        !RetryPolicy::is_retryable(&err),
+        "404 must not be retryable"
+    );
+}
+
+#[tokio::test]
+async fn error_normalization_421_content_blocked() {
+    let server = MockServer::start(|_| MockResponse::Raw {
+        status: 421,
+        headers: vec![("Content-Type".into(), "application/json".into())],
+        body: br#"{"error":{"message":"content moderation"}}"#.to_vec(),
+    })
+    .await;
+
+    let provider = make_provider(&server);
+    let err = provider
+        .chat(ChatRequest::simple("test"))
+        .await
+        .expect_err("should return error");
+    assert!(
+        matches!(err, LlmError::ContentBlocked(ref s) if s.contains("421")),
+        "got {err:?}"
+    );
+    assert!(
+        !RetryPolicy::is_retryable(&err),
+        "content blocked must not be retryable"
+    );
+}
+
+// ───────────────────────────────────────────────
 // 测试 6：重试 — 500 后成功（指数退避）
 // ───────────────────────────────────────────────
 #[tokio::test]
@@ -551,4 +624,72 @@ impl MessageExt for Message {
         self.reasoning_content = Some(reasoning.to_string());
         self
     }
+}
+
+// ───────────────────────────────────────────────
+// 测试 11：订阅计划接入（Token Plan / Code Plan）— 配置化而非新适配器
+// ───────────────────────────────────────────────
+#[test]
+fn token_plan_endpoint_constants_cover_three_clusters() {
+    assert!(TOKEN_PLAN_BASE_URL_CN.starts_with("https://token-plan-cn.xiaomimimo.com/v1"));
+    assert!(TOKEN_PLAN_BASE_URL_SGP.starts_with("https://token-plan-sgp.xiaomimimo.com/v1"));
+    assert!(TOKEN_PLAN_BASE_URL_AMS.starts_with("https://token-plan-ams.xiaomimimo.com/v1"));
+}
+
+#[tokio::test]
+async fn subscription_plan_config_overrides_provider_id_not_protocol() {
+    let server = MockServer::start(|_| MockResponse::Json {
+        status: 200,
+        body: json!({
+            "id": "x",
+            "model": "mimo-v2.5-pro",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }]
+        }),
+    })
+    .await;
+
+    // Token Plan：专属计费身份 + 自定义端点，协议行为与按量付费完全一致
+    let provider = XiaomiProvider::new(
+        XiaomiModel::MimoV25Pro,
+        XiaomiConfig::new("tp-key")
+            .with_plan("tokenplan")
+            .with_base_url(&server.base_url)
+            .with_retry(RetryPolicy::no_retry()),
+    )
+    .expect("provider creation");
+    assert_eq!(
+        provider.id().as_str(),
+        "tokenplan/mimo-v2.5-pro",
+        "订阅计划应使用 plan 前缀而非默认 xiaomi"
+    );
+
+    // 任意计划名（codeplan 等）同样适用，无需新增适配器
+    let code_plan = XiaomiProvider::new(
+        XiaomiModel::MimoV25,
+        XiaomiConfig::new("cp-key")
+            .with_plan("codeplan")
+            .with_base_url(&server.base_url)
+            .with_retry(RetryPolicy::no_retry()),
+    )
+    .expect("provider creation");
+    assert_eq!(code_plan.id().as_str(), "codeplan/mimo-v2.5");
+
+    // 协议行为不受 plan 影响：模型名与请求构造不变
+    let resp = provider
+        .chat(ChatRequest::simple("hi"))
+        .await
+        .expect("chat should succeed");
+    assert_eq!(resp.model, "mimo-v2.5-pro");
+
+    // 未配置 plan 时保持默认按量付费身份（向后兼容）
+    let default_p = XiaomiProvider::new(
+        XiaomiModel::MimoV25Pro,
+        XiaomiConfig::new("k").with_base_url(&server.base_url),
+    )
+    .expect("provider creation");
+    assert_eq!(default_p.id(), ids::MIMO_V25_PRO);
 }

@@ -8,9 +8,9 @@
 //! - usage 扩展：`prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`（硬盘缓存）
 //! - 多轮工具调用：assistant 消息必须完整回传 `reasoning_content`
 //!
-//! 错误码扩展（已纳入 [`crate::provider::LlmError`] 归一）：
-//! - 402 余额不足 → `BadRequest`
-//! - 422 参数错误 → `BadRequest`
+//! 错误码扩展（已纳入 [`crate::provider::LlmError`] 归一，与 MiMo 共享底座）：
+//! - 402 余额不足 → `InsufficientBalance`
+//! - 422 参数错误 → `BadRequest`（DeepSeek 特有码；MiMo 用 400 涵盖）
 
 use std::time::Duration;
 

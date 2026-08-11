@@ -9,6 +9,25 @@
 //!
 //! 多模态（音频/视频/图片，仅 `mimo-v2.5`）在后续 Phase 通过扩展
 //! [`crate::provider::MessageContent`] 启用，本适配器无需改动。
+//!
+//! ## 订阅计划接入（Token Plan 等）
+//! Token Plan 是订阅制**独立计费身份**，协议行为与按量付费 MiMo 完全一致，
+//! 仅接入端点与 API Key 不同 —— 属于配置差异而非新提供商，无需新增适配器：
+//!
+//! ```no_run
+//! use referee_agent::provider::xiaomi::{
+//!     XiaomiConfig, XiaomiModel, XiaomiProvider, TOKEN_PLAN_BASE_URL_CN,
+//! };
+//! let provider = XiaomiProvider::new(
+//!     XiaomiModel::MimoV25Pro,
+//!     XiaomiConfig::new("tp-xxxxx") // Token Plan 专属 Key（tp- 前缀）
+//!         .with_plan("tokenplan") // 计费身份前缀（任意名称，如 "codeplan"）
+//!         .with_base_url(TOKEN_PLAN_BASE_URL_CN), // 切换订阅计划集群
+//! )
+//! .expect("provider creation");
+//! ```
+//!
+//! 401 认证失败可能因混用订阅计划与按量付费的 API Key 导致，请核对专属 Key。
 
 use std::time::Duration;
 
@@ -35,8 +54,15 @@ pub mod ids {
     pub const MIMO_V25: ProviderId = ProviderId::new("xiaomi/mimo-v2.5");
 }
 
-/// MiMo 默认 BASE_URL（OpenAI 兼容协议）
+/// MiMo 默认 BASE_URL（OpenAI 兼容协议，按量付费）
 pub const DEFAULT_BASE_URL: &str = "https://api.xiaomimimo.com/v1";
+
+/// Token Plan 订阅计划接入端点（中国集群）
+pub const TOKEN_PLAN_BASE_URL_CN: &str = "https://token-plan-cn.xiaomimimo.com/v1";
+/// Token Plan 订阅计划接入端点（新加坡集群）
+pub const TOKEN_PLAN_BASE_URL_SGP: &str = "https://token-plan-sgp.xiaomimimo.com/v1";
+/// Token Plan 订阅计划接入端点（欧洲集群）
+pub const TOKEN_PLAN_BASE_URL_AMS: &str = "https://token-plan-ams.xiaomimimo.com/v1";
 
 /// MiMo 单次响应最大输出 token 数（pro 与 v2.5 相同）
 pub const MAX_OUTPUT_TOKENS: usize = 128 * 1024;
@@ -70,8 +96,11 @@ impl XiaomiModel {
 pub struct XiaomiConfig {
     /// API Key（环境变量 `MIMO_API_KEY`）
     pub api_key: String,
-    /// 覆盖默认 BASE_URL（自部署 / 代理场景）
+    /// 覆盖默认 BASE_URL（自部署 / 代理 / 订阅计划集群）
     pub base_url: Option<String>,
+    /// 订阅计划计费身份（如 `"tokenplan"` / `"codeplan"`），决定 ProviderId 前缀；
+    /// `None` 时使用默认按量付费身份 `"xiaomi"`。协议行为不受影响。
+    pub plan: Option<String>,
     /// 单次请求总超时（含重试）
     pub timeout: Duration,
     /// 重试策略（默认 3 次）
@@ -83,6 +112,7 @@ impl XiaomiConfig {
         Self {
             api_key: api_key.into(),
             base_url: None,
+            plan: None,
             timeout: Duration::from_secs(120),
             retry: RetryPolicy::default(),
         }
@@ -90,6 +120,12 @@ impl XiaomiConfig {
 
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = Some(url.into());
+        self
+    }
+
+    /// 设置订阅计划计费身份（ProviderId 前缀，如 `"tokenplan"`）
+    pub fn with_plan(mut self, plan: impl Into<String>) -> Self {
+        self.plan = Some(plan.into());
         self
     }
 
@@ -109,6 +145,8 @@ pub struct XiaomiProvider {
     client: OpenAiCompatClient,
     model: XiaomiModel,
     capabilities: ProviderCapabilities,
+    /// 最终身份：默认 `xiaomi/{model}`；配置订阅计划时为 `{plan}/{model}`
+    provider_id: ProviderId,
 }
 
 impl XiaomiProvider {
@@ -119,6 +157,11 @@ impl XiaomiProvider {
             timeout: cfg.timeout,
             retry: cfg.retry,
         })?;
+        // 订阅计划身份：有 plan 时 ProviderId = "{plan}/{model}"（动态），否则默认静态标识
+        let provider_id = match &cfg.plan {
+            Some(plan) => ProviderId::owned(format!("{plan}/{}", model.as_str())),
+            None => model.provider_id(),
+        };
         Ok(Self {
             client,
             model,
@@ -129,6 +172,7 @@ impl XiaomiProvider {
                 usage_reported: true,
                 max_output_tokens: MAX_OUTPUT_TOKENS,
             },
+            provider_id,
         })
     }
 
@@ -157,7 +201,7 @@ impl XiaomiProvider {
 #[async_trait]
 impl LLMProvider for XiaomiProvider {
     fn id(&self) -> ProviderId {
-        self.model.provider_id()
+        self.provider_id.clone()
     }
 
     fn capabilities(&self) -> &ProviderCapabilities {
