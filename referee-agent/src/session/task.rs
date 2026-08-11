@@ -29,6 +29,9 @@ use crate::provider::{ChatResponse, LlmError};
 pub enum TurnOutcome {
     /// LLM 正常返回
     Success(Box<ChatResponse>),
+    /// 缓存命中 — 与 Success 语义等价（回信/入 history 相同），
+    /// 但未发生真实 LLM 调用，**不计量 Token**（缓存不产生成本）
+    Cached(Box<ChatResponse>),
     /// LLM 返回错误（已归一为 `LlmError`，含重试后的最终错误）
     Error(LlmError),
     /// 收到中断信号（协作取消）
@@ -40,9 +43,9 @@ pub enum TurnOutcome {
 }
 
 impl TurnOutcome {
-    /// 是否为成功结果
+    /// 是否为成功结果（含缓存命中）
     pub fn is_success(&self) -> bool {
-        matches!(self, Self::Success(_))
+        matches!(self, Self::Success(_) | Self::Cached(_))
     }
 
     /// 是否为可恢复错误（调用方可据此决定是否重试或降级）

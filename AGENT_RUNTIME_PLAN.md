@@ -85,28 +85,30 @@ memory-persist = []  # 记忆/成果落盘（接 referee-core WalSink 抽象）
 referee-agent/
 ├── Cargo.toml                      # 依赖：referee-core + reqwest(D1) + serde_json(D2) + 白名单库
 ├── src/
-│   ├── lib.rs                      # AgentRuntime 扩展入口（实现 referee-core Extension trait）
+│   ├── lib.rs                      # AgentRuntime 扩展入口（预算守门员 + register_peer_tool + 共享全局计数）
 │   ├── provider/                   # 【厂商适配层】唯一 I/O 边界
 │   │   ├── mod.rs                  #   LLMProvider trait、ProviderId、ProviderCapabilities
-│   │   ├── openai.rs               #   OpenAI Chat Completions 适配器   (#[cfg(feature="openai")])
-│   │   ├── anthropic.rs            #   Anthropic Messages 适配器       (#[cfg(feature="anthropic")])
-│   │   └── responses.rs            #   OpenAI Responses API 适配器     (#[cfg(feature="responses")])
+│   │   ├── openai_compat.rs        #   OpenAI 兼容共享底座（HTTP / 错误归一 / 重试 / SSE）
+│   │   ├── xiaomi.rs               #   Xiaomi MiMo 适配器   (#[cfg(feature="xiaomi")])
+│   │   ├── deepseek.rs             #   DeepSeek 适配器      (#[cfg(feature="deepseek")])
+│   │   └── openai.rs / anthropic.rs / responses.rs   # 预留适配器（feature 隔离）
 │   ├── session/                    # 【会话状态机】并发正确性核心
-│   │   ├── mod.rs                  #   SessionState 状态机 + 消息驱动
+│   │   ├── mod.rs                  #   SessionState 状态机 + consumed_tokens 计量
+│   │   ├── message.rs              #   消息协议（SessionMessage / SessionReply 编解码）
 │   │   ├── task.rs                 #   后台任务 wrapper：catch_unwind + finally 终态收敛
 │   │   └── timeout.rs              #   超时治理（Thinking / AwaitingCalls 双 deadline）
-│   ├── tool/                       # 【工具层】FunctionCall 统一抽象
-│   │   ├── mod.rs                  #   Tool trait、Registry（有界注册表）
-│   │   ├── executor.rs             #   并行执行器（Semaphore + 每轮上限）
-│   │   └── bridge.rs               #   MCP / Skills → Tool 桥接
-│   ├── agent/                      # 【子 Agent 与成果】
-│   │   ├── mod.rs                  #   子任务派发、完成聚合（复用 AwaitingCalls 通道）
-│   │   └── artifact.rs             #   ArtifactStore（有界、哈希、可见性白名单）
-│   ├── memory/                     # 【记忆】全局 / 项目 / 会话三层
-│   ├── prompt/                     # 【提示词】PromptBuilder + 预算分配 + 缓存
-│   ├── usage/                      # 【计量】Token 估算 + 厂商 usage 校准
-│   └── observe/                    # 【可观测】tracing 全链路 + metrics
-└── tests/                          # 阶段验收测试（沿用 referee-core 测试风格）
+│   ├── tool/                       # 【工具层】FunctionCall 统一抽象 + 对等协作
+│   │   ├── definition.rs           #   Tool trait、ToolCategory(Local/Remote)、ToolContext
+│   │   ├── registry.rs             #   有界注册表
+│   │   ├── executor.rs             #   并行执行器（Local 不占槽位 / Remote 限流 + 截断 + 隔离）
+│   │   └── agent_tool.rs           #   对等智能体工具（Agent as Tool，invoke RPC + 大结果落库）
+│   ├── artifact/                   # 【工件存储】ACL（owner + allowed_readers）+ 有界容量
+│   ├── budget/                     # 【预算治理】Session/全局双层级限额 + 保守估算
+│   ├── memory/                     # 【记忆】全局 / 项目 / 会话三层（预留）
+│   ├── prompt/                     # 【提示词】PromptBuilder + 预算分配 + 缓存（预留）
+│   ├── usage/                      # 【计量】Token 估算 + 厂商 usage 校准（预算已先行落地）
+│   └── observe/                    # 【可观测】tracing 全链路 + metrics（预留）
+└── tests/                          # 阶段验收测试（tool / peer / budget / session / 厂商适配）
 ```
 
 ### 3.2 分层依赖规则（可拓展性的根基）
@@ -132,16 +134,17 @@ referee-agent/
 
 ### 5.0 阶段总览
 
-| 阶段 | 名称 | 核心交付 | 前置 |
-|---|---|---|---|
-| P0 | 厂商抽象层 | LLMProvider trait + 3 适配器 + 流式 + 错误归一 | D1/D2 |
-| P1 | 会话状态机 | 并发正确性 + 中断 + 幽灵治理 + 消息驱动循环 | P0 |
-| P2 | 工具调用 | Tool trait + 并行执行 + 结果回写 | P1 |
-| P3 | 子 Agent 与成果 | ArtifactStore + 派发/聚合 + 可见性注入 | P2 |
-| P4 | 记忆模块 | 三层记忆 + 注入策略 + 容量 | P1 |
-| P5 | 提示词与缓存 | PromptBuilder + 预算 + 缓存命中 | P0/P4 |
-| P6 | 计量与可观测 | Token 用量 + 全链路 tracing + metrics | P0–P5 |
-| P7 | MCP 与 Skills | MCP stdio 桥 + Skills 注册 | P2 |
+| 阶段 | 名称 | 核心交付 | 前置 | 状态 |
+|---|---|---|---|---|
+| P0 | 厂商抽象层 | LLMProvider trait + 适配器 + 流式 + 错误归一 | D1/D2 | ✅ 完成 |
+| P1 | 会话状态机 | 并发正确性 + 中断 + 幽灵治理 + 消息驱动循环 | P0 | ✅ 完成 |
+| P2 | 工具调用 | Tool trait + 并行执行 + 结果回写 | P1 | ✅ 完成 |
+| P3 | 子 Agent 与成果 | ArtifactStore + 派发/聚合 + 可见性注入 | P2 | ✅ 完成（路线偏差见 §5.4） |
+| 预算治理 | Token 双层级限额 | Session 级 + 全局共享计数器 | P1/P2 | ✅ 完成（提前落地，见 §5.4.1） |
+| P4 | 记忆模块 | 三层记忆 + 注入策略 + 容量 | P1 | ⏳ 待开发 |
+| P5 | 提示词与缓存 | PromptBuilder + 预算 + 缓存命中 | P0/P4 | ✅ 完成（缓存/预算部分已落地，见 §5.6） |
+| P6 | 计量与可观测 | Token 用量 + 全链路 tracing + metrics | P0–P5 | ⏳ 待开发 |
+| P7 | MCP 与 Skills | MCP stdio 桥 + Skills 注册 | P2 | ⏳ 待开发 |
 
 **为什么是这个顺序**：
 - P0 是唯一 I/O 边界，先立边界，后续所有模块都只面对统一接口，不写厂商分支。
@@ -220,7 +223,7 @@ where F: FnMut() -> Fut, Fut: Future<Output = TurnOutcome> + Send;
 4. **busy 拒绝可见**：并发 chat → 明确拒绝消息 + DLQ 落一条，扩展不熔断。
 5. **resume 循环**：等待项全部完成后自动进入下一轮思考，断言轮次递增（修复上一版断掉的流程）。
 
-### 5.3 Phase 2 — 工具调用（FunctionCall 统一抽象）
+### 5.3 Phase 2 — 工具调用（FunctionCall 统一抽象）✅ 已完成
 
 **目标**：工具定义、发现、并行执行、结果回写闭环；背压与隔离达标。
 
@@ -246,7 +249,10 @@ pub trait Tool: Send + Sync {
 3. **隔离**：某工具 panic → 该调用回错误，其余调用与注册表不受影响（catch_unwind 在 execute 边界）。
 4. **背压**：工具结果洪泛 → 有界队列满 → 明确错误，无 OOM。
 
-### 5.4 Phase 3 — 子 Agent 与成果管理
+### 5.4 Phase 3 — 子 Agent 与成果管理（✅ 已完成，实现走 Agent as Tool 路线）
+
+> 状态：✅ 已完成（`tests/peer_test.rs` 4 条验收全绿）。原规划的「emit 异步派发」路线
+> 改为 **Agent as Tool** 同步 invoke 路线，偏差记录见本节末尾。
 
 **目标**：主 Agent 并行派生 N 个子 Agent；成果落库；调用时按白名单注入可见成果。
 
@@ -261,6 +267,33 @@ pub trait Tool: Send + Sync {
 2. **可见性**：仅白名单内 artifact 出现在注入后的 prompt 中（断言 prompt 文本）；白名单外的即使存在也不注入。
 3. **容量**：成果超限 → 最旧淘汰或拒绝，行为明确，无 OOM。
 4. **隔离**：子 Agent 崩溃 → 主收到失败通知并继续运行，内核不受影响。
+
+**实现偏差（Agent as Tool 路线，均已验证）**：
+
+| 项 | 原规划 | 实际实现 |
+|---|---|---|
+| 派发机制 | 主 Agent 经 `emit` 派发子任务消息 + `SubagentDone` 完成通知 | 目标 Session 经 [`AgentTool`](../referee-agent/src/tool/agent_tool.rs)（`ToolCategory::Local`）注册为工具，`execute` 内 `kernel.invoke` 同步 RPC（带超时，默认 30s） |
+| 等待通道 | P2 的 AwaitingCalls（含 Subagent pending） | 复用 P2 的 AwaitingCalls（工具 pending） |
+| 循环调用 | — | A→B→A 被 `SessionReply::Busy` 拒绝并回传错误，系统不挂死（DAG 约束，`cyclic_call_rejected` 验证） |
+| 资源池 | — | `ToolCategory::Local` 使对等调用不占 ToolExecutor 的 IO 槽位，避免「AgentTool 等目标、目标等槽位」死锁（`resource_pool_deadlock_fixed` 验证） |
+| Artifact 模型 | `id / hash / bytes / meta / source_agent / created_at / ttl`，可见性白名单注入 | `id / owner / allowed_readers / content_type / bytes / created_at`，**读取路径全鉴权**（owner 或显式授权读者），存储有界（数量 + 字节双上限） |
+| 大结果处理 | — | AgentTool 返回文本 > 4096 字节时写入 ArtifactStore 并显式授权调用者，仅回传 Artifact ID |
+| `SubagentDone` | 完成通知消息 | 编解码保留未启用；异步派发 + 白名单可见性注入留待后续增强（同步路线下单次调用受 RPC 超时上限约束，超长任务需评估异步路线） |
+
+### 5.4.1 预算治理（提前落地，✅ 已完成）
+
+> Token 双层级限额（原规划属 P5/P6 范畴，随对等协作提前落地；`tests/budget_test.rs` 6 条验收全绿）。
+
+- **配置**：`BudgetConfig`（`session_limit` / `global_limit`，0 = 无限制），挂载于 `AgentConfig.budget`。
+- **Session 级计量**：`Session.consumed_tokens` 在 `finish_thinking` 成功分支累加，统一口径
+  `tokens_from_response`（优先 `usage.total_tokens`；厂商缺失时保守估算响应文本，绝不计 0）。
+- **全局级计量**：`Arc<AtomicU64>` 原子计数器；`with_global_budget` 注入共享实例——主 Agent + 子 Agent
+  （不同 Runtime）共享同一计数器即**系统级总预算**（子任务消耗并入总盘子）。
+- **前置守门员**：`handle_chat` 在 `start_thinking` 前检查双限额，超限回 `SessionReply::Error`
+  （`Budget limit reached: Session/Global budget exceeded (used/limit)`），不进入 Thinking、不产生无效计费。
+- **语义（软限制）**：check-then-act——允许最后一次超额，其后拒绝（单轮消耗无法预知）；
+  并发下最多超额一轮并发量。验收 1/2 的断言口径即此语义。
+- **验收**：会话级阻断 / 全局级阻断 / 计量准确性 / 并发原子累加（10 并发无丢失）/ 子 Agent 共享全局预算 / 估算兜底。
 
 ### 5.5 Phase 4 — 记忆模块
 
@@ -281,18 +314,42 @@ pub trait Tool: Send + Sync {
 3. **注入预算**：记忆 + 历史 + 成果 + 工具声明 总和 ≤ 配置 token 上限（P5 断言）。
 4. **可替换**：mock `MemoryStore` 断言写穿与读回；不依赖具体存储实现。
 
-### 5.6 Phase 5 — 提示词组装与缓存
+### 5.6 Phase 5 — 提示词组装与缓存（✅ 已完成）
 
 **目标**：PromptBuilder 统一组装 + 预算分配 + 缓存命中，杜绝"Prompt 爆炸"。
 
 - 段落优先级（超限按序截断）：`system > 工具声明 > 历史 > 项目/全局记忆 > 会话记忆 > 成果注入`。
-- 缓存：`CacheKey = provider + model + prompt_hash + params`；命中返回缓存响应（合成流）；不命中调用后按策略落缓存；**内存 LRU 自实现（dashmap，容量有界）+ TTL**，不引 lru crate。
+  实现：`src/prompt/mod.rs`（`build_prompt`），System 按字符截断兜底（绝不整段丢弃）、
+  工具声明超限才整体丢弃、历史滑动窗口保留最近 N 条并修正首条角色配对
+  （tool_calls 配对轮次保留 / 裸 assistant / 悬空 tool 开头移除）。
+- 缓存：`src/cache/mod.rs`（`InMemoryCache`）。`CacheKey = provider/model + content_hash + params_hash`；
+  命中返回缓存响应；不命中调用后按策略落缓存（**仅无 tool_calls 的响应**）；内存 LRU 自实现
+  （dashmap + VecDeque 顺序队列，容量有界）+ TTL，不引 lru crate。
+- Runtime 集成：`AgentConfig.cache`（enabled/capacity/ttl）+ `SessionConfig.prompt_budget_tokens`；
+  缓存命中走 `TurnOutcome::Cached`（回信/入 history 与 Success 等价，**不计量 Token**）；
+  metrics 增加 `outcome="cached"` 标签（`referee_agent_turns_total`）。
 
-**验收标准**：
-1. **命中**：相同输入二次调用 → 命中，LLM 调用计数 = 1（计数 mock 断言）。
-2. **容量/TTL**：缓存超限淘汰、过期失效，均有测试。
-3. **预算**：超长输入按优先级截断，总量恒 ≤ 上限；断言截断后的实际 token 估算值。
-4. 流式缓存：完整响应收敛后落缓存，再次命中返回等价合成流。
+**验收标准**（`tests/cache_test.rs` 7 条 + prompt/cache 模块单测 20 条）：
+1. **命中**：相同输入二次调用 → 命中，LLM 调用计数 = 1（计数 mock 断言）。✅
+2. **容量/TTL**：缓存超限淘汰、get 刷新 LRU 顺序、过期失效，均有测试。✅
+3. **预算**：超长输入按优先级截断，总量恒 ≤ 上限；断言截断后的实际 token 估算值。✅
+4. **流式缓存**：完整响应收敛后落缓存，再次命中返回等价合成流
+   （`synthetic_stream`：Delta 分块 + Finish 块，拼接 == 原文 —— 协议层无流式回信，
+   验收 4 由函数级单测覆盖，见下方偏差）。✅
+
+**对执行方案的偏差（均有意为之，均已验证）**：
+| 偏差 | 原因 |
+|------|------|
+| `SessionReply::Stream` 不可行 → 集成层缓存命中回 `SessionReply::Success`，流式一致性由 `synthetic_stream` 函数 + 单测保证 | referee-agent 协议层（Envelope metadata JSON）只能承载一次性回信，无流式通道；`run_turn` 亦走非流式 `provider.chat`。验收 4 的语义（缓存结果与真实调用流式等价）由合成流单测覆盖 |
+| 缓存键**不排除**动态字段：`params_hash` 含 temperature/max_tokens/thinking/tool_choice | 规划风险 4「缓存键必须包含全部影响输出的参数」是硬约束；执行方案 `params_hash: 0` + `exclude_dynamic_fields=true` 会让不同温度错误共享缓存 |
+| 只缓存无 `tool_calls` 的响应 | tool_call_id 是厂商生成的一次性 ID，重放缓存响应会破坏工具调用流程（`tool_call_responses_are_not_cached` 验收） |
+| 缓存命中不计量 Token（`TurnOutcome::Cached`） | 缓存命中未发生真实 LLM 调用，不应占用 Session/全局预算（`cached_hit_does_not_charge_budget` 验收） |
+| 缓存写入在 turn task 收敛路径（非 handle_chat 内联） | 响应只在 `converge` 可得；执行方案假设 handle_chat 内联 run_turn 与现有 forwarder + spawn_turn_task 架构不符 |
+| 预算截断挂 `SessionConfig.prompt_budget_tokens`（默认 8000）而非硬编码 | 测试需可配预算（验收 3）；`AgentConfig.session` 模板统一下发 |
+| System 截断按估算系数反推字符数并**扣除截断后缀成本** | 执行方案 `budget*4` 字符 ≈ 2.67×budget tokens 会超预算；且字符数做字节切片索引对中文必 panic（已加 CJK 回归） |
+| History 截断修正首条角色（tool_calls 轮次保留 / 裸 assistant 移除） | 滑动窗口切在中间会残留协议非法开头（OpenAI 400）；完全按执行方案会误删工具轮片段（session 既有测试回归） |
+| LRU 死键惰性清理 | 执行方案 TTL 过期只 `map.remove` 不移除 lru 队列，死键无界堆积（违反背压硬约束）；evict 时跳过失效键 |
+| `cache.get` 过期分支先 drop Ref guard 再 remove | 持有 DashMap 读 guard 时取同 shard 写锁（parking_lot RwLock 非重入）会死锁，卡死 current_thread runtime（测试定位） |
 
 ### 5.7 Phase 6 — Token 计量与可观测
 
@@ -342,7 +399,7 @@ pub trait Tool: Send + Sync {
 1. **厂商 API 漂移**：三厂商 API 均在演进。缓解：适配器集中、能力声明驱动降级；每个适配器配契约测试（mock 服务器）。
 2. **MCP 生态复杂**：stdio 进程的生命周期管理是 P7 主要风险。缓解：独立进程治理（超时/熔断/清理）+ 专用测试；HTTP 后置。
 3. **记忆的长期一致性**：全局记忆跨会话写并发。缓解：写入统一走 emit 消息队列串行化，存储 trait 层保证原子性。
-4. **缓存正确性**：缓存键必须包含全部影响输出的参数（含温度、工具声明集合）。缓解：P5 验收 1 的计数断言 + 键结构单测。
+4. **缓存正确性**：缓存键必须包含全部影响输出的参数（含温度、工具声明集合）。缓解：已落地 —— `params_hash` 含 temperature/max_tokens/thinking/tool_choice，`content_hash` 覆盖 messages+tools；`params_affect_cache_key` 单测 + P5 验收 1 的计数断言。
 5. **Token 估算误差**：近似估算与厂商实际 usage 存在偏差。缓解：usage 优先、估算兜底；计量口径文档化。
 
 ---

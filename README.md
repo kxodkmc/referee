@@ -9,9 +9,9 @@
 | 模块 | 定位 | 进度 | 测试 | 文档 |
 |------|------|------|------|------|
 | [`referee-core`](referee-core/) | **微内核**：路由 / 原语 / 治理（背压、熔断、监督、停机、DLQ、WAL） | Phase 1 ~ 6 ✅ 完成 | 25 条 | [README](referee-core/README.md) |
-| [`referee-agent`](referee-agent/) | **智能体运行时**（基于内核的可选 SDK）：厂商抽象 + 会话状态机 + AgentRuntime 扩展 | Phase 0 ~ 1 ✅ 完成 | 65 条 | [README](referee-agent/README.md) |
+| [`referee-agent`](referee-agent/) | **智能体运行时**（基于内核的可选 SDK）：厂商抽象 + 会话状态机 + 工具调用 + 对等协作 + 预算治理 + 提示词组装与缓存 | Phase 0 ~ 3 + 预算治理 + P5 ✅ 完成 | 146 条 | [README](referee-agent/README.md) |
 
-合计 **90 条测试全绿**（`cargo test --workspace`）。
+合计 **171 条测试全绿**（`cargo test --workspace`）。
 
 ---
 
@@ -46,7 +46,7 @@ referee-agent = { path = "referee-agent" }             # 智能体能力（可�
 ## 验证
 
 ```bash
-cargo test --workspace                      # 全量回归（core 25 + agent 65 = 90 条）
+cargo test --workspace                      # 全量回归（core 25 + agent 146 = 171 条）
 cargo clippy --workspace --all-targets -- -D warnings    # 零警告
 cargo fmt --check                           # 格式整洁
 ```
@@ -65,10 +65,11 @@ Phase 1 骨架与背压 → Phase 2 invoke 原语 → Phase 3 容错与隔离 �
 |------|------|------|
 | Phase 0 | 厂商抽象层（LLMProvider + 适配器 + 流式 + 错误归一） | ✅ 完成 |
 | Phase 1 | 会话状态机（并发正确性 + 中断 + 幽灵治理 + 消息驱动） | ✅ 完成 |
-| Phase 2 | 工具调用（Tool trait + 并行执行 + 结果回写） | ⏳ 待开发 |
-| Phase 3 | 子 Agent 与成果（ArtifactStore + 派发/聚合 + 可见性注入） | ⏳ 待开发 |
+| Phase 2 | 工具调用（Tool trait + 并行执行 + 结果回写） | ✅ 完成 |
+| Phase 3 | 对等智能体协作 + 工件存储（Agent as Tool + ArtifactStore ACL） | ✅ 完成 |
+| 预算治理 | Token 双层级限额（Session 级 + 全局共享计数器） | ✅ 完成 |
 | Phase 4 | 记忆模块（三层记忆 + 注入策略 + 容量） | ⏳ 待开发 |
-| Phase 5 | 提示词与缓存（PromptBuilder + 预算 + 缓存命中） | ⏳ 待开发 |
+| Phase 5 | 提示词与缓存（PromptBuilder 预算截断 + 内存 LRU/TTL 缓存 + 合成流） | ✅ 完成 |
 | Phase 6 | 计量与可观测（Token 用量 + 全链路 tracing + metrics） | ⏳ 待开发 |
 | Phase 7 | MCP 与 Skills（stdio 桥 + Skills 注册） | ⏳ 待开发 |
 

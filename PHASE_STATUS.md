@@ -312,9 +312,59 @@ referee-core/
 | `priority.rs` 置于 `kernel/` 而非 `common/` | 保持 common 纯数据层，避免 common → extension 反向依赖（详见 Phase 4 偏差表） |
 | 停机信号用 `watch` 而非 `Notify` | `notify_waiters` 不存储 permit，存在通知丢失竞态（详见 Phase 4 偏差表） |
 
+## referee-agent 阶段状态（P0 ~ P3 + 预算治理 + P5 已完成）
+
+> 本仓库当前共 **169 条测试全绿**（referee-core 25 + referee-agent 144）。
+> referee-agent 各阶段验收口径见 `AGENT_RUNTIME_PLAN.md`（规划文档）与对应测试文件。
+
+### 阶段总览
+
+| 阶段 | 主题 | 状态 | 测试 |
+|------|------|------|------|
+| P0 | 厂商抽象层（LLMProvider + MiMo/DeepSeek 适配器 + 流式 + 错误归一） | ✅ 完成 | deepseek 13 / xiaomi 13 / equivalence 5 |
+| P1 | 会话状态机（并发正确性 + 中断 + 幽灵治理 + 消息驱动） | ✅ 完成 | session_test 14 + 单元 |
+| P2 | 工具调用（Tool trait + 注册表 + 并行执行 + 多轮循环） | ✅ 完成 | tool_test 9 + 单元 |
+| P3 | 对等智能体协作 + 工件存储（Agent as Tool + ArtifactStore ACL） | ✅ 完成 | peer_test 4 + 单元 |
+| 预算治理 | Token 双层级限额（Session + 全局共享计数器） | ✅ 完成 | budget_test 6 + 单元 |
+| P5 | 提示词组装与缓存（PromptBuilder 预算截断 + 内存 LRU/TTL 缓存 + 合成流） | ✅ 完成 | cache_test 7 + 模块单测 20 |
+
+### 关键设计决策（agent 层）
+
+| 决策 | 理由 |
+|------|------|
+| `ToolCategory::Local`（AgentTool）不占 ToolExecutor 槽位 | ToolExecutor 的 Semaphore 是「permit 持有至完成」模型：AgentTool 占用槽位等待目标 Agent、目标 Agent 又需槽位执行自身工具 → 并发上限耗尽即死锁；Local 分类从根上解除（`resource_pool_deadlock_fixed` 复现验证） |
+| 循环调用（A→B→A）由 `Busy` 拒绝兜底 | A 调 B 时 A 处于 AwaitingCalls（busy），B 回调 A 收到 `SessionReply::Busy` → 工具转错误回传，系统不挂死（DAG 约束，`cyclic_call_rejected`） |
+| `ToolContext` 注入 `Option<Kernel>` / `Option<ArtifactStore>` | Kernel 未实现 Debug 且 ToolContext 需 Debug；Option 显式表达「未启用对等能力」，既有测试零破坏；信任边界：完整 Kernel 仅授予可信注册工具（引入不可信工具前须收窄为受限句柄，见 security-review 记录） |
+| ArtifactStore 读取路径全鉴权 | `get(id, requester)` 校验 owner / allowed_readers，杜绝「猜中 ID 即越权读取」（`artifact_acl_end_to_end`：A 可读 / C PermissionDenied） |
+| 工件存储有界（数量 + 总字节双上限） | 背压硬约束：超限回 `CapacityExceeded`，绝不无界增长 |
+| 全局预算计数器可注入共享（`Arc<AtomicU64>`） | 主 Agent + 子 Agent 是不同 Runtime，各自独立计数无法约束任务总盘子；共享同一计数器即系统级总预算（`sub_agent_shared_global_budget`：40+60+40=140 跨 runtime 合并） |
+| Session 级与全局共用 `tokens_from_response` | 统一计量口径（usage 优先、缺失时保守估算响应文本）；避免「Session 计 AwaitingCalls、全局漏计」的不一致（converge 开头统一计数，覆盖工具调用轮） |
+| 预算为软限制（check-then-act） | 单轮消耗无法预知，只能拒绝「累计 ≥ limit 后的新请求」：允许最后一次超额，其后拒绝；并发下最多超额一轮并发量（budget_test 断言口径即此语义） |
+
+### 对规划文档的偏差（均有意为之，均已验证）
+
+| 偏差 | 原因 |
+|------|------|
+| P3 走 Agent as Tool 同步 invoke 路线，而非规划的 emit 异步派发 + SubagentDone | 复用 P2 工具通道（同一 AwaitingCalls / ToolResult 机制），实现简单直接；同步 RPC 受超时上限约束，超长任务需异步路线（`SubagentDone` 编解码保留未启用） |
+| Artifact 模型简化（owner + allowed_readers，去掉 hash/source_agent/ttl/白名单注入） | 存储侧 ACL 由 ArtifactStore 强制校验，覆盖「猜 ID 越权」威胁；白名单可见性注入属 prompt 层（P5 范畴） |
+| 预算治理提前于 P5/P6 落地 | 对等协作引入跨 Agent 消耗，需先有全局限额（作为 P3 前置条件落地） |
+| 缓存键含全部影响输出的参数（`params_hash`，不排除动态字段） | 规划风险 4 硬约束：不同温度错误共享缓存比命中率损失严重；`params_affect_cache_key` 单测验证 |
+| 只缓存无 tool_calls 的响应 | tool_call_id 是一次性 ID，重放含工具调用的响应破坏工具流程 |
+| 缓存命中走 `TurnOutcome::Cached`（不计量 Token） | 缓存命中无真实 LLM 调用，不占 Session/全局预算；metrics `outcome="cached"` 反映命中 |
+| 缓存写入在 turn task 收敛路径（非 handle_chat） | 响应只在 converge 可得；handle_chat 是同步 forwarder 架构 |
+| `cache.get` TTL 过期分支先 drop Ref guard 再 remove | DashMap 同 shard 读锁未释放取写锁死锁（parking_lot RwLock 非重入），卡死 current_thread runtime |
+| LRU 死键惰性清理（evict 跳过失效键） | 防止 lru 队列无界堆积（背压硬约束） |
+| History 截断修正首条角色（tool_calls 轮次保留 / 裸 assistant 移除） | 滑动窗口切在中间产生协议非法开头；粗暴移除会误删工具轮片段 |
+| System 截断按估算系数反推字符数并扣除后缀成本 | `budget*4` 字符超预算；字符数做字节切片索引对中文必 panic（CJK 回归测试） |
+| 验收 4（流式缓存语义）由 `synthetic_stream` 函数级单测覆盖 | 协议层无流式回信通道（Envelope metadata JSON 一次性回信），集成层回 `SessionReply::Success` |
+| 预算验收语义修正（软限制） | 原方案验收 1/2「预计本轮超限即拒绝」无法实现——前置检查只能看到已消耗量；改为「允许最后一次超额，其后拒绝」并写入测试断言 |
+
 ## 后续阶段待办
 
-> Phase 1 ~ 6 已全部完成，当前无待办。
+> referee-core Phase 1 ~ 6 已全部完成；referee-agent P0 ~ P3 + 预算治理已完成。
+> 待办：referee-agent P4（记忆模块）/ P6（计量收口 + 全链路可观测）/ P7（MCP 与 Skills）；
+> P3 异步派发路线 + 白名单可见性注入（同步路线的超长任务增强）；预算任务级级联（子任务消耗计入父任务，超出共享计数器的系统级口径）；
+> P5 后续：system prompt 注入点（SessionConfig 预留）、memory/artifacts 片段接入（P4 落地后）。
 
 ## 开工前核对清单
 

@@ -15,10 +15,12 @@
 //!
 //! `tool` 模块不依赖 `session`，反向依赖通过 `emit_callback` 闭包注入。
 
+pub mod agent_tool;
 pub mod definition;
 pub mod executor;
 pub mod registry;
 
-pub use definition::{Tool, ToolContext, ToolError, ToolOutput};
+pub use agent_tool::AgentTool;
+pub use definition::{Tool, ToolCategory, ToolContext, ToolError, ToolOutput};
 pub use executor::{ExecutedTool, ExecutorConfig, ToolExecutor};
 pub use registry::{RegistryConfig, RegistryError, ToolRegistry};

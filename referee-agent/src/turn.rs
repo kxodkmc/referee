@@ -10,6 +10,7 @@
 //!    - `AwaitingCalls` → spawn 工具执行 + emit 结果
 
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,6 +20,8 @@ use metrics::counter;
 use referee_core::{CapabilityId, Kernel};
 use tracing::{info_span, warn, Instrument};
 
+use crate::budget::{add_tokens, tokens_from_response};
+use crate::cache::{CacheKey, InMemoryCache};
 use crate::provider::{ChatRequest, LLMProvider};
 use crate::session::{
     FinishAction, Session, SessionId, SessionMessage, SessionReply, SessionState, TurnOutcome,
@@ -33,12 +36,21 @@ pub struct TurnContext {
     pub self_id: CapabilityId,
     pub tools: Option<ToolRegistry>,
     pub tool_executor: Option<ToolExecutor>,
+    /// 【预算治理】全局 Token 计数器（converge 时更新）
+    pub record_tokens: Arc<AtomicU64>,
+    /// 【P5 提示词】内存 LRU 缓存（None = 未启用）
+    pub cache: Option<Arc<InMemoryCache>>,
 }
 
 /// 派生 turn 任务 — 终态自管
 ///
 /// 执行 LLM 调用（`run_turn`），finally 收敛 Session 状态 + reply。
 /// 外层 `catch_unwind` 兜底：即使收敛逻辑 panic 也强制恢复 Idle。
+///
+/// `cache_key` 非 None 且缓存启用时：
+/// - 命中 → `TurnOutcome::Cached`（不调 LLM、不计量）
+/// - 未命中 → 调 LLM，成功后**仅对无工具调用的响应**落缓存
+///   （含 tool_calls 的响应不可重放：tool_call_id 是厂商生成的一次性 ID）
 pub fn spawn_turn_task(
     tctx: Arc<TurnContext>,
     req: ChatRequest,
@@ -46,14 +58,44 @@ pub fn spawn_turn_task(
     session_id: SessionId,
     turn_id: u64,
     timeout: Duration,
+    cache_key: Option<CacheKey>,
 ) {
     let sessions = tctx.sessions.clone();
 
     tokio::spawn(async move {
         let span = info_span!("agent_turn", session_id = %session_id, turn_id);
-        let outcome = crate::session::run_turn(tctx.provider.chat(req), cancel_rx, timeout)
-            .instrument(span)
-            .await;
+        let outcome = async {
+            // 缓存命中检查（不调 LLM）。
+            // catch_unwind 兜底：缓存路径 panic 时降级为正常 LLM 调用，
+            // 绝不让 turn task 直接死亡（否则收敛不执行 → 幽灵会话）。
+            let cached = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                if let (Some(cache), Some(key)) = (&tctx.cache, &cache_key) {
+                    cache.get(key).map(|r| TurnOutcome::Cached(Box::new(r)))
+                } else {
+                    None
+                }
+            }))
+            .ok()
+            .flatten();
+            if let Some(outcome) = cached {
+                return outcome;
+            }
+            crate::session::run_turn(tctx.provider.chat(req), cancel_rx, timeout).await
+        }
+        .instrument(span)
+        .await;
+
+        // 缓存写入：真实调用成功且可缓存（无工具调用）时落缓存。
+        // 同样 catch_unwind 兜底：写入失败不影响收敛路径。
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            if let (Some(cache), Some(key)) = (&tctx.cache, &cache_key) {
+                if let TurnOutcome::Success(resp) = &outcome {
+                    if resp.message.tool_calls.is_empty() {
+                        cache.set(key.clone(), (**resp).clone());
+                    }
+                }
+            }
+        }));
 
         let label = outcome_label(&outcome);
 
@@ -79,6 +121,12 @@ pub fn spawn_turn_task(
 
 /// 终态收敛 — 根据 `FinishAction` 决定后续动作
 async fn converge(tctx: &TurnContext, session_id: SessionId, turn_id: u64, outcome: TurnOutcome) {
+    // 0. 【预算治理】全局计数（统一口径，覆盖 Idle 与 AwaitingCalls 分支）
+    //    与 Session 级计数共用 tokens_from_response，保证两侧一致。
+    if let TurnOutcome::Success(resp) = &outcome {
+        add_tokens(&tctx.record_tokens, tokens_from_response(resp));
+    }
+
     // 1. 终态收敛（短暂持锁，无 await）
     let action = if let Some(mut session) = tctx.sessions.get_mut(&session_id) {
         session.finish_thinking(turn_id, outcome)
@@ -182,6 +230,7 @@ fn spawn_tool_execution(
 pub fn outcome_label(outcome: &TurnOutcome) -> &'static str {
     match outcome {
         TurnOutcome::Success(_) => "success",
+        TurnOutcome::Cached(_) => "cached",
         TurnOutcome::Error(_) => "error",
         TurnOutcome::Cancelled => "cancelled",
         TurnOutcome::Timeout => "timeout",

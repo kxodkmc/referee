@@ -10,24 +10,73 @@
 //!   `catch_unwind` 捕获，转为 `ToolError::Panic`，不影响其他工具与会话。
 //! - **输入/输出均 `Send + 'static`**：工具可在独立 task 中并行执行。
 
+//! ## 信任边界（安全声明）
+//! 工具注册（`ToolRegistry::register` / `AgentRuntime::register_peer_tool`）是
+//! 对等能力的唯一信任边界：注入 `ToolContext` 的 `Kernel` 与 `ArtifactStore`
+//! 句柄仅授予**可信注册**的工具。当前 Phase 无用户自定义 / MCP 工具（Phase 7
+//! 预留），引入不可信工具前须先将 `kernel` 收窄为受限句柄（固定目标白名单），
+//! 否则任何持有句柄的工具均可 invoke 任意能力 / 伪造会话消息。
+
+use std::sync::Arc;
+
 use async_trait::async_trait;
+use referee_core::Kernel;
 use serde_json::Value;
 
+use crate::artifact::ArtifactStore;
 use crate::provider::ToolDeclaration;
 
-/// 工具执行上下文 — 预留扩展点
+/// 工具分类 — 决定执行策略
 ///
-/// Phase 2 仅携带 `tool_call_id` 与 `session_id`，供工具日志关联。
-/// 后续 Phase 可注入 `KernelView`（emit 能力）、ArtifactStore 句柄等，
-/// 但 `Tool` trait 不感知具体注入内容，保持解耦。
-#[derive(Debug, Clone)]
+/// - `Local`：内部调用（如对等 Agent RPC），不占用外部 IO 并发槽位；
+///   仅受内核背压与目标扩展自身容量约束。
+/// - `Remote`：外部 IO（HTTP / 文件等），受 `ToolExecutor` 的 Semaphore 限流。
+///
+/// 分类解决「AgentTool 占用槽位等待目标 Agent 完成，而目标 Agent 又需要
+/// 槽位执行自身工具」的资源池死锁。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCategory {
+    /// 内部调用（如 Agent 调用），不占用外部 IO 槽位
+    Local,
+    /// 外部 IO（如 HTTP），受 Semaphore 限制
+    Remote,
+}
+
+/// 工具执行上下文 — 由 `ToolExecutor` 注入
+///
+/// Phase 3 注入受限的对等能力：`kernel`（RPC invoke）与 `artifact_store`
+/// （大结果落库）。两者均为 `Option`：未启用对等能力时保持 `None`，
+/// 对等工具（如 [`crate::tool::AgentTool`]）在缺失时返回明确错误。
+/// 既有本地工具无感知（字段为 pub，忽略即可）。
+#[derive(Clone)]
 pub struct ToolContext {
     /// 触发此次工具调用的 `ToolCall.id`（LLM 生成的，用于结果回传匹配）
     pub tool_call_id: String,
-    /// 所属会话 ID（用于 tracing 关联）
+    /// 所属会话 ID（用于 tracing 关联与工件 ACL 授权）
     pub session_id: uuid::Uuid,
     /// 所属轮次 ID（用于 tracing 关联）
     pub turn_id: u64,
+    /// 内核句柄（对等 RPC 用；未注入为 None）
+    ///
+    /// **信任边界**：完整 `Kernel` 仅授予可信注册工具（见模块文档）；
+    /// 工具可经它 invoke 任意目标、emit 任意消息，不可信工具接入前必须收窄。
+    pub kernel: Option<Kernel>,
+    /// 工件存储句柄（大结果落库用；未注入为 None）
+    ///
+    /// **信任边界**：仅授予可信注册工具；工具可凭 owner 身份写工件。
+    pub artifact_store: Option<Arc<dyn ArtifactStore>>,
+}
+
+impl std::fmt::Debug for ToolContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolContext")
+            .field("tool_call_id", &self.tool_call_id)
+            .field("session_id", &self.session_id)
+            .field("turn_id", &self.turn_id)
+            .field("kernel", &self.kernel.is_some())
+            .field("artifact_store", &self.artifact_store.is_some())
+            .finish()
+    }
 }
 
 /// 工具输出 — execute 的成功返回值
@@ -95,6 +144,11 @@ pub trait Tool: Send + Sync {
     /// 实现方自行解析与校验。
     async fn execute(&self, ctx: ToolContext, args: Value) -> Result<ToolOutput, ToolError>;
 
+    /// 工具分类，决定执行策略（默认 Remote，保证向后兼容）
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Remote
+    }
+
     /// 导出为 `ToolDeclaration`（供 LLM 请求时拼装 `tools` 字段）
     fn to_declaration(&self) -> ToolDeclaration {
         ToolDeclaration {
@@ -136,6 +190,8 @@ mod tests {
             tool_call_id: "tc_1".into(),
             session_id: uuid::Uuid::new_v4(),
             turn_id: 0,
+            kernel: None,
+            artifact_store: None,
         };
         let result = tool.execute(ctx, json!({"text": "hello"})).await.unwrap();
         assert_eq!(result.content, "hello");

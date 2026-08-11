@@ -52,6 +52,8 @@ pub enum RegistryError {
     Duplicate(String),
     #[error("registry full: max {0} tools")]
     Full(usize),
+    #[error("tools are not enabled on this runtime (call with_tools first)")]
+    NotEnabled,
 }
 
 impl ToolRegistry {

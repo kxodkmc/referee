@@ -13,12 +13,14 @@ use std::time::Duration;
 
 use futures::future::join_all;
 use futures::FutureExt;
+use referee_core::Kernel;
 use serde_json::Value;
 use tokio::sync::Semaphore;
 use tracing::{debug, instrument, warn};
 
+use crate::artifact::ArtifactStore;
 use crate::provider::ToolCall;
-use crate::tool::{Tool, ToolContext, ToolError};
+use crate::tool::{Tool, ToolCategory, ToolContext, ToolError};
 
 /// 执行器配置
 #[derive(Debug, Clone)]
@@ -52,10 +54,17 @@ pub struct ExecutedTool {
 ///
 /// 持有配置和 Semaphore，不持有任何可变状态。
 /// 每次 `execute_batch` 创建独立的 permit 上下文。
+///
+/// Phase 3：可注入 `kernel` / `artifact_store` 以启用对等能力
+/// （构造 `ToolContext` 时透传给所有工具，本地工具无感知）。
 #[derive(Clone)]
 pub struct ToolExecutor {
     config: ExecutorConfig,
     semaphore: Arc<Semaphore>,
+    /// 对等 RPC 能力（`AgentTool` 经 `kernel.invoke` 调用目标 Agent）
+    kernel: Option<Kernel>,
+    /// 工件存储能力（大结果落库 + ACL）
+    artifact_store: Option<Arc<dyn ArtifactStore>>,
 }
 
 impl std::fmt::Debug for ToolExecutor {
@@ -64,6 +73,8 @@ impl std::fmt::Debug for ToolExecutor {
             .field("max_per_turn", &self.config.max_per_turn)
             .field("tool_timeout", &self.config.tool_timeout)
             .field("max_concurrency", &self.config.max_concurrency)
+            .field("kernel", &self.kernel.is_some())
+            .field("artifact_store", &self.artifact_store.is_some())
             .finish()
     }
 }
@@ -71,12 +82,29 @@ impl std::fmt::Debug for ToolExecutor {
 impl ToolExecutor {
     pub fn new(config: ExecutorConfig) -> Self {
         let semaphore = Arc::new(Semaphore::new(config.max_concurrency));
-        Self { config, semaphore }
+        Self {
+            config,
+            semaphore,
+            kernel: None,
+            artifact_store: None,
+        }
     }
 
     /// 从默认配置构造
     pub fn with_defaults() -> Self {
         Self::new(ExecutorConfig::default())
+    }
+
+    /// 注入内核句柄（启用对等 RPC 能力）
+    pub fn with_kernel(mut self, kernel: Kernel) -> Self {
+        self.kernel = Some(kernel);
+        self
+    }
+
+    /// 注入工件存储（启用大结果落库能力）
+    pub fn with_artifact_store(mut self, store: Arc<dyn ArtifactStore>) -> Self {
+        self.artifact_store = Some(store);
+        self
     }
 
     /// 配置引用
@@ -126,14 +154,28 @@ impl ToolExecutor {
             .collect();
 
         // 并行执行
+        let kernel = self.kernel.clone();
+        let artifact_store = self.artifact_store.clone();
         let futures: Vec<_> = to_execute
             .into_iter()
             .map(|tc| {
                 let sem = self.semaphore.clone();
                 let registry = registry.clone();
                 let timeout = self.config.tool_timeout;
+                let kernel = kernel.clone();
+                let artifact_store = artifact_store.clone();
                 async move {
-                    execute_single(&registry, tc, session_id, turn_id, timeout, sem).await
+                    execute_single(
+                        &registry,
+                        tc,
+                        session_id,
+                        turn_id,
+                        timeout,
+                        sem,
+                        kernel,
+                        artifact_store,
+                    )
+                    .await
                 }
             })
             .collect();
@@ -144,8 +186,13 @@ impl ToolExecutor {
     }
 }
 
-/// 执行单个工具调用（含 permit 获取 + panic 隔离 + 超时）
-#[instrument(skip(registry, tc, sem), fields(tool_call_id = %tc.id, tool_name = %tc.function.name))]
+/// 执行单个工具调用（分类限流 + panic 隔离 + 超时）
+///
+/// 限流策略：`Remote` 工具获取 Semaphore permit（外部 IO 并发上限）；
+/// `Local` 工具（如 AgentTool）不占槽位，直接执行——避免对等调用
+/// 相互等待外部 IO 槽位的资源池死锁。
+#[instrument(skip(registry, tc, sem, kernel, artifact_store), fields(tool_call_id = %tc.id, tool_name = %tc.function.name))]
+#[allow(clippy::too_many_arguments)]
 async fn execute_single(
     registry: &crate::tool::ToolRegistry,
     tc: ToolCall,
@@ -153,6 +200,8 @@ async fn execute_single(
     turn_id: u64,
     timeout: Duration,
     sem: Arc<Semaphore>,
+    kernel: Option<Kernel>,
+    artifact_store: Option<Arc<dyn ArtifactStore>>,
 ) -> ExecutedTool {
     let tool_call_id = tc.id.clone();
     let tool_name = tc.function.name.clone();
@@ -174,21 +223,27 @@ async fn execute_single(
         }
     };
 
-    // 获取并发 permit
-    let _permit = match sem.acquire_owned().await {
-        Ok(p) => p,
-        Err(_) => {
-            return ExecutedTool {
-                tool_call_id,
-                result: "Failed to acquire concurrency permit".to_string(),
-            };
+    // 按分类获取并发 permit：Remote 受限流，Local 不占槽位
+    let _permit = if tool.category() == ToolCategory::Remote {
+        match sem.acquire_owned().await {
+            Ok(p) => Some(p),
+            Err(_) => {
+                return ExecutedTool {
+                    tool_call_id,
+                    result: "Failed to acquire concurrency permit".to_string(),
+                };
+            }
         }
+    } else {
+        None
     };
 
     let ctx = ToolContext {
         tool_call_id: tool_call_id.clone(),
         session_id,
         turn_id,
+        kernel,
+        artifact_store,
     };
 
     // 执行（panic 隔离 + 超时）
@@ -265,7 +320,6 @@ mod tests {
     }
 
     struct PanicTool;
-
     #[async_trait]
     impl Tool for PanicTool {
         fn name(&self) -> &str {
@@ -279,6 +333,32 @@ mod tests {
         }
         async fn execute(&self, _ctx: ToolContext, _args: Value) -> Result<ToolOutput, ToolError> {
             panic!("boom");
+        }
+    }
+
+    /// Local 工具 — 声明为 Local 分类，不占 Semaphore 槽位
+    struct LocalSlowTool {
+        name: String,
+        delay_ms: u64,
+    }
+
+    #[async_trait]
+    impl Tool for LocalSlowTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "local slow tool"
+        }
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn category(&self) -> ToolCategory {
+            ToolCategory::Local
+        }
+        async fn execute(&self, _ctx: ToolContext, _args: Value) -> Result<ToolOutput, ToolError> {
+            tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+            Ok(ToolOutput::text(self.name.clone()))
         }
     }
 
@@ -411,5 +491,75 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert!(results[0].result.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn local_tools_bypass_semaphore() {
+        // max_concurrency=1：两个 Local 工具仍应并行（不占槽位）
+        let reg = make_registry(vec![
+            Arc::new(LocalSlowTool {
+                name: "local_a".into(),
+                delay_ms: 50,
+            }),
+            Arc::new(LocalSlowTool {
+                name: "local_b".into(),
+                delay_ms: 50,
+            }),
+        ]);
+        let exec = ToolExecutor::new(ExecutorConfig {
+            max_per_turn: 10,
+            tool_timeout: Duration::from_secs(5),
+            max_concurrency: 1,
+        });
+        let calls = vec![make_call("local_a", "{}"), make_call("local_b", "{}")];
+        let start = std::time::Instant::now();
+        let results = exec
+            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0)
+            .await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(results.len(), 2);
+        // 并行：50ms 双任务应远小于串行 100ms
+        assert!(
+            elapsed < Duration::from_millis(95),
+            "local tools should run in parallel, took {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_tools_respect_semaphore() {
+        // max_concurrency=1：两个 Remote 工具串行执行（受槽位限制）
+        let reg = make_registry(vec![
+            Arc::new(SlowTool {
+                name: "r_a".into(),
+                delay_ms: 50,
+                result: "a".into(),
+            }),
+            Arc::new(SlowTool {
+                name: "r_b".into(),
+                delay_ms: 50,
+                result: "b".into(),
+            }),
+        ]);
+        let exec = ToolExecutor::new(ExecutorConfig {
+            max_per_turn: 10,
+            tool_timeout: Duration::from_secs(5),
+            max_concurrency: 1,
+        });
+        let calls = vec![make_call("r_a", "{}"), make_call("r_b", "{}")];
+        let start = std::time::Instant::now();
+        let results = exec
+            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0)
+            .await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(results.len(), 2);
+        // 串行：两个 50ms 任务至少 ~100ms
+        assert!(
+            elapsed >= Duration::from_millis(90),
+            "remote tools should be serialized by semaphore, took {:?}",
+            elapsed
+        );
     }
 }

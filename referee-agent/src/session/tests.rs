@@ -115,6 +115,42 @@ fn finish_thinking_cancelled_to_idle() {
 }
 
 #[test]
+fn finish_thinking_counts_consumed_tokens() {
+    let mut session = Session::new(SessionConfig::default());
+    let (turn_id, _rx) = session.start_thinking().expect("start ok");
+
+    let mut resp = mock_response("hi");
+    resp.usage = Some(TokenUsage {
+        prompt_tokens: 10,
+        completion_tokens: 40,
+        total_tokens: 50,
+        ..Default::default()
+    });
+    session.finish_thinking(turn_id, TurnOutcome::Success(Box::new(resp)));
+
+    assert_eq!(session.consumed_tokens(), 50);
+}
+
+#[test]
+fn finish_thinking_with_tool_calls_also_counts() {
+    // AwaitingCalls 分支（LLM 返回工具调用）同样消耗 token，必须计入
+    let mut session = Session::new(SessionConfig::default());
+    let (turn_id, _rx) = session.start_thinking().expect("start ok");
+
+    let mut resp = mock_tool_response("calling tool", vec![make_tool_call("tc_1", "echo")]);
+    resp.usage = Some(TokenUsage {
+        prompt_tokens: 10,
+        completion_tokens: 40,
+        total_tokens: 50,
+        ..Default::default()
+    });
+    let action = session.finish_thinking(turn_id, TurnOutcome::Success(Box::new(resp)));
+
+    assert!(matches!(action, FinishAction::AwaitingCalls { .. }));
+    assert_eq!(session.consumed_tokens(), 50);
+}
+
+#[test]
 fn finish_thinking_stale_turn_id_ignored() {
     let mut session = Session::new(SessionConfig::default());
     let (_turn_id, _rx) = session.start_thinking().expect("start ok");
