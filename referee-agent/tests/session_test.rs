@@ -30,6 +30,7 @@ use uuid::Uuid;
 
 /// Mock 行为枚举（Clone，可运行时切换）
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
 enum MockBehavior {
     /// 立即返回成功响应
     Ok(ChatResponse),

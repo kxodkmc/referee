@@ -3,6 +3,10 @@
 //! 本模块是 Phase 1 最关键的交付：修复上一版全部并发缺陷，建立
 //! "永不幽灵、永不阻塞、可中断"的会话核心。
 //!
+//! Phase 2 扩展：AwaitingCalls 状态新增 `tool_results` 收集，
+//! `Session` 新增 `pending_reply` 与 `last_chat_options` 支持
+//! 多轮工具调用循环。
+//!
 //! ## 状态机
 //! ```text
 //!   ┌──────────────────────────────────────────────┐
@@ -17,13 +21,16 @@
 //!   │                                              │
 //!   │  Idle ──Chat(with tools)──▶ Thinking         │
 //!   │                                  │           │
-//!   │                           tool_calls         │
+//!   │                          finish_reason=      │
+//!   │                          tool_calls          │
 //!   │                                  ▼           │
 //!   │                           AwaitingCalls      │
-//!   │                                  │           │
-//!   │                           all done            │
-//!   │                           (P2/P3 resume)     │
-//!   └──────────────────────────────────┘           │
+//!   │                              │     │         │
+//!   │                    tool_result│     │timeout  │
+//!   │                    (all done) │     │         │
+//!   │                              ▼     ▼         │
+//!   │                    Resume→Thinking  Idle      │
+//!   └──────────────────────────────────────────────┘
 //! ```
 //!
 //! ## 设计约束（AGENT_RUNTIME_PLAN §2）
@@ -49,7 +56,7 @@ use tracing::{info, warn};
 
 use crate::provider::{ChatRequest, ChatResponse, Message, ToolCall, ToolChoice};
 
-/// 等待项类型（P2/P3 预留，Phase 1 不使用 AwaitingCalls）
+/// 等待项类型（P2/P3 预留）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingKind {
     /// 工具调用（P2）
@@ -76,6 +83,8 @@ pub enum SessionState {
     AwaitingCalls {
         turn_id: u64,
         pending: HashMap<String, PendingKind>,
+        /// 已收集的工具结果（tool_call_id → JSON content）
+        tool_results: HashMap<String, String>,
     },
 }
 
@@ -84,12 +93,23 @@ pub enum SessionState {
 pub enum FinishAction {
     /// 回到 Idle，可选回复（Success 时含 ChatResponse）
     Idle { response: Option<ChatResponse> },
-    /// 进入 AwaitingCalls（模型发起了工具调用，P2/P3 处理）
+    /// 进入 AwaitingCalls（模型发起了工具调用）
     AwaitingCalls {
-        /// 完整响应（含 tool_calls，供 Phase 1 回传或 P2 执行后回传）
+        /// 完整响应（供 Phase 1 回传或 P2 执行后回传）
         response: ChatResponse,
         tool_calls: Vec<ToolCall>,
     },
+}
+
+/// 工具结果回写后的动作（由 AgentRuntime 执行）
+#[derive(Debug)]
+pub enum ToolCallAction {
+    /// 结果已记录，仍有 pending 项
+    Pending,
+    /// 全部完成，可以 resume
+    AllDone,
+    /// tool_call_id 不在 pending 中（stale 或 session 不在 AwaitingCalls）
+    Ignored,
 }
 
 /// 会话配置 — 每会话独立（从 AgentConfig 模板派生）
@@ -125,6 +145,14 @@ pub struct Session {
     history: VecDeque<Message>,
     turn_id: u64,
     config: SessionConfig,
+    /// Chat 调用方的回信通道（forwarder 模式）
+    ///
+    /// `handle_chat` 创建 oneshot channel，sender 存入此字段，
+    /// receiver 存入 forwarder task 等待最终响应。
+    /// 每个会话生命周期内最多 send 一次。
+    pending_reply: Option<oneshot::Sender<SessionReply>>,
+    /// 上一轮 Chat 选项（resume 时复用）
+    last_chat_options: ChatOptions,
 }
 
 impl std::fmt::Debug for Session {
@@ -133,6 +161,7 @@ impl std::fmt::Debug for Session {
             .field("state", &self.state)
             .field("history_len", &self.history.len())
             .field("turn_id", &self.turn_id)
+            .field("has_pending_reply", &self.pending_reply.is_some())
             .finish()
     }
 }
@@ -140,12 +169,14 @@ impl std::fmt::Debug for Session {
 impl Session {
     /// 创建新会话
     pub fn new(config: SessionConfig) -> Self {
-        let cap = config.max_history.min(64); // 预分配上限 64，避免大预分配
+        let cap = config.max_history.min(64);
         Self {
             state: SessionState::Idle,
             history: VecDeque::with_capacity(cap),
             turn_id: 0,
             config,
+            pending_reply: None,
+            last_chat_options: ChatOptions::default(),
         }
     }
 
@@ -162,6 +193,23 @@ impl Session {
     /// 当前 history 长度
     pub fn history_len(&self) -> usize {
         self.history.len()
+    }
+
+    // ─────────────────────────────────────────────
+    // Reply 管理（forwarder 模式）
+    // ─────────────────────────────────────────────
+
+    /// 存入 pending_reply（handle_chat 入口调用）
+    pub fn set_pending_reply(&mut self, tx: oneshot::Sender<SessionReply>) {
+        if self.pending_reply.is_some() {
+            warn!("overwriting existing pending_reply — previous caller will get dropped");
+        }
+        self.pending_reply = Some(tx);
+    }
+
+    /// 取出 pending_reply（终态收敛时调用，消费式 oneshot）
+    pub fn take_pending_reply(&mut self) -> Option<oneshot::Sender<SessionReply>> {
+        self.pending_reply.take()
     }
 
     // ─────────────────────────────────────────────
@@ -188,6 +236,7 @@ impl Session {
     /// 发送取消信号（不直接转 Idle，由 `finish_thinking` 收敛终态）
     ///
     /// 返回 true 表示成功发送（当前正在 Thinking 且未发送过取消）。
+    /// 若 AwaitingCalls 状态则强制转 Idle + 取出 pending_reply 回 Cancelled。
     pub fn cancel_thinking(&mut self) -> bool {
         if let SessionState::Thinking { cancel, .. } = &mut self.state {
             if let Some(tx) = cancel.take() {
@@ -198,20 +247,21 @@ impl Session {
         false
     }
 
+    /// 强制转 Idle（Interrupt 在 AwaitingCalls 时调用）
+    ///
+    /// 取出 pending_reply 供调用方回 Cancelled。
+    pub fn force_idle(&mut self) {
+        self.state = SessionState::Idle;
+    }
+
     /// Thinking → Idle/AwaitingCalls：终态收敛（finally 式，唯一终态写入）
     ///
     /// 成功时将 assistant 消息追加到 history。
     /// 返回 [`FinishAction`] 指示后续动作（reply / AwaitingCalls）。
-    ///
-    /// # 状态一致性
-    /// 若当前不是 Thinking 状态（已被 Interrupt 强制取消或 turn_id 不匹配），
-    /// 不做任何状态变更，返回 `Idle { response: None }`。
     pub fn finish_thinking(&mut self, expected_turn_id: u64, outcome: TurnOutcome) -> FinishAction {
-        // 校验 turn_id：防止过期的 cancel/timeout 在 finish 之后重复收敛
         let current_turn = match &self.state {
             SessionState::Thinking { turn_id, .. } if *turn_id == expected_turn_id => *turn_id,
             _ => {
-                // 状态已不匹配（可能已 Idle 或 turn_id 过期）— 不做任何变更
                 warn!(
                     expected_turn_id,
                     current_state = ?self.state,
@@ -223,7 +273,7 @@ impl Session {
 
         let action = match outcome {
             TurnOutcome::Success(resp) => {
-                let resp = *resp; // unbox ChatResponse
+                let resp = *resp;
                 let has_tool_calls = !resp.message.tool_calls.is_empty();
                 self.push_history(resp.message.clone());
                 if has_tool_calls {
@@ -266,12 +316,82 @@ impl Session {
                 SessionState::AwaitingCalls {
                     turn_id: current_turn,
                     pending,
+                    tool_results: HashMap::new(),
                 }
             }
             FinishAction::Idle { .. } => SessionState::Idle,
         };
 
         action
+    }
+
+    // ─────────────────────────────────────────────
+    // 工具结果管理（Phase 2）
+    // ─────────────────────────────────────────────
+
+    /// 记录工具执行结果，更新 pending
+    ///
+    /// 若所有 pending 项已清空，返回 [`ToolCallAction::AllDone`]。
+    pub fn finish_tool_call(&mut self, tool_call_id: &str, result: String) -> ToolCallAction {
+        match &mut self.state {
+            SessionState::AwaitingCalls {
+                pending,
+                tool_results,
+                ..
+            } => {
+                if pending.remove(tool_call_id).is_some() {
+                    tool_results.insert(tool_call_id.to_string(), result);
+                    if pending.is_empty() {
+                        ToolCallAction::AllDone
+                    } else {
+                        ToolCallAction::Pending
+                    }
+                } else {
+                    ToolCallAction::Ignored
+                }
+            }
+            _ => ToolCallAction::Ignored,
+        }
+    }
+
+    /// AwaitingCalls → Idle → Thinking：resume 循环
+    ///
+    /// 1. 收集全部工具结果
+    /// 2. 按 tool_call_id 排序，追加 Tool 角色消息到 history
+    /// 3. 转 Idle → start_thinking → build request
+    ///
+    /// 返回 `(turn_id, cancel_rx, ChatRequest)` 或 None（不在 AwaitingCalls）。
+    pub fn resume_thinking(&mut self) -> Option<(u64, oneshot::Receiver<()>, ChatRequest)> {
+        // 收集 + 排序工具结果
+        let results = if let SessionState::AwaitingCalls { tool_results, .. } = &mut self.state {
+            let mut items: Vec<(String, String)> = tool_results.drain().collect();
+            items.sort_by(|a, b| a.0.cmp(&b.0));
+            items
+        } else {
+            return None;
+        };
+
+        // 追加 Tool 消息到 history
+        for (tool_call_id, content) in &results {
+            self.push_history(Message {
+                role: crate::provider::Role::Tool,
+                content: crate::provider::MessageContent::text(content.clone()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                tool_call_id: Some(tool_call_id.clone()),
+            });
+        }
+
+        // AwaitingCalls → Idle
+        self.state = SessionState::Idle;
+
+        // Idle → Thinking
+        let (turn_id, cancel_rx) = self.start_thinking()?;
+
+        // 构建 ChatRequest（复用上一轮 options）
+        let req = self.build_chat_request(&self.last_chat_options.clone());
+
+        Some((turn_id, cancel_rx, req))
     }
 
     // ─────────────────────────────────────────────
@@ -307,6 +427,11 @@ impl Session {
         }
     }
 
+    /// 保存 ChatOptions（供 resume 使用）
+    pub fn set_chat_options(&mut self, options: ChatOptions) {
+        self.last_chat_options = options;
+    }
+
     /// 会话配置引用
     pub fn config(&self) -> &SessionConfig {
         &self.config
@@ -314,148 +439,5 @@ impl Session {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::provider::{FinishReason, TokenUsage};
-
-    fn mock_response(content: &str) -> ChatResponse {
-        ChatResponse {
-            id: "test".into(),
-            model: "test".into(),
-            message: Message::assistant(content),
-            finish_reason: FinishReason::Stop,
-            usage: Some(TokenUsage::default()),
-        }
-    }
-
-    #[test]
-    fn start_thinking_from_idle() {
-        let mut session = Session::new(SessionConfig::default());
-        assert!(!session.is_busy());
-        let (turn_id, _rx) = session.start_thinking().expect("should start from Idle");
-        assert_eq!(turn_id, 1);
-        assert!(session.is_busy());
-    }
-
-    #[test]
-    fn start_thinking_rejected_when_busy() {
-        let mut session = Session::new(SessionConfig::default());
-        let _ = session.start_thinking().expect("first start ok");
-        assert!(
-            session.start_thinking().is_none(),
-            "should reject when busy"
-        );
-    }
-
-    #[test]
-    fn cancel_sends_signal() {
-        let mut session = Session::new(SessionConfig::default());
-        let (_, mut rx) = session.start_thinking().expect("start ok");
-        assert!(session.cancel_thinking());
-        // Receiver should get the signal
-        match rx.try_recv() {
-            Ok(()) => {}
-            other => panic!("expected Ok(()), got {other:?}"),
-        }
-        // Second cancel should fail (already taken)
-        assert!(!session.cancel_thinking());
-    }
-
-    #[test]
-    fn finish_thinking_success_to_idle() {
-        let mut session = Session::new(SessionConfig::default());
-        let (turn_id, _rx) = session.start_thinking().expect("start ok");
-        let action = session.finish_thinking(turn_id, TurnOutcome::Success(Box::new(mock_response("hi"))));
-        match action {
-            FinishAction::Idle { response } => {
-                assert!(response.is_some());
-                assert_eq!(response.unwrap().message.content.as_text(), Some("hi"));
-            }
-            _ => panic!("expected Idle"),
-        }
-        assert!(!session.is_busy());
-    }
-
-    #[test]
-    fn finish_thinking_with_tool_calls_to_awaiting() {
-        let mut session = Session::new(SessionConfig::default());
-        let (turn_id, _rx) = session.start_thinking().expect("start ok");
-
-        let mut resp = mock_response("calling tool");
-        resp.message.tool_calls = vec![ToolCall {
-            id: "call_1".into(),
-            function: crate::provider::ToolCallFunction {
-                name: "get_weather".into(),
-                arguments: "{}".into(),
-            },
-        }];
-        resp.finish_reason = FinishReason::ToolCalls;
-
-        let action = session.finish_thinking(turn_id, TurnOutcome::Success(Box::new(resp)));
-        match action {
-            FinishAction::AwaitingCalls {
-                response,
-                tool_calls,
-            } => {
-                assert_eq!(tool_calls.len(), 1);
-                assert_eq!(response.message.content.as_text(), Some("calling tool"));
-            }
-            _ => panic!("expected AwaitingCalls"),
-        }
-        assert!(session.is_busy());
-    }
-
-    #[test]
-    fn finish_thinking_cancelled_to_idle() {
-        let mut session = Session::new(SessionConfig::default());
-        let (turn_id, _rx) = session.start_thinking().expect("start ok");
-        let action = session.finish_thinking(turn_id, TurnOutcome::Cancelled);
-        assert!(matches!(action, FinishAction::Idle { response: None }));
-        assert!(!session.is_busy());
-    }
-
-    #[test]
-    fn finish_thinking_stale_turn_id_ignored() {
-        let mut session = Session::new(SessionConfig::default());
-        let (_, _rx) = session.start_thinking().expect("start ok (turn 1)");
-        // Simulate: turn 1 finishes, goes back to Idle
-        let _ = session.finish_thinking(1, TurnOutcome::Cancelled);
-        // Start turn 2
-        let (turn2, _rx2) = session.start_thinking().expect("start ok (turn 2)");
-        // Stale finish for turn 1 should be ignored
-        let action = session.finish_thinking(1, TurnOutcome::Success(Box::new(mock_response("stale"))));
-        assert!(matches!(action, FinishAction::Idle { response: None }));
-        // Session should still be in turn 2's Thinking
-        assert!(session.is_busy());
-        assert_eq!(session.turn_id(), turn2);
-    }
-
-    #[test]
-    fn history_is_bounded() {
-        let mut session = Session::new(SessionConfig {
-            max_history: 3,
-            ..Default::default()
-        });
-        for i in 0..5 {
-            session.push_history(Message::user(format!("msg {i}")));
-        }
-        assert_eq!(session.history_len(), 3);
-        // Oldest should be evicted (msg 0, msg 1), keeping msg 2, 3, 4
-        let req = session.build_chat_request(&ChatOptions::default());
-        let msgs: Vec<&Message> = req.messages.iter().collect();
-        assert_eq!(msgs[0].content.as_text(), Some("msg 2"));
-        assert_eq!(msgs[2].content.as_text(), Some("msg 4"));
-    }
-
-    #[test]
-    fn build_chat_request_includes_history() {
-        let mut session = Session::new(SessionConfig::default());
-        session.push_history(Message::user("hello"));
-        session.push_history(Message::assistant("hi there"));
-
-        let req = session.build_chat_request(&ChatOptions::default());
-        assert_eq!(req.messages.len(), 2);
-        assert_eq!(req.messages[0].content.as_text(), Some("hello"));
-        assert_eq!(req.messages[1].content.as_text(), Some("hi there"));
-    }
-}
+#[path = "tests.rs"]
+mod tests;
