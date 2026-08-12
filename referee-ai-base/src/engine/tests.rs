@@ -29,6 +29,10 @@ struct MockProvider {
     id: &'static str,
     responses: Arc<parking_lot::Mutex<VecDeque<Result<ChatResponse, LlmError>>>>,
     call_count: Arc<AtomicUsize>,
+    /// 每次请求的 messages 文本（验证异步注入等请求内容）
+    requests: Arc<parking_lot::Mutex<Vec<String>>>,
+    /// 每次请求的工具声明名（逗号分隔；验证嵌套深度过滤）
+    requests_tools: Arc<parking_lot::Mutex<Vec<String>>>,
 }
 
 fn caps() -> &'static ProviderCapabilities {
@@ -83,6 +87,8 @@ fn mock(responses: Vec<Result<ChatResponse, LlmError>>) -> Arc<MockProvider> {
         id: "mock",
         responses: Arc::new(parking_lot::Mutex::new(responses.into())),
         call_count: Arc::new(AtomicUsize::new(0)),
+        requests: Arc::new(parking_lot::Mutex::new(Vec::new())),
+        requests_tools: Arc::new(parking_lot::Mutex::new(Vec::new())),
     })
 }
 
@@ -94,8 +100,22 @@ impl LLMProvider for MockProvider {
     fn capabilities(&self) -> &ProviderCapabilities {
         caps()
     }
-    async fn chat(&self, _req: crate::provider::ChatRequest) -> Result<ChatResponse, LlmError> {
+    async fn chat(&self, req: crate::provider::ChatRequest) -> Result<ChatResponse, LlmError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
+        let text = req
+            .messages
+            .iter()
+            .map(|m| m.content.as_text().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.requests.lock().push(text);
+        let tools = req
+            .tools
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        self.requests_tools.lock().push(tools);
         self.responses
             .lock()
             .pop_front()
@@ -163,6 +183,10 @@ async fn multi_turn_tool_loop() {
     impl Tool for EchoTool {
         fn name(&self) -> &str {
             "echo"
+        }
+        // 工具配置默认等待：本测试验证同步多轮收敛
+        fn default_wait(&self) -> bool {
+            true
         }
         fn description(&self) -> &str {
             "echo"
@@ -293,6 +317,10 @@ async fn tool_panic_isolated() {
         fn name(&self) -> &str {
             "boom"
         }
+        // 工具配置默认等待：本测试验证同步多轮收敛
+        fn default_wait(&self) -> bool {
+            true
+        }
         fn description(&self) -> &str {
             "panics"
         }
@@ -375,6 +403,10 @@ async fn multi_turn_accumulates_all_round_tokens() {
     impl Tool for AccumEcho {
         fn name(&self) -> &str {
             "accum_echo"
+        }
+        // 工具配置默认等待：本测试验证同步多轮收敛
+        fn default_wait(&self) -> bool {
+            true
         }
         fn description(&self) -> &str {
             "echo"
@@ -563,4 +595,180 @@ async fn session_reusable_after_cancel() {
 
     // history 记录了两轮用户消息（被拒的除外），不因中断而丢失状态一致
     assert_eq!(engine.history_len(sid), Some(2));
+}
+
+// ─────────────────────────────────────────────
+// 异步派发（不等待工具）— 端到端：纯派发轮立即结束，结果下一回合注入
+// ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn async_dispatch_injected_on_next_round() {
+    // 默认不等待（未覆写 default_wait）的慢工具
+    #[async_trait::async_trait]
+    impl Tool for SlowAsyncTool {
+        fn name(&self) -> &str {
+            "slow_async"
+        }
+        fn description(&self) -> &str {
+            "slow async tool"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _c: ToolContext,
+            _a: serde_json::Value,
+        ) -> Result<ToolOutput, ToolError> {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            Ok(ToolOutput::text("async_result"))
+        }
+    }
+    struct SlowAsyncTool;
+
+    let registry = ToolRegistry::new(RegistryConfig::default());
+    registry.register(Arc::new(SlowAsyncTool)).unwrap();
+    let executor = crate::tool::ToolExecutor::new(ExecutorConfig {
+        max_per_turn: 10,
+        tool_timeout: Duration::from_secs(2),
+        max_concurrency: 5,
+    });
+    let provider = mock(vec![
+        Ok(resp("dispatching", vec![tool_call("slow_async")])),
+        Ok(resp("done", vec![])),
+    ]);
+    let engine = Engine::new(provider.clone(), config()).with_tools(registry, executor);
+    let sid = session_id();
+
+    // 第一回合：不等待 → 立即返回模型原文，绝不阻塞 150ms 慢工具
+    let start = std::time::Instant::now();
+    let r1 = wait_with_timeout(engine.chat(sid, chat_payload("go")).unwrap()).await;
+    let elapsed = start.elapsed();
+    match r1 {
+        EngineReply::Success(r) => assert_eq!(r.message.content.as_text().unwrap(), "dispatching"),
+        other => panic!("expected immediate Success, got {other:?}"),
+    }
+    assert!(
+        elapsed < Duration::from_millis(150),
+        "main agent must not block on async tool, took {elapsed:?}"
+    );
+
+    // 等待后台完成并注入（工具 150ms + 余量，纯内存注入即时生效）
+    tokio::time::sleep(Duration::from_millis(350)).await;
+
+    // 第二回合：注入结果应出现在本次请求上下文中（不为此主动触发 LLM）
+    let r2 = wait_with_timeout(engine.chat(sid, chat_payload("again")).unwrap()).await;
+    assert!(matches!(
+        r2,
+        EngineReply::Success(r) if r.message.content.as_text().unwrap() == "done"
+    ));
+    let reqs = provider.requests.lock();
+    let last = reqs.last().expect("second request recorded");
+    assert!(
+        last.contains("async_result"),
+        "async result must be injected into next-round context: {last}"
+    );
+    assert!(
+        last.contains("[async tool 'slow_async' completed]"),
+        "injection must carry tool name: {last}"
+    );
+}
+
+// ─────────────────────────────────────────────
+// 子智能体嵌套深度限制 — 声明过滤 + 执行兜底
+// ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn subagent_depth_limit_enforced() {
+    // 深度受限工具（模拟子 Agent 工具）
+    #[async_trait::async_trait]
+    impl Tool for SubAgentTool {
+        fn name(&self) -> &str {
+            "sub"
+        }
+        fn description(&self) -> &str {
+            "subagent tool"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn depth_limited(&self) -> bool {
+            true
+        }
+        // 短查询类工具默认同步等待（聚焦深度限制语义）
+        fn default_wait(&self) -> bool {
+            true
+        }
+        async fn execute(
+            &self,
+            _c: ToolContext,
+            _a: serde_json::Value,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text("sub_ok"))
+        }
+    }
+    struct SubAgentTool;
+
+    let registry = ToolRegistry::new(RegistryConfig::default());
+    registry.register(Arc::new(SubAgentTool)).unwrap();
+    let executor = crate::tool::ToolExecutor::new(ExecutorConfig {
+        max_per_turn: 10,
+        tool_timeout: Duration::from_secs(2),
+        max_concurrency: 5,
+    });
+    let config = EngineConfig {
+        max_subagent_depth: 2,
+        ..config()
+    };
+    let provider = mock(vec![
+        // B 层（深度 1）：调用 sub 应执行 → resume 第二轮
+        Ok(resp("call sub", vec![tool_call("sub")])),
+        Ok(resp("b done", vec![])),
+        // C 层（深度 2）：发起 sub 调用应被拒绝 → 回合直接结束（仅一轮）
+        Ok(resp("call sub again", vec![tool_call("sub")])),
+    ]);
+    let engine = Engine::new(provider.clone(), config).with_tools(registry, executor);
+
+    // B 层（peer_depth=1）：声明含 sub，调用成功（两轮 LLM）
+    let sid_b = session_id();
+    let payload = ChatPayload {
+        message: Message::user("go"),
+        options: ChatOptions {
+            peer_depth: 1,
+            ..Default::default()
+        },
+    };
+    let r1 = wait_with_timeout(engine.chat(sid_b, payload).unwrap()).await;
+    assert!(matches!(
+        r1,
+        EngineReply::Success(r) if r.message.content.as_text().unwrap() == "b done"
+    ));
+    assert!(
+        provider.requests_tools.lock()[0].contains("sub"),
+        "depth 1 must keep subagent tool declaration"
+    );
+
+    // C 层（peer_depth=2）：声明剔除 sub；即便发起调用也被拒绝（仅一轮，无 resume）
+    let sid_c = session_id();
+    let payload = ChatPayload {
+        message: Message::user("go"),
+        options: ChatOptions {
+            peer_depth: 2,
+            ..Default::default()
+        },
+    };
+    let r2 = wait_with_timeout(engine.chat(sid_c, payload).unwrap()).await;
+    assert!(matches!(
+        r2,
+        EngineReply::Success(r) if r.message.content.as_text().unwrap() == "call sub again"
+    ));
+    assert_eq!(
+        provider.call_count.load(Ordering::SeqCst),
+        3,
+        "depth-limited call must be rejected without a resume round"
+    );
+    assert!(
+        !provider.requests_tools.lock().last().unwrap().contains("sub"),
+        "depth 2 must drop subagent tool declaration"
+    );
 }

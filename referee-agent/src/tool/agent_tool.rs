@@ -6,11 +6,14 @@
 //! ## 设计要点
 //! - **Local 分类**：`category() = Local`，不占用 `ToolExecutor` 外部 IO 槽位，
 //!   避免对等调用相互等待外部 IO 槽位的资源池死锁。
+//! - **默认不等待**：未配置 `default_wait`（trait 默认 `false`）——子智能体默认
+//!   异步派发并行执行，主智能体不阻塞；调用方可传保留参数 `wait: true` 强制同步。
 //! - **同步 RPC**：`execute` 经 `ToolContext.kernel.invoke` 发起请求-响应调用
 //!   （带超时）。invoke 在派生任务（引擎回合）中执行，不违反「handle 内零阻塞」。
 //! - **循环调用拒绝**：目标 Agent 忙碌时返回 `Busy` → 转为错误结果，系统不挂死。
-//! - **大结果落库**：返回文本超阈值时写入带 ACL 的 [`ArtifactStore`]，并将调用者
-//!   显式加入 `allowed_readers`，仅回传 Artifact ID（业务层安全能力）。
+//! - **成果落库**：非等待模式下无论结果大小都写入带 ACL 的 [`ArtifactStore`] 并
+//!   将调用者显式加入 `allowed_readers`，仅回传 Artifact ID（主智能体只收到
+//!   「完成与否」通知，自主决定是否查看原文）；等待模式仅大结果落库。
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -18,7 +21,7 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use referee_ai_base::provider::Message;
-use referee_ai_base::session::{ChatPayload, SessionMessage, SessionReply};
+use referee_ai_base::session::{ChatOptions, ChatPayload, SessionMessage, SessionReply};
 use referee_ai_base::tool::{Tool, ToolCategory, ToolContext, ToolError, ToolOutput};
 use serde_json::{json, Value};
 
@@ -89,6 +92,11 @@ impl Tool for AgentTool {
         ToolCategory::Local
     }
 
+    /// 子 Agent 工具受嵌套深度限制：达上限的会话无法再调用（声明过滤 + 执行兜底）
+    fn depth_limited(&self) -> bool {
+        true
+    }
+
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
@@ -111,12 +119,15 @@ impl Tool for AgentTool {
             ToolError::Execution("peer RPC not enabled: kernel not injected".into())
         })?;
 
-        // 3. 发起同步 RPC 调用（不占用 ToolExecutor 槽位）
+        // 3. 发起同步 RPC 调用（不占用 ToolExecutor 槽位）；嵌套深度 +1 透传
         let msg = SessionMessage::Chat {
             session_id: self.target_session_id,
             payload: ChatPayload {
                 message: Message::user(task),
-                options: Default::default(),
+                options: ChatOptions {
+                    peer_depth: ctx.peer_depth + 1,
+                    ..Default::default()
+                },
             },
         };
         let resp_env = kernel
@@ -132,8 +143,10 @@ impl Tool for AgentTool {
             SessionReply::Success { message, .. } => {
                 let content = message.content.as_text().unwrap_or("").to_string();
 
-                // 5. 大结果落库：写入 ArtifactStore + 显式授权调用者读取（业务层 ACL）
-                if content.len() > LARGE_RESULT_THRESHOLD {
+                // 5. 成果落库：非等待（异步派发）时无论大小都落库成果板，仅回传
+                //    Artifact ID（主智能体只收到「完成与否」通知，自主决定是否查看原文）；
+                //    等待模式仅大结果落库（避免截断长文本）。
+                if !ctx.wait || content.len() > LARGE_RESULT_THRESHOLD {
                     if let Some(store) = &self.artifact_store {
                         let artifact = Artifact {
                             id: uuid::Uuid::new_v4().to_string(),

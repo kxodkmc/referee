@@ -35,7 +35,7 @@ use crate::session::{
     ChatPayload, FinishAction, RoundStart, Session, SessionConfig, SessionId, SessionReply,
     TurnOutcome,
 };
-use crate::tool::{ToolExecutor, ToolRegistry};
+use crate::tool::{ExecutedTool, ToolExecutor, ToolRegistry};
 
 /// 引擎配置
 #[derive(Debug, Clone)]
@@ -48,6 +48,11 @@ pub struct EngineConfig {
     pub cache: CacheConfig,
     /// 最大并发会话数（超限拒绝新会话）
     pub max_sessions: usize,
+    /// 子智能体最大嵌套深度（0 = 主调用；达上限的会话无法再调用子 Agent）
+    ///
+    /// 例：`max_subagent_depth = 2` 允许 主A → 子B → 附属C（C 深度 2 达上限，
+    /// 不能再调更深的子 Agent），B（深度 1）仍可调用。
+    pub max_subagent_depth: u32,
 }
 
 impl Default for EngineConfig {
@@ -57,6 +62,7 @@ impl Default for EngineConfig {
             budget: BudgetConfig::default(),
             cache: CacheConfig::default(),
             max_sessions: 100,
+            max_subagent_depth: 2,
         }
     }
 }
@@ -239,11 +245,14 @@ impl Engine {
             return Err(EngineStartError::Budget(e));
         }
 
-        // 2. 注入工具声明（若本轮未显式指定）
+        // 2. 注入工具声明（若本轮未显式指定）；按嵌套深度过滤子 Agent 工具
         let mut options = payload.options;
         if let Some(registry) = &self.tools {
             if options.tools.is_empty() {
-                options.tools = registry.declarations();
+                options.tools = registry.declarations_for_depth(
+                    options.peer_depth,
+                    self.config.max_subagent_depth,
+                );
             }
         }
 
@@ -475,9 +484,13 @@ impl Engine {
                         }
                         return EngineReply::Success(Box::new(response));
                     }
-                    // 执行工具（并行 + 截断 + 隔离 + 超时），随后进入恢复轮
-                    self.execute_tools(session_id, tool_calls).await;
-                    // src 已在迭代顶部置为 RoundSource::Resume，循环继续恢复
+                    // 工具轮：截断 → 按 wait 分流 → 等待类同步 / 派发类后台注入
+                    match self.run_tool_calls(session_id, turn_id, tool_calls).await {
+                        // 有待等待的工具 → 循环继续恢复（src 已在迭代顶部置为 Resume）
+                        ToolRound::Resume => {}
+                        // 纯派发轮（全部不等待）→ 回合就此结束，返回模型原文
+                        ToolRound::Settled => return EngineReply::Success(Box::new(response)),
+                    }
                 }
             }
         }
@@ -490,30 +503,127 @@ impl Engine {
             .map(|s| s.is_interrupted())
             .unwrap_or(false)
     }
-    /// 执行一批工具调用，将结果回写进 session 的 AwaitingCalls pending
-    async fn execute_tools(
+    /// 一轮工具调用的完整处理：截断 → 按 wait 分流 → 等待类同步 / 派发类后台注入
+    ///
+    /// - 截断项：生成引导错误消息（下一轮重发），立即收敛
+    /// - 派发类（不等待）：占位结果立即收敛（保证 assistant tool_calls 与 tool 结果
+    ///   配对），后台任务执行完成后结果入队，等待下一次模型调用/回合合并注入
+    /// - 等待类：同步执行（并行 + 隔离 + 超时），完成后收敛结果
+    async fn run_tool_calls(
         &self,
         session_id: &SessionId,
-        tool_calls: Vec<crate::provider::ToolCall>,
-    ) {
-        let Some(registry) = self.tools.clone() else {
-            return;
-        };
-        let Some(executor) = self.tool_executor.clone() else {
-            return;
+        turn_id: u64,
+        mut tool_calls: Vec<crate::provider::ToolCall>,
+    ) -> ToolRound {
+        let (registry, executor) = match (&self.tools, &self.tool_executor) {
+            (Some(r), Some(e)) => (r.clone(), e.clone()),
+            _ => return ToolRound::Settled,
         };
 
-        let results = executor
-            .execute_batch(tool_calls, &registry, *session_id, 0)
-            .await;
+        // 0. 深度兜底（声明层过滤被绕过时的防线）：嵌套深度达上限的会话
+        //    拒绝调用子 Agent 工具（depth_limited），生成明确错误并立即收敛
+        let depth = self
+            .sessions
+            .get(session_id)
+            .map(|s| s.peer_depth())
+            .unwrap_or(0);
+        if depth >= self.config.max_subagent_depth {
+            let (blocked, rest): (Vec<_>, Vec<_>) = tool_calls.into_iter().partition(|tc| {
+                registry
+                    .get(&tc.function.name)
+                    .map(|t| t.depth_limited())
+                    .unwrap_or(false)
+            });
+            for tc in blocked {
+                if let Some(mut s) = self.sessions.get_mut(session_id) {
+                    s.finish_tool_call(&tc.id, DEPTH_LIMIT_MESSAGE.to_string());
+                }
+            }
+            tool_calls = rest;
+        }
 
-        for r in results {
-            observe::tool_completed(!r.result.is_empty());
+        // 1. 截断：超出 max_per_turn 的生成引导错误（由调用方统一截断一次）
+        let (head, tail) = executor.truncate(tool_calls);
+        for tc in tail {
             if let Some(mut s) = self.sessions.get_mut(session_id) {
-                s.finish_tool_call(&r.tool_call_id, r.result);
+                s.finish_tool_call(
+                    &tc.id,
+                    format!(
+                        "Exceeds max_tools_per_turn limit ({}). \
+                         Please re-issue this tool call in the next turn.",
+                        executor.config().max_per_turn
+                    ),
+                );
             }
         }
+
+        // 2. 按等待决策分流
+        let (waiting, dispatched) = executor.split_by_wait(head, &registry);
+
+        // 3. 派发类：占位收敛 + 后台执行完成后入队注入
+        if !dispatched.is_empty() {
+            for tc in &dispatched {
+                if let Some(mut s) = self.sessions.get_mut(session_id) {
+                    s.finish_tool_call(&tc.id, DISPATCHED_PLACEHOLDER.to_string());
+                }
+            }
+            let handles = executor.dispatch_batch(dispatched, &registry, *session_id, turn_id, depth);
+            let engine = self.clone();
+            let sid = *session_id;
+            tokio::spawn(async move {
+                for h in handles {
+                    let r = h.await.unwrap_or_else(|_| ExecutedTool {
+                        tool_call_id: String::new(),
+                        tool_name: "<unknown>".into(),
+                        result: "async tool task panicked".into(),
+                    });
+                    observe::tool_completed(!r.result.is_empty());
+                    let text = format!("[async tool '{}' completed]\n{}", r.tool_name, r.result);
+                    if let Some(mut s) = engine.sessions.get_mut(&sid) {
+                        s.inject_tool_result(text);
+                    }
+                }
+            });
+        }
+
+        // 4. 等待类：同步执行并收敛结果
+        if !waiting.is_empty() {
+            let results = executor
+                .execute_batch(waiting, &registry, *session_id, turn_id, depth)
+                .await;
+            for r in results {
+                observe::tool_completed(!r.result.is_empty());
+                if let Some(mut s) = self.sessions.get_mut(session_id) {
+                    s.finish_tool_call(&r.tool_call_id, r.result);
+                }
+            }
+            return ToolRound::Resume;
+        }
+
+        // 5. 纯派发轮：占位 Tool 消息落 history → Idle（回合结束）
+        if let Some(mut s) = self.sessions.get_mut(session_id) {
+            s.settle_dispatched();
+        }
+        ToolRound::Settled
     }
+}
+
+/// 派发类（不等待）工具的占位结果 — 立即收敛进 history，满足厂商协议
+/// assistant tool_calls 与 tool 结果配对；真实结果完成后入队，在**下一次**
+/// 模型调用/回合时合并注入（绝不为此主动触发 LLM）。
+const DISPATCHED_PLACEHOLDER: &str =
+    "Task dispatched (async execution); real result will be injected into a later turn.";
+
+/// 子智能体嵌套深度超限的拒绝消息（执行层兜底）
+const DEPTH_LIMIT_MESSAGE: &str =
+    "Rejected: subagent nesting depth limit reached. This agent cannot call sub-agents.";
+
+/// 工具轮处理结果
+enum ToolRound {
+    /// 有待等待的工具 → 继续 resume 循环
+    Resume,
+    /// 纯派发轮（全部不等待）→ 回合就此结束
+    Settled,
 }
 
 /// 每轮输入来源

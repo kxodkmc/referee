@@ -170,11 +170,22 @@ pub struct Session {
     /// receiver 存入 forwarder task 等待最终响应。
     /// 每个会话生命周期内最多 send 一次。
     pending_reply: Option<oneshot::Sender<SessionReply>>,
+    /// 本会话的子智能体嵌套深度（start_round 时从 ChatOptions 设置，回合内保持）
+    peer_depth: u32,
     /// 上一轮 Chat 选项（resume 时复用）
     last_chat_options: ChatOptions,
     /// 【预算治理】本会话已消耗 Token 数（finish_thinking 成功分支累加）
     consumed_tokens: u64,
+    /// 【异步工具】已完成但尚未注入的不等待工具结果队列
+    ///
+    /// 派发类（wait=false）工具后台完成后入队；在**下一次**模型调用/回合构建
+    /// 请求时作为 user 消息合并注入 history。绝不为此主动触发 LLM 调用。
+    /// 有界：超限丢弃最旧（背压硬约束，防结果堆积无界增长）。
+    pending_injections: VecDeque<String>,
 }
+
+/// 异步工具结果注入队列容量上限（超限丢最旧 + 告警）
+const MAX_PENDING_INJECTIONS: usize = 64;
 
 impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -201,6 +212,8 @@ impl Session {
             pending_reply: None,
             last_chat_options: ChatOptions::default(),
             consumed_tokens: 0,
+            pending_injections: VecDeque::new(),
+            peer_depth: 0,
         }
     }
 
@@ -217,6 +230,11 @@ impl Session {
     /// 当前 history 长度
     pub fn history_len(&self) -> usize {
         self.history.len()
+    }
+
+    /// 本会话的子智能体嵌套深度（0 = 主调用；经子 Agent 工具调用时递增）
+    pub fn peer_depth(&self) -> u32 {
+        self.peer_depth
     }
 
     /// 本会话已消耗 Token 数（预算治理计量）
@@ -285,6 +303,10 @@ impl Session {
         };
         self.push_history(message);
         self.last_chat_options = options.clone();
+        // 记录本轮子智能体嵌套深度（回合内 resume 保持不变）
+        self.peer_depth = options.peer_depth;
+        // 合并注入：新回合构建请求前，把已完成的不等待工具结果追加为 user 消息
+        self.flush_injections();
         let request = self.build_chat_request(options);
         Some(RoundStart {
             turn_id,
@@ -409,6 +431,30 @@ impl Session {
     // 工具结果管理（Phase 2）
     // ─────────────────────────────────────────────
 
+    /// 登记异步（不等待）工具完成结果 — 入队，等待下一次模型调用/回合时注入。
+    /// 队列有界：超限丢弃最旧（背压硬约束），绝不无界增长。
+    pub fn inject_tool_result(&mut self, content: String) {
+        if content.is_empty() {
+            return;
+        }
+        if self.pending_injections.len() >= MAX_PENDING_INJECTIONS {
+            warn!(
+                "async tool result queue full, dropping oldest ({} pending)",
+                self.pending_injections.len()
+            );
+            self.pending_injections.pop_front();
+        }
+        self.pending_injections.push_back(content);
+    }
+
+    /// 把已完成的异步工具结果作为 user 消息追加到 history（仅非空时）
+    fn flush_injections(&mut self) {
+        let pending: Vec<String> = self.pending_injections.drain(..).collect();
+        for content in pending {
+            self.push_history(Message::user(content));
+        }
+    }
+
     /// 记录工具执行结果，更新 pending
     ///
     /// 若所有 pending 项已清空，返回 [`ToolCallAction::AllDone`]。
@@ -436,31 +482,21 @@ impl Session {
 
     /// AwaitingCalls → Idle → Thinking：resume 循环
     ///
-    /// 1. 收集全部工具结果
-    /// 2. 按 tool_call_id 排序，追加 Tool 角色消息到 history
+    /// 1. 收集全部工具结果（含派发类占位）并追加 Tool 消息
+    /// 2. 合并注入：已完成的不等待工具结果作为 user 消息追加
     /// 3. 转 Idle → start_thinking → build request
     ///
     /// 返回 `(turn_id, cancel_rx, ChatRequest)` 或 None（不在 AwaitingCalls）。
     pub fn resume_thinking(&mut self) -> Option<(u64, oneshot::Receiver<()>, ChatRequest)> {
-        // 收集 + 排序工具结果
-        let results = if let SessionState::AwaitingCalls { tool_results, .. } = &mut self.state {
-            let mut items: Vec<(String, String)> = tool_results.drain().collect();
-            items.sort_by(|a, b| a.0.cmp(&b.0));
-            items
-        } else {
+        // 仅 AwaitingCalls 可 resume（保持原语义：非等待态返回 None）
+        if !matches!(self.state, SessionState::AwaitingCalls { .. }) {
             return None;
-        };
-
-        // 追加 Tool 消息到 history
-        for (tool_call_id, content) in &results {
-            self.push_history(Message {
-                role: crate::provider::Role::Tool,
-                content: crate::provider::MessageContent::text(content.clone()),
-                reasoning_content: None,
-                tool_calls: Vec::new(),
-                tool_call_id: Some(tool_call_id.clone()),
-            });
         }
+        // 1. 收集 + 追加工具结果（含派发占位）
+        self.append_tool_results();
+
+        // 2. 合并注入（已完成的不等待工具结果）
+        self.flush_injections();
 
         // AwaitingCalls → Idle
         self.state = SessionState::Idle;
@@ -472,6 +508,41 @@ impl Session {
         let req = self.build_chat_request(&self.last_chat_options.clone());
 
         Some((turn_id, cancel_rx, req))
+    }
+
+    /// 收集 AwaitingCalls 的工具结果（排序）+ 追加 Tool 消息到 history
+    fn append_tool_results(&mut self) {
+        let results = if let SessionState::AwaitingCalls { tool_results, .. } = &mut self.state {
+            let mut items: Vec<(String, String)> = tool_results.drain().collect();
+            items.sort_by(|a, b| a.0.cmp(&b.0));
+            items
+        } else {
+            return;
+        };
+
+        for (tool_call_id, content) in &results {
+            self.push_history(Message {
+                role: crate::provider::Role::Tool,
+                content: crate::provider::MessageContent::text(content.clone()),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                tool_call_id: Some(tool_call_id.clone()),
+            });
+        }
+    }
+
+    /// 纯派发轮收尾：把 AwaitingCalls 的占位工具结果追加为 Tool 消息并回到 Idle。
+    ///
+    /// 本轮全部为不等待工具（无等待项可 resume），回合就此结束；占位 Tool 消息
+    /// 保证 assistant tool_calls 与 tool 结果配对（厂商协议硬约束）。
+    /// 返回是否成功收敛（非 AwaitingCalls 返回 false）。
+    pub fn settle_dispatched(&mut self) -> bool {
+        if !matches!(self.state, SessionState::AwaitingCalls { .. }) {
+            return false;
+        }
+        self.append_tool_results();
+        self.state = SessionState::Idle;
+        true
     }
 
     // ─────────────────────────────────────────────

@@ -84,6 +84,13 @@ pub struct ChatOptions {
     /// 深度思考配置
     #[serde(default)]
     pub thinking: ThinkingConfig,
+    /// 子智能体嵌套深度（0 = 主调用；每经一次子 Agent 工具调用 +1）
+    ///
+    /// 经 `AgentTool` 透传给目标会话，目标侧据此限制更深的嵌套调用。
+    /// 信任边界：该字段随 Envelope 传输、可被构造方伪造——**仅可信注册的工具**
+    /// （如 `AgentTool`）应设置，不可信调用方不得自行声明深度（防绕过上限）。
+    #[serde(default)]
+    pub peer_depth: u32,
 }
 
 /// 消息编解码错误

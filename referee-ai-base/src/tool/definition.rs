@@ -41,6 +41,9 @@ pub enum ToolCategory {
 /// 均为 `Option`：未启用对等能力时保持 `None`，依赖它们的工具在缺失时
 /// 返回明确错误。既有本地工具无感知（字段为 pub，忽略即可）。
 ///
+/// `wait` 为引擎解析出的本次调用等待决策（`true` = 主智能体等待本工具完成）。
+/// 工具可据此调整行为（如 AgentTool 在非等待时一律落库成果板，仅回传 ID）。
+///
 /// ## 信任边界（安全声明）
 /// `kernel` 为完整内核句柄，授予后工具可 invoke 任意能力 / 伪造会话消息。
 /// 它**仅应注入给可信注册的工具**；引入不可信工具前必须先收窄为受限句柄
@@ -57,6 +60,10 @@ pub struct ToolContext {
     pub kernel: Option<Kernel>,
     /// 通用 KV 存储句柄（成果/大结果落库用；未注入为 None）
     pub store: Option<Arc<dyn Store>>,
+    /// 本次调用的等待决策（引擎解析保留参数 `wait` 或工具默认值后注入）
+    pub wait: bool,
+    /// 本会话的子智能体嵌套深度（0 = 主调用；子 Agent 工具据此透传 +1）
+    pub peer_depth: u32,
 }
 
 impl std::fmt::Debug for ToolContext {
@@ -67,6 +74,8 @@ impl std::fmt::Debug for ToolContext {
             .field("turn_id", &self.turn_id)
             .field("kernel", &self.kernel.is_some())
             .field("store", &self.store.is_some())
+            .field("wait", &self.wait)
+            .field("peer_depth", &self.peer_depth)
             .finish()
     }
 }
@@ -141,6 +150,24 @@ pub trait Tool: Send + Sync {
         ToolCategory::Remote
     }
 
+    /// 工具配置的默认等待行为 — 调用方未显式传保留参数 `wait` 时生效。
+    ///
+    /// 默认 `false`（未配置默认不等待）：引擎派发后立即返回「已派发」占位结果，
+    /// 主智能体不阻塞；真实结果完成后入队，在**下一次**模型调用/回合时合并注入。
+    /// 覆写为 `true` 可让短查询类工具默认同步返回（如只读查询）。
+    fn default_wait(&self) -> bool {
+        false
+    }
+
+    /// 是否为子智能体嵌套工具（受嵌套深度限制）
+    ///
+    /// 默认 `false`（普通工具不消耗嵌套深度）。子 Agent 工具（如 `AgentTool`）
+    /// 覆写为 `true`：当目标会话嵌套深度达到上限时，该工具从 LLM 声明中过滤、
+    /// 并在执行层兜底拒绝，防止无限递归的子 Agent 调用链。
+    fn depth_limited(&self) -> bool {
+        false
+    }
+
     /// 导出为 `ToolDeclaration`（供 LLM 请求时拼装 `tools` 字段）
     fn to_declaration(&self) -> ToolDeclaration {
         ToolDeclaration {
@@ -184,6 +211,8 @@ mod tests {
             turn_id: 0,
             kernel: None,
             store: None,
+            wait: false,
+            peer_depth: 0,
         };
         let result = tool.execute(ctx, json!({"text": "hello"})).await.unwrap();
         assert_eq!(result.content, "hello");

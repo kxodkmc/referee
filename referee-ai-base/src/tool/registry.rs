@@ -109,6 +109,19 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// 按子智能体嵌套深度过滤后导出工具声明
+    ///
+    /// 当会话当前深度 `current_depth >= max_depth` 时，剔除 `depth_limited` 工具
+    /// （子 Agent 工具）——LLM 看不到即无法发起更深嵌套调用（声明层防线）。
+    /// 未达上限时行为与 [`declarations`](Self::declarations) 一致。
+    pub fn declarations_for_depth(&self, current_depth: u32, max_depth: u32) -> Vec<ToolDeclaration> {
+        self.tools
+            .iter()
+            .filter(|r| !(r.value().depth_limited() && current_depth >= max_depth))
+            .map(|r| r.value().to_declaration())
+            .collect()
+    }
+
     /// 当前工具数
     pub fn len(&self) -> usize {
         self.tools.len()
@@ -210,5 +223,53 @@ mod tests {
         assert!(reg.unregister("foo"));
         assert!(!reg.unregister("foo"));
         assert_eq!(reg.len(), 0);
+    }
+
+    /// 受子智能体嵌套深度限制的工具（模拟 AgentTool）
+    struct DepthLimitedTool {
+        name: String,
+    }
+
+    #[async_trait]
+    impl Tool for DepthLimitedTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "subagent tool"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+        fn depth_limited(&self) -> bool {
+            true
+        }
+        async fn execute(
+            &self,
+            _ctx: crate::tool::ToolContext,
+            _args: serde_json::Value,
+        ) -> Result<crate::tool::ToolOutput, crate::tool::ToolError> {
+            Ok(crate::tool::ToolOutput::text("ok"))
+        }
+    }
+
+    #[test]
+    fn declarations_for_depth_filters_subagent_tools_at_limit() {
+        let reg = ToolRegistry::with_defaults();
+        reg.register(Arc::new(DummyTool { name: "plain".into() }))
+            .unwrap();
+        reg.register(Arc::new(DepthLimitedTool { name: "sub".into() }))
+            .unwrap();
+
+        // 深度未达上限：子 Agent 工具可见（如 B 层可调 C）
+        let decls = reg.declarations_for_depth(1, 2);
+        let names: Vec<_> = decls.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"sub"));
+
+        // 深度达上限：子 Agent 工具被剔除（如 C 层不可调 D），普通工具保留
+        let decls = reg.declarations_for_depth(2, 2);
+        let names: Vec<_> = decls.iter().map(|d| d.name.as_str()).collect();
+        assert!(!names.contains(&"sub"));
+        assert!(names.contains(&"plain"));
     }
 }

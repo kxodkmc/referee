@@ -1,11 +1,14 @@
-//! 工具执行器 — 并行执行 + 截断 + panic 隔离 + 超时
+//! 工具执行器 — 并行执行 + 截断 + panic 隔离 + 超时 + 等待/派发分流
 //!
 //! ## 设计约束
 //! - **并行有上限**：`Semaphore` 限制并发数；`max_per_turn` 限制每轮工具数
-//! - **截断策略**：前 N 个执行，多余的发引导错误消息（引导 LLM 下轮分批）
+//! - **截断策略**：调用方先 `truncate`，多余的发引导错误消息（引导 LLM 下轮分批）
 //! - **panic 隔离**：每个 `execute` 调用包 `catch_unwind`，panic 转为 `ToolError::Panic`
 //! - **超时治理**：每个工具独立 `tokio::time::timeout`
-//! - **结果返回**：`execute_batch` 返回 `Vec<ExecutedTool>`，调用方异步 emit
+//! - **等待/派发分流**：`split_by_wait` 按保留参数 `wait`（或工具 `default_wait`）
+//!   拆分——等待类走 `execute_batch` 同步收敛；派发类走 `dispatch_batch` 后台执行，
+//!   完成结果由调用方注入（入队，不阻塞主智能体）
+//! - **结果返回**：`execute_batch` / `dispatch_batch` 返回 `ExecutedTool`，调用方异步回写
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -47,6 +50,8 @@ impl Default for ExecutorConfig {
 #[derive(Debug, Clone)]
 pub struct ExecutedTool {
     pub tool_call_id: String,
+    /// 工具名（异步派发完成时用于生成注入文本）
+    pub tool_name: String,
     pub result: String,
 }
 
@@ -113,51 +118,55 @@ impl ToolExecutor {
         &self.config
     }
 
-    /// 批量执行工具调用，返回所有结果（成功的 + 截断的）
+    /// 按 `max_per_turn` 截断：返回 (head 执行, tail 截断)。截断项由调用方
+    /// 生成引导错误消息（职责与执行分离，分流前统一截断一次）。
+    pub fn truncate(&self, tool_calls: Vec<ToolCall>) -> (Vec<ToolCall>, Vec<ToolCall>) {
+        if tool_calls.len() <= self.config.max_per_turn {
+            return (tool_calls, Vec::new());
+        }
+        let (head, tail) = tool_calls.split_at(self.config.max_per_turn);
+        (head.to_vec(), tail.to_vec())
+    }
+
+    /// 按等待决策拆分：返回 (等待类, 派发类)
     ///
-    /// - 前 `max_per_turn` 个调用并行执行
-    /// - 超出部分返回截断错误消息（引导 LLM 下轮重发）
-    /// - 每个调用独立 `catch_unwind` + `timeout`
+    /// 每个调用解析保留参数 `wait`（LLM 显式选择）；未传则取工具 `default_wait()`；
+    /// 工具不存在时按等待处理（同步返回 not found，避免异步悬空）。
+    pub fn split_by_wait(
+        &self,
+        tool_calls: Vec<ToolCall>,
+        registry: &crate::tool::ToolRegistry,
+    ) -> (Vec<ToolCall>, Vec<ToolCall>) {
+        let (mut waiting, mut dispatched) = (Vec::new(), Vec::new());
+        for tc in tool_calls {
+            if wants_wait(&tc, registry) {
+                waiting.push(tc);
+            } else {
+                dispatched.push(tc);
+            }
+        }
+        (waiting, dispatched)
+    }
+
+    /// 批量执行工具调用，返回所有结果（仅等待类；调用方应先 `truncate`）
+    ///
+    /// - 全部并行执行，`join_all` 等到最后一个（每个独立 `catch_unwind` + `timeout`）
     pub async fn execute_batch(
         &self,
         tool_calls: Vec<ToolCall>,
         registry: &crate::tool::ToolRegistry,
         session_id: uuid::Uuid,
         turn_id: u64,
+        peer_depth: u32,
     ) -> Vec<ExecutedTool> {
         if tool_calls.is_empty() {
             return Vec::new();
         }
 
-        let max = self.config.max_per_turn;
-        let (to_execute, truncated) = if tool_calls.len() > max {
-            warn!(
-                count = tool_calls.len(),
-                max, "tool calls exceed per-turn limit, truncating"
-            );
-            let (head, tail) = tool_calls.split_at(max);
-            (head.to_vec(), tail.to_vec())
-        } else {
-            (tool_calls, vec![])
-        };
-
-        // 截断项：生成引导消息
-        let mut results: Vec<ExecutedTool> = truncated
-            .iter()
-            .map(|tc| ExecutedTool {
-                tool_call_id: tc.id.clone(),
-                result: format!(
-                    "Exceeds max_tools_per_turn limit ({}). \
-                     Please re-issue this tool call in the next turn.",
-                    max
-                ),
-            })
-            .collect();
-
         // 并行执行
         let kernel = self.kernel.clone();
         let store = self.store.clone();
-        let futures: Vec<_> = to_execute
+        let futures: Vec<_> = tool_calls
             .into_iter()
             .map(|tc| {
                 let sem = self.semaphore.clone();
@@ -166,17 +175,101 @@ impl ToolExecutor {
                 let kernel = kernel.clone();
                 let store = store.clone();
                 async move {
-                    execute_single(
-                        &registry, tc, session_id, turn_id, timeout, sem, kernel, store,
+                    guarded_execute(
+                        &registry, tc, session_id, turn_id, peer_depth, timeout, sem, kernel, store,
                     )
                     .await
                 }
             })
             .collect();
 
-        let executed = join_all(futures).await;
-        results.extend(executed);
-        results
+        join_all(futures).await
+    }
+
+    /// 派发一批工具调用（仅派发类）— 后台执行，立即返回句柄，不阻塞调用方
+    ///
+    /// 每个调用 spawn 独立 task（复用 `execute_single` 的限流/隔离/超时）。
+    /// 调用方 await 句柄取得结果后自行注入（入队，等待下一次模型调用合并）。
+    pub fn dispatch_batch(
+        &self,
+        tool_calls: Vec<ToolCall>,
+        registry: &crate::tool::ToolRegistry,
+        session_id: uuid::Uuid,
+        turn_id: u64,
+        peer_depth: u32,
+    ) -> Vec<tokio::task::JoinHandle<ExecutedTool>> {
+        let kernel = self.kernel.clone();
+        let store = self.store.clone();
+        tool_calls
+            .into_iter()
+            .map(|tc| {
+                let sem = self.semaphore.clone();
+                let registry = registry.clone();
+                let timeout = self.config.tool_timeout;
+                let kernel = kernel.clone();
+                let store = store.clone();
+                tokio::spawn(async move {
+                    guarded_execute(
+                        &registry, tc, session_id, turn_id, peer_depth, timeout, sem, kernel, store,
+                    )
+                    .await
+                })
+            })
+            .collect()
+    }
+}
+
+/// 单个工具调用的保护执行：外层 `catch_unwind` 兜底 pre-execute 段
+/// （参数解析 / 注册查找 / 并发槽位获取）的 panic。
+///
+/// `execute_single` 内部已对 `tool.execute` 单独 catch_unwind；此处再包一层
+/// 保证同步与派发路径一致：任何 panic 都收敛为带 `tool_call_id` / `tool_name`
+/// 的错误结果，不静默丢失调用身份。
+#[allow(clippy::too_many_arguments)]
+async fn guarded_execute(
+    registry: &crate::tool::ToolRegistry,
+    tc: ToolCall,
+    session_id: uuid::Uuid,
+    turn_id: u64,
+    peer_depth: u32,
+    timeout: Duration,
+    sem: Arc<Semaphore>,
+    kernel: Option<Kernel>,
+    store: Option<Arc<dyn Store>>,
+) -> ExecutedTool {
+    let tool_call_id = tc.id.clone();
+    let tool_name = tc.function.name.clone();
+    AssertUnwindSafe(async {
+        execute_single(registry, tc, session_id, turn_id, peer_depth, timeout, sem, kernel, store)
+            .await
+    })
+    .catch_unwind()
+    .await
+    .unwrap_or_else(|_| ExecutedTool {
+        tool_call_id,
+        tool_name,
+        result: format!("{}", ToolError::Panic("<pre-execute panic>".into())),
+    })
+}
+
+/// 解析单个工具调用的等待决策：保留参数 `wait` > 工具 `default_wait` > 默认不等待。
+/// 工具不存在时按等待处理（同步返回 not found，避免异步悬空）。
+fn wants_wait(tc: &ToolCall, registry: &crate::tool::ToolRegistry) -> bool {
+    if let Ok(args) = serde_json::from_str::<Value>(&tc.function.arguments) {
+        if let Some(w) = args.get("wait").and_then(|v| v.as_bool()) {
+            return w;
+        }
+    }
+    registry
+        .get(&tc.function.name)
+        .map(|t| t.default_wait())
+        .unwrap_or(true)
+}
+
+/// 从参数中剥离引擎保留参数 `wait`（不传给工具实现）
+fn strip_wait(args: &mut Value) {
+    if let Some(obj) = args.as_object_mut() {
+        obj.remove("wait");
     }
 }
 
@@ -192,6 +285,7 @@ async fn execute_single(
     tc: ToolCall,
     session_id: uuid::Uuid,
     turn_id: u64,
+    peer_depth: u32,
     timeout: Duration,
     sem: Arc<Semaphore>,
     kernel: Option<Kernel>,
@@ -200,11 +294,12 @@ async fn execute_single(
     let tool_call_id = tc.id.clone();
     let tool_name = tc.function.name.clone();
 
-    // 解析参数
-    let args: Value = serde_json::from_str(&tc.function.arguments).unwrap_or_else(|e| {
+    // 解析参数 + 剥离保留参数 wait
+    let mut args: Value = serde_json::from_str(&tc.function.arguments).unwrap_or_else(|e| {
         warn!(error = %e, tool = %tool_name, "failed to parse tool arguments");
         Value::Null
     });
+    strip_wait(&mut args);
 
     // 查找工具
     let tool: Arc<dyn Tool> = match registry.get(&tool_name) {
@@ -212,10 +307,14 @@ async fn execute_single(
         None => {
             return ExecutedTool {
                 tool_call_id,
+                tool_name: tool_name.clone(),
                 result: format!("Tool '{}' not found", tool_name),
             };
         }
     };
+
+    // 等待决策（保留参数 wait > 工具默认 > 默认不等待）
+    let wait = wants_wait(&tc, registry);
 
     // 按分类获取并发 permit：Remote 受限流，Local 不占槽位
     let _permit = if tool.category() == ToolCategory::Remote {
@@ -224,6 +323,7 @@ async fn execute_single(
             Err(_) => {
                 return ExecutedTool {
                     tool_call_id,
+                    tool_name,
                     result: "Failed to acquire concurrency permit".to_string(),
                 };
             }
@@ -238,6 +338,8 @@ async fn execute_single(
         turn_id,
         kernel,
         store,
+        wait,
+        peer_depth,
     };
 
     // 执行（panic 隔离 + 超时）
@@ -267,6 +369,7 @@ async fn execute_single(
 
     ExecutedTool {
         tool_call_id,
+        tool_name,
         result: content,
     }
 }
@@ -391,7 +494,7 @@ mod tests {
         let exec = ToolExecutor::with_defaults();
         let calls = vec![make_call("a", "{}"), make_call("b", "{}")];
         let results = exec
-            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0)
+            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0, 0)
             .await;
 
         assert_eq!(results.len(), 2);
@@ -402,11 +505,6 @@ mod tests {
 
     #[tokio::test]
     async fn truncation() {
-        let reg = make_registry(vec![Arc::new(SlowTool {
-            name: "a".into(),
-            delay_ms: 10,
-            result: "ok".into(),
-        })]);
         let exec = ToolExecutor::new(ExecutorConfig {
             max_per_turn: 2,
             tool_timeout: Duration::from_secs(5),
@@ -415,16 +513,10 @@ mod tests {
         let calls: Vec<ToolCall> = (0..5)
             .map(|i| make_call("a", &format!("{{\"i\":{}}}", i)))
             .collect();
-        let results = exec
-            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0)
-            .await;
+        let (head, tail) = exec.truncate(calls);
 
-        assert_eq!(results.len(), 5); // 2 executed + 3 truncated
-        let truncated: Vec<_> = results
-            .iter()
-            .filter(|r| r.result.contains("Exceeds max_tools_per_turn"))
-            .collect();
-        assert_eq!(truncated.len(), 3);
+        assert_eq!(head.len(), 2);
+        assert_eq!(tail.len(), 3); // 超出部分交由调用方生成引导错误
     }
 
     #[tokio::test]
@@ -440,7 +532,7 @@ mod tests {
         let exec = ToolExecutor::with_defaults();
         let calls = vec![make_call("panic", "{}"), make_call("ok", "{}")];
         let results = exec
-            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0)
+            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0, 0)
             .await;
 
         assert_eq!(results.len(), 2);
@@ -467,7 +559,7 @@ mod tests {
         });
         let calls = vec![make_call("slow", "{}")];
         let results = exec
-            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0)
+            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0, 0)
             .await;
 
         assert_eq!(results.len(), 1);
@@ -480,7 +572,7 @@ mod tests {
         let exec = ToolExecutor::with_defaults();
         let calls = vec![make_call("nonexistent", "{}")];
         let results = exec
-            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0)
+            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0, 0)
             .await;
 
         assert_eq!(results.len(), 1);
@@ -508,7 +600,7 @@ mod tests {
         let calls = vec![make_call("local_a", "{}"), make_call("local_b", "{}")];
         let start = std::time::Instant::now();
         let results = exec
-            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0)
+            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0, 0)
             .await;
         let elapsed = start.elapsed();
 
@@ -544,7 +636,7 @@ mod tests {
         let calls = vec![make_call("r_a", "{}"), make_call("r_b", "{}")];
         let start = std::time::Instant::now();
         let results = exec
-            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0)
+            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0, 0)
             .await;
         let elapsed = start.elapsed();
 
@@ -555,5 +647,105 @@ mod tests {
             "remote tools should be serialized by semaphore, took {:?}",
             elapsed
         );
+    }
+
+    /// 显式声明默认等待的工具
+    struct WaitByDefaultTool;
+    #[async_trait]
+    impl Tool for WaitByDefaultTool {
+        fn name(&self) -> &str {
+            "wait_default"
+        }
+        fn description(&self) -> &str {
+            "waits by default"
+        }
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn default_wait(&self) -> bool {
+            true
+        }
+        async fn execute(&self, _ctx: ToolContext, _args: Value) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text("ok"))
+        }
+    }
+
+    /// 记录实际收到的参数（验证保留参数 wait 已被剥离）
+    struct RecordArgsTool {
+        seen: Arc<parking_lot::Mutex<Option<Value>>>,
+    }
+    #[async_trait]
+    impl Tool for RecordArgsTool {
+        fn name(&self) -> &str {
+            "record_args"
+        }
+        fn description(&self) -> &str {
+            "records args"
+        }
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        async fn execute(&self, _ctx: ToolContext, args: Value) -> Result<ToolOutput, ToolError> {
+            *self.seen.lock() = Some(args);
+            Ok(ToolOutput::text("recorded"))
+        }
+    }
+
+    #[tokio::test]
+    async fn split_by_wait_override_default_and_missing() {
+        let reg = make_registry(vec![Arc::new(WaitByDefaultTool)]);
+        let exec = ToolExecutor::with_defaults();
+        let calls = vec![
+            // 显式 wait:true → 等待类
+            make_call("wait_default", r#"{"wait":true}"#),
+            // 显式 wait:false → 派发类（覆盖工具默认）
+            make_call("wait_default", r#"{"wait":false}"#),
+            // 未传 + 工具 default_wait=true → 等待类
+            make_call("wait_default", "{}"),
+            // 未传 + 工具不存在 → 按等待处理（同步返回 not found）
+            make_call("missing", "{}"),
+        ];
+        let (waiting, dispatched) = exec.split_by_wait(calls, &reg);
+        assert_eq!(waiting.len(), 3);
+        assert_eq!(dispatched.len(), 1);
+        // 派发类仅显式 wait:false 的调用；wait:true / 工具默认 / 缺失工具均按等待
+        assert_eq!(dispatched[0].id, "tc_wait_default");
+        assert!(waiting.iter().any(|c| c.id == "tc_missing"));
+    }
+
+    #[tokio::test]
+    async fn wait_override_wins_for_dispatch() {
+        // 默认不等待的工具，显式 wait:false → 派发类
+        let reg = make_registry(vec![Arc::new(SlowTool {
+            name: "a".into(),
+            delay_ms: 5,
+            result: "ok".into(),
+        })]);
+        let exec = ToolExecutor::with_defaults();
+        let calls = vec![make_call("a", r#"{"wait":false}"#)];
+        let (waiting, dispatched) = exec.split_by_wait(calls, &reg);
+        assert!(waiting.is_empty());
+        assert_eq!(dispatched.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reserved_wait_key_is_stripped_before_execute() {
+        let seen = Arc::new(parking_lot::Mutex::new(None));
+        let reg = make_registry(vec![Arc::new(RecordArgsTool { seen: seen.clone() })]);
+        let exec = ToolExecutor::with_defaults();
+        // 等待模式执行：保留参数 wait 不应传给工具实现
+        let results = exec
+            .execute_batch(
+                vec![make_call("record_args", r#"{"x":1,"wait":true}"#)],
+                &reg,
+                uuid::Uuid::new_v4(),
+                0,
+                0,
+            )
+            .await;
+        assert_eq!(results.len(), 1);
+        let received = seen.lock().clone().expect("tool must have run");
+        assert_eq!(received.get("x"), Some(&json!(1)));
+        assert!(received.get("wait").is_none(), "reserved wait key must be stripped");
     }
 }

@@ -299,3 +299,76 @@ fn set_chat_options_persists_for_resume() {
     let (_, _, req) = session.resume_thinking().expect("resume ok");
     assert_eq!(req.temperature, Some(0.7));
 }
+
+// ─────────────────────────────────────────────
+// 异步派发（不等待工具）— 注入队列与纯派发轮收敛
+// ─────────────────────────────────────────────
+
+#[test]
+fn inject_tool_result_flushes_on_next_start_round() {
+    let mut session = Session::new(SessionConfig::default());
+    // 后台派发完成 → 入队（非空忽略，保持简单语义）
+    session.inject_tool_result("async result data".into());
+
+    // 下一次模型调用（新回合）构建请求前合并注入
+    let round = session
+        .start_round(Message::user("continue"), &ChatOptions::default())
+        .expect("start ok");
+    let req = round.request;
+    let last = req.messages.last().expect("has messages");
+    assert_eq!(last.role, Role::User);
+    assert_eq!(last.content.as_text().unwrap(), "async result data");
+}
+
+#[test]
+fn empty_injection_is_ignored() {
+    let mut session = Session::new(SessionConfig::default());
+    session.inject_tool_result(String::new());
+    let round = session
+        .start_round(Message::user("hi"), &ChatOptions::default())
+        .expect("start ok");
+    // 仅用户消息，无注入占位
+    assert_eq!(round.request.messages.len(), 1);
+}
+
+#[test]
+fn resume_thinking_flushes_async_injections_after_tool_results() {
+    let mut session = Session::new(SessionConfig::default());
+    let (turn_id, _rx) = session.start_thinking().expect("start ok");
+    let resp = mock_tool_response("calling", vec![make_tool_call("tc_1", "echo")]);
+    session.finish_thinking(turn_id, TurnOutcome::Success(Box::new(resp)));
+
+    // 占位结果收敛 + 后台真实结果入队
+    session.finish_tool_call("tc_1", "dispatched".into());
+    session.inject_tool_result("real async result".into());
+
+    assert!(session.resume_thinking().is_some());
+    let req = session.build_chat_request(&ChatOptions::default());
+    // [assistant(tool_calls), tool(占位), user(异步结果)]
+    assert_eq!(req.messages.len(), 3);
+    assert_eq!(req.messages[1].role, Role::Tool);
+    assert_eq!(req.messages[2].role, Role::User);
+    assert_eq!(req.messages[2].content.as_text().unwrap(), "real async result");
+}
+
+#[test]
+fn settle_dispatched_converges_pure_dispatch_round() {
+    let mut session = Session::new(SessionConfig::default());
+    let (turn_id, _rx) = session.start_thinking().expect("start ok");
+    let resp = mock_tool_response("dispatching", vec![make_tool_call("tc_1", "echo")]);
+    session.finish_thinking(turn_id, TurnOutcome::Success(Box::new(resp)));
+
+    // 派发类占位收敛（清 pending）
+    let action = session.finish_tool_call("tc_1", "dispatched".into());
+    assert!(matches!(action, ToolCallAction::AllDone));
+
+    // 纯派发轮收尾：占位 Tool 消息落 history → Idle
+    assert!(session.settle_dispatched());
+    assert!(!session.is_busy());
+    let req = session.build_chat_request(&ChatOptions::default());
+    assert_eq!(req.messages[1].role, Role::Tool);
+    assert_eq!(req.messages[1].tool_call_id.as_deref(), Some("tc_1"));
+
+    // 非 AwaitingCalls 状态重复收敛返回 false
+    assert!(!session.settle_dispatched());
+}
