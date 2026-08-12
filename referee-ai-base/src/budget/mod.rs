@@ -7,8 +7,8 @@
 //!   用 [`TokenEstimator`] 保守估算响应文本，绝不计 0。
 //! - **统一口径**：Session 级与全局级共用 [`tokens_from_response`]，保证
 //!   两侧计数一致（含 AwaitingCalls 分支的每轮消耗）。
-//! - **可共享全局**：全局计数器为 `Arc<AtomicU64>`，多个 AgentRuntime
-//!   （主 Agent + 子 Agent）可注入同一计数器实现系统级总预算。
+//! - **可共享全局**：全局计数器为 `Arc<AtomicU64>`，多个引擎可注入同一个
+//!   计数器实现系统级总预算。
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -47,7 +47,7 @@ impl BudgetConfig {
 }
 
 /// 预算错误
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BudgetError {
     #[error("Session budget exceeded (used: {used}, limit: {limit})")]
     SessionExceeded { used: u64, limit: u64 },

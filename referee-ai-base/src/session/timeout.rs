@@ -2,7 +2,7 @@
 //!
 //! 两类超时：
 //! - **Thinking 超时**：LLM 调用超时（`run_turn` 内 `tokio::time::timeout` 切断）
-//! - **AwaitingCalls 超时**：等待工具/子 Agent 完成的超时（P2/P3 用，
+//! - **AwaitingCalls 超时**：等待工具调用完成的超时（
 //!   超时后会话自动恢复 Idle + DLQ 记录，杜绝幽灵会话）
 //!
 //! ## 可配置
@@ -19,7 +19,7 @@ pub struct TimeoutConfig {
     /// 超时后 `run_turn` 返回 `TurnOutcome::Timeout`，派生任务终态收敛为 Idle。
     pub thinking_timeout: Duration,
 
-    /// AwaitingCalls 状态超时（等待工具/子 Agent 完成上限）
+    /// AwaitingCalls 状态超时（等待工具调用完成上限）
     ///
     /// P2/P3 使用。超时后未完成的 pending 项进 DLQ，会话恢复 Idle。
     pub awaiting_calls_timeout: Duration,
@@ -30,7 +30,7 @@ impl Default for TimeoutConfig {
         Self {
             // Thinking：30s（LLM 调用通常 5-15s，30s 足够覆盖深度思考厂商）
             thinking_timeout: Duration::from_secs(30),
-            // AwaitingCalls：60s（工具/子 Agent 完成通常 10-30s，60s 留余量）
+            // AwaitingCalls：60s（工具完成通常 10-30s，60s 留余量）
             awaiting_calls_timeout: Duration::from_secs(60),
         }
     }

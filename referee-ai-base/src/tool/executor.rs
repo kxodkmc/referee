@@ -18,8 +18,8 @@ use serde_json::Value;
 use tokio::sync::Semaphore;
 use tracing::{debug, instrument, warn};
 
-use crate::artifact::ArtifactStore;
 use crate::provider::ToolCall;
+use crate::store::Store;
 use crate::tool::{Tool, ToolCategory, ToolContext, ToolError};
 
 /// 执行器配置
@@ -55,16 +55,17 @@ pub struct ExecutedTool {
 /// 持有配置和 Semaphore，不持有任何可变状态。
 /// 每次 `execute_batch` 创建独立的 permit 上下文。
 ///
-/// Phase 3：可注入 `kernel` / `artifact_store` 以启用对等能力
+/// 执行器无状态，可跨 Session 共享；每次 `execute_batch` 创建独立 permit 上下文。
+/// 可选注入 `kernel` / `store` 以启用对等 RPC 与通用落库能力
 /// （构造 `ToolContext` 时透传给所有工具，本地工具无感知）。
 #[derive(Clone)]
 pub struct ToolExecutor {
     config: ExecutorConfig,
     semaphore: Arc<Semaphore>,
-    /// 对等 RPC 能力（`AgentTool` 经 `kernel.invoke` 调用目标 Agent）
+    /// 对等 RPC 能力（上层工具经 `kernel.invoke` 调用目标能力）
     kernel: Option<Kernel>,
-    /// 工件存储能力（大结果落库 + ACL）
-    artifact_store: Option<Arc<dyn ArtifactStore>>,
+    /// 通用 KV 存储能力（成果/大结果落库）
+    store: Option<Arc<dyn Store>>,
 }
 
 impl std::fmt::Debug for ToolExecutor {
@@ -74,7 +75,7 @@ impl std::fmt::Debug for ToolExecutor {
             .field("tool_timeout", &self.config.tool_timeout)
             .field("max_concurrency", &self.config.max_concurrency)
             .field("kernel", &self.kernel.is_some())
-            .field("artifact_store", &self.artifact_store.is_some())
+            .field("store", &self.store.is_some())
             .finish()
     }
 }
@@ -86,7 +87,7 @@ impl ToolExecutor {
             config,
             semaphore,
             kernel: None,
-            artifact_store: None,
+            store: None,
         }
     }
 
@@ -101,9 +102,9 @@ impl ToolExecutor {
         self
     }
 
-    /// 注入工件存储（启用大结果落库能力）
-    pub fn with_artifact_store(mut self, store: Arc<dyn ArtifactStore>) -> Self {
-        self.artifact_store = Some(store);
+    /// 注入通用 KV 存储（启用成果/大结果落库能力）
+    pub fn with_store(mut self, store: Arc<dyn Store>) -> Self {
+        self.store = Some(store);
         self
     }
 
@@ -155,7 +156,7 @@ impl ToolExecutor {
 
         // 并行执行
         let kernel = self.kernel.clone();
-        let artifact_store = self.artifact_store.clone();
+        let store = self.store.clone();
         let futures: Vec<_> = to_execute
             .into_iter()
             .map(|tc| {
@@ -163,17 +164,10 @@ impl ToolExecutor {
                 let registry = registry.clone();
                 let timeout = self.config.tool_timeout;
                 let kernel = kernel.clone();
-                let artifact_store = artifact_store.clone();
+                let store = store.clone();
                 async move {
                     execute_single(
-                        &registry,
-                        tc,
-                        session_id,
-                        turn_id,
-                        timeout,
-                        sem,
-                        kernel,
-                        artifact_store,
+                        &registry, tc, session_id, turn_id, timeout, sem, kernel, store,
                     )
                     .await
                 }
@@ -191,7 +185,7 @@ impl ToolExecutor {
 /// 限流策略：`Remote` 工具获取 Semaphore permit（外部 IO 并发上限）；
 /// `Local` 工具（如 AgentTool）不占槽位，直接执行——避免对等调用
 /// 相互等待外部 IO 槽位的资源池死锁。
-#[instrument(skip(registry, tc, sem, kernel, artifact_store), fields(tool_call_id = %tc.id, tool_name = %tc.function.name))]
+#[instrument(skip(registry, tc, sem, kernel, store), fields(tool_call_id = %tc.id, tool_name = %tc.function.name))]
 #[allow(clippy::too_many_arguments)]
 async fn execute_single(
     registry: &crate::tool::ToolRegistry,
@@ -201,7 +195,7 @@ async fn execute_single(
     timeout: Duration,
     sem: Arc<Semaphore>,
     kernel: Option<Kernel>,
-    artifact_store: Option<Arc<dyn ArtifactStore>>,
+    store: Option<Arc<dyn Store>>,
 ) -> ExecutedTool {
     let tool_call_id = tc.id.clone();
     let tool_name = tc.function.name.clone();
@@ -243,7 +237,7 @@ async fn execute_single(
         session_id,
         turn_id,
         kernel,
-        artifact_store,
+        store,
     };
 
     // 执行（panic 隔离 + 超时）

@@ -749,6 +749,25 @@ name = "referee-agent"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "dashmap",
+ "futures",
+ "parking_lot",
+ "referee-ai-base",
+ "referee-core",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "referee-ai-base"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
  "bytes",
  "dashmap",
  "futures",

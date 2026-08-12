@@ -15,7 +15,7 @@
 //! 仅接入端点与 API Key 不同 —— 属于配置差异而非新提供商，无需新增适配器：
 //!
 //! ```no_run
-//! use referee_agent::provider::xiaomi::{
+//! use referee_ai_base::provider::xiaomi::{
 //!     XiaomiConfig, XiaomiModel, XiaomiProvider, TOKEN_PLAN_BASE_URL_CN,
 //! };
 //! let provider = XiaomiProvider::new(

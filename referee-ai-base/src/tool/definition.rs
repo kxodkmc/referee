@@ -10,21 +10,14 @@
 //!   `catch_unwind` 捕获，转为 `ToolError::Panic`，不影响其他工具与会话。
 //! - **输入/输出均 `Send + 'static`**：工具可在独立 task 中并行执行。
 
-//! ## 信任边界（安全声明）
-//! 工具注册（`ToolRegistry::register` / `AgentRuntime::register_peer_tool`）是
-//! 对等能力的唯一信任边界：注入 `ToolContext` 的 `Kernel` 与 `ArtifactStore`
-//! 句柄仅授予**可信注册**的工具。当前 Phase 无用户自定义 / MCP 工具（Phase 7
-//! 预留），引入不可信工具前须先将 `kernel` 收窄为受限句柄（固定目标白名单），
-//! 否则任何持有句柄的工具均可 invoke 任意能力 / 伪造会话消息。
-
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use referee_core::Kernel;
 use serde_json::Value;
 
-use crate::artifact::ArtifactStore;
 use crate::provider::ToolDeclaration;
+use crate::store::Store;
 
 /// 工具分类 — 决定执行策略
 ///
@@ -44,27 +37,26 @@ pub enum ToolCategory {
 
 /// 工具执行上下文 — 由 `ToolExecutor` 注入
 ///
-/// Phase 3 注入受限的对等能力：`kernel`（RPC invoke）与 `artifact_store`
-/// （大结果落库）。两者均为 `Option`：未启用对等能力时保持 `None`，
-/// 对等工具（如 [`crate::tool::AgentTool`]）在缺失时返回明确错误。
-/// 既有本地工具无感知（字段为 pub，忽略即可）。
+/// 可选的能力句柄：`kernel`（对等 RPC）与 `store`（通用 KV 落库）。
+/// 均为 `Option`：未启用对等能力时保持 `None`，依赖它们的工具在缺失时
+/// 返回明确错误。既有本地工具无感知（字段为 pub，忽略即可）。
+///
+/// ## 信任边界（安全声明）
+/// `kernel` 为完整内核句柄，授予后工具可 invoke 任意能力 / 伪造会话消息。
+/// 它**仅应注入给可信注册的工具**；引入不可信工具前必须先收窄为受限句柄
+/// （固定目标白名单）。
 #[derive(Clone)]
 pub struct ToolContext {
     /// 触发此次工具调用的 `ToolCall.id`（LLM 生成的，用于结果回传匹配）
     pub tool_call_id: String,
-    /// 所属会话 ID（用于 tracing 关联与工件 ACL 授权）
+    /// 所属会话 ID（用于 tracing 关联）
     pub session_id: uuid::Uuid,
     /// 所属轮次 ID（用于 tracing 关联）
     pub turn_id: u64,
     /// 内核句柄（对等 RPC 用；未注入为 None）
-    ///
-    /// **信任边界**：完整 `Kernel` 仅授予可信注册工具（见模块文档）；
-    /// 工具可经它 invoke 任意目标、emit 任意消息，不可信工具接入前必须收窄。
     pub kernel: Option<Kernel>,
-    /// 工件存储句柄（大结果落库用；未注入为 None）
-    ///
-    /// **信任边界**：仅授予可信注册工具；工具可凭 owner 身份写工件。
-    pub artifact_store: Option<Arc<dyn ArtifactStore>>,
+    /// 通用 KV 存储句柄（成果/大结果落库用；未注入为 None）
+    pub store: Option<Arc<dyn Store>>,
 }
 
 impl std::fmt::Debug for ToolContext {
@@ -74,7 +66,7 @@ impl std::fmt::Debug for ToolContext {
             .field("session_id", &self.session_id)
             .field("turn_id", &self.turn_id)
             .field("kernel", &self.kernel.is_some())
-            .field("artifact_store", &self.artifact_store.is_some())
+            .field("store", &self.store.is_some())
             .finish()
     }
 }
@@ -191,7 +183,7 @@ mod tests {
             session_id: uuid::Uuid::new_v4(),
             turn_id: 0,
             kernel: None,
-            artifact_store: None,
+            store: None,
         };
         let result = tool.execute(ctx, json!({"text": "hello"})).await.unwrap();
         assert_eq!(result.content, "hello");

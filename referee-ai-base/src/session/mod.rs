@@ -57,16 +57,14 @@ use tracing::{info, warn};
 use crate::budget::tokens_from_response;
 use crate::provider::{ChatRequest, ChatResponse, Message, ToolCall};
 
-/// 等待项类型（P2/P3 预留）
+/// 等待项类型 — 当前仅工具调用；调用方二次封装时可自行扩展
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingKind {
-    /// 工具调用（P2）
+    /// 工具调用
     Tool,
-    /// 子 Agent（P3）
-    Subagent,
 }
 
-/// 会话状态机 — 统一工具与子 Agent 的等待态
+/// 会话状态机 — 统一等待态（当前为工具调用）
 ///
 /// `Thinking.cancel` 用 `Option` 包装：`cancel_thinking` 通过 `take()` 取出
 /// 发送端发送取消信号，避免 `oneshot::Sender::send(self)` 需要所有权的冲突。
@@ -80,7 +78,7 @@ pub enum SessionState {
         /// 取消信号发送端（`take()` 后为 None，表示已发送取消）
         cancel: Option<oneshot::Sender<()>>,
     },
-    /// 等待工具/子 Agent 完成（P2/P3）
+    /// 等待工具调用完成
     AwaitingCalls {
         turn_id: u64,
         pending: HashMap<String, PendingKind>,
@@ -437,11 +435,11 @@ impl Session {
         let temperature = options.temperature.or(self.config.default_temperature);
         let max_tokens = options.max_tokens.or(self.config.default_max_tokens);
         crate::prompt::build_prompt(
-            None, // system：P5 预留（AgentConfig/SessionConfig 注入点）
+            None, // system：预留注入点（由业务层/调用方提供）
             options.tools.clone(),
             history,
-            Vec::new(), // memory：P4 注入
-            Vec::new(), // artifacts：P4 白名单可见性注入
+            Vec::new(), // 记忆片段：预留扩展点（业务层可注入）
+            Vec::new(), // 工件片段：预留扩展点（业务层可注入）
             temperature,
             max_tokens,
             options.thinking,

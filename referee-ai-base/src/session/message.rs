@@ -55,16 +55,8 @@ pub enum SessionMessage {
         /// 工具执行结果（JSON 字符串）
         result: String,
     },
-    /// 等待项全部完成，进入下一轮思考（P2/P3 resume 循环）
+    /// 等待项全部完成，进入下一轮思考（工具调用 resume 循环）
     Resume { session_id: SessionId, turn_id: u64 },
-    /// 子 Agent 完成（P3：写入 Artifact + 通知主 Agent）
-    SubagentDone {
-        session_id: SessionId,
-        turn_id: u64,
-        subagent_id: SessionId,
-        /// 子 Agent 产出的 artifact ID 列表
-        artifact_ids: Vec<String>,
-    },
 }
 
 /// Chat 消息负载
@@ -186,8 +178,7 @@ impl SessionMessage {
             Self::Chat { session_id, .. }
             | Self::Interrupt { session_id }
             | Self::ToolResult { session_id, .. }
-            | Self::Resume { session_id, .. }
-            | Self::SubagentDone { session_id, .. } => *session_id,
+            | Self::Resume { session_id, .. } => *session_id,
         }
     }
 

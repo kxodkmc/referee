@@ -671,3 +671,113 @@ fn parse_tool_call_delta(t: &Value) -> Option<ToolCallDelta> {
         function,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use futures::stream;
+    use futures::StreamExt;
+
+    /// 构造 SSE 字节流（每个元素 = 一次网络 read 的字节块）
+    fn sse_stream(payloads: &[&str]) -> BoxStream<'static, Result<Bytes, reqwest::Error>> {
+        let bytes = payloads
+            .iter()
+            .map(|p| format!("data: {p}\n\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        // 拆成若干小块，模拟分片到达
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = bytes
+            .as_bytes()
+            .chunks(7)
+            .map(|c| Ok(Bytes::copy_from_slice(c)))
+            .collect();
+        Box::pin(stream::iter(chunks))
+    }
+
+    fn parse_chunks(payloads: &[&str]) -> Result<Vec<StreamChunk>, LlmError> {
+        let json_stream = parse_sse_stream(sse_stream(payloads));
+        let chunk_stream = parse_chunk_stream(json_stream);
+        let mut items = Vec::new();
+        let mut stream = Box::pin(chunk_stream);
+        while let Some(item) = futures::executor::block_on(stream.next()) {
+            items.push(item?);
+        }
+        Ok(items)
+    }
+
+    #[test]
+    fn sse_delta_and_finish_are_accumulated() {
+        let chunks = parse_chunks(&[
+            r#"{"id":"1","choices":[{"index":0,"delta":{"content":"你好"}}]}"#,
+            r#"{"id":"1","choices":[{"index":0,"delta":{"content":"世界"}}]}"#,
+            r#"{"id":"1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}"#,
+            "[DONE]",
+        ])
+        .expect("parse ok");
+
+        let mut joined = String::new();
+        let mut finish: Option<StreamChunk> = None;
+        for c in chunks {
+            match c {
+                StreamChunk::Delta { content, .. } => {
+                    joined.push_str(content.as_deref().unwrap_or(""))
+                }
+                f @ StreamChunk::Finish { .. } => finish = Some(f),
+            }
+        }
+        assert_eq!(joined, "你好世界");
+        match finish.expect("must have Finish") {
+            StreamChunk::Finish {
+                finish_reason,
+                usage,
+            } => {
+                assert_eq!(finish_reason, FinishReason::Stop);
+                let u = usage.expect("usage present");
+                assert_eq!(u.total_tokens, 6);
+            }
+            StreamChunk::Delta { .. } => panic!("expected Finish"),
+        }
+    }
+
+    #[test]
+    fn sse_done_terminates_without_extra() {
+        let chunks = parse_chunks(&[
+            r#"{"id":"1","choices":[{"index":0,"delta":{"content":"hi"}}]}"#,
+            "[DONE]",
+        ])
+        .expect("parse ok");
+        // 无 finish_reason/usage → 流结束不发 Finish （语义：增量流；收敛由上层完成）
+        let deltas = chunks
+            .iter()
+            .filter(|c| matches!(c, StreamChunk::Delta { .. }))
+            .count();
+        assert_eq!(deltas, 1);
+    }
+
+    #[test]
+    fn non_stream_response_parses_tool_calls_and_reasoning() {
+        let json = serde_json::json!({
+            "id": "r1", "model": "m",
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning_content": "thinking...",
+                    "tool_calls": [{"id":"call_1","type":"function",
+                        "function":{"name":"f","arguments":"{\"x\":1}"}}]
+                }
+            }],
+            "usage": {"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}
+        });
+        let resp = parse_chat_response(&json).expect("parse");
+        assert_eq!(resp.finish_reason, FinishReason::ToolCalls);
+        assert_eq!(
+            resp.message.reasoning_content.as_deref(),
+            Some("thinking...")
+        );
+        assert_eq!(resp.message.tool_calls.len(), 1);
+        assert_eq!(resp.usage.map(|u| u.total_tokens), Some(3));
+    }
+}
