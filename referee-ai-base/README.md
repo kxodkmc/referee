@@ -41,6 +41,19 @@ handle.cancel();
 - 错误绝不静默丢弃：busy/预算/解码/工具失败均显式可见。
 - 有限依赖：`referee-core`、`reqwest`、`serde_json` 及基础设施 crate。
 
+## 并发与中断模型
+
+- **原子回合启动（根治 TOCTOU）**：`Session::start_round` 在单一 guard 内完成
+  busy 检查、turn_id 分配、取消通道创建与 history 写入。同会话并发 `chat`
+  恰一个成功，其余显式返回 `Busy`，绝不污染 history、不错乱取消标志。
+- **回合级中断下沉到会话**：中断标志（`AtomicBool`）与 `cancel` 通道互补——
+  前者在轮隙间（工具执行/思考间隙）拦截，后者在 LLM 等待中即时打断。
+  空闲会话调用 `interrupt` 返回 `false`（区分"无可取消"与"已取消"）。
+- **中断后复位**：回合收敛（完成/取消/超时）后会话回到 Idle，可再次发起
+  Chat，不会永久卡死 busy。
+- **存储安全**：会话/工具注册表统一经 `or_insert_with`（dashmap 的 insert
+  路径），规避裸 `entry()` match 触发的 shrink 死锁。
+
 ## 验证
 
 ```bash

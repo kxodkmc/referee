@@ -23,10 +23,10 @@
 | 模块 | 定位 | 测试 |
 |------|------|------|
 | [`referee-core`](referee-core/) | **微内核**：路由 / 原语 / 治理（背压、熔断、监督、停机、DLQ、WAL） | 25 条 |
-| [`referee-ai-base`](referee-ai-base/) | **核心支撑（地基）**：厂商抽象、会话引擎（最小闭环）、工具执行、通用 KV、预算、提示词、缓存、可观测 | 87 条 |
+| [`referee-ai-base`](referee-ai-base/) | **核心支撑（地基）**：厂商抽象、会话引擎（最小闭环）、工具执行、通用 KV、预算、提示词、缓存、可观测 | 89 条 |
 | [`referee-agent`](referee-agent/) | **业务封装（开箱即用）**：Extension 集成、对等协作、ACL 工件存储 | 12 条 |
 
-合计 **124 条测试全绿**（`cargo test --workspace`）。
+合计 **126 条测试全绿**（`cargo test --workspace`）。
 
 ## 组合使用
 
@@ -58,7 +58,7 @@ referee-agent   = { path = "referee-agent" }               # 开箱即用 Agent�
 ## 验证
 
 ```bash
-cargo test --workspace                      # 全量回归（core 25 + base 87 + agent 12 = 124 条）
+cargo test --workspace                      # 全量回归（core 25 + base 89 + agent 12 = 126 条）
 cargo clippy --workspace --all-targets -- -D warnings    # 零警告
 cargo fmt --check                           # 格式整洁
 ```
