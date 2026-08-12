@@ -80,12 +80,17 @@ impl ToolRegistry {
             return Err(RegistryError::Full(self.config.max_tools));
         }
 
-        match self.tools.entry(name.clone()) {
-            dashmap::Entry::Occupied(_) => Err(RegistryError::Duplicate(name)),
-            dashmap::Entry::Vacant(entry) => {
-                entry.insert(tool);
-                Ok(())
-            }
+        // 用 or_insert_with（内部经 dashmap 的 insert 路径），避免裸 `entry()`
+        // match 触发的 shrink 死锁；闭包仅在 Vacant 分支执行，据此判断名称冲突。
+        let mut created = false;
+        self.tools.entry(name.clone()).or_insert_with(|| {
+            created = true;
+            tool
+        });
+        if created {
+            Ok(())
+        } else {
+            Err(RegistryError::Duplicate(name))
         }
     }
 

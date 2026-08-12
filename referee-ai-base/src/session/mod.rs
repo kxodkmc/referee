@@ -50,6 +50,8 @@ pub use task::{run_turn, TurnOutcome};
 pub use timeout::TimeoutConfig;
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use tokio::sync::oneshot;
 use tracing::{info, warn};
@@ -138,6 +140,17 @@ impl Default for SessionConfig {
     }
 }
 
+/// 一轮 `Chat` 的原子启动产物 — 由 [`Session::start_round`] 在单一 guard 内产出
+#[derive(Debug)]
+pub struct RoundStart {
+    /// 本轮 turn_id（`finish_thinking` 校验用）
+    pub turn_id: u64,
+    /// 本轮取消通道（LLM 等待中 interrupt 触发）
+    pub cancel_rx: oneshot::Receiver<()>,
+    /// 已组装（含最新 user 消息 + 预算截断）的请求
+    pub request: ChatRequest,
+}
+
 /// 会话 — 一个 Agent 实例，会话级隔离
 ///
 /// 纯状态持有者，不含 I/O 句柄。状态转移由 [`Session`] 方法驱动，
@@ -147,6 +160,10 @@ pub struct Session {
     history: VecDeque<Message>,
     turn_id: u64,
     config: SessionConfig,
+    /// 回合级取消标志（回合内持续有效，`start_round` 时重置）。
+    /// 供「轮隙间」（工具执行中 / 思考间隙）的 interrupt 检查，
+    /// 与 `Thinking.cancel` 通道互补：前者覆盖面内任意时点，后者即时打断 LLM 等待。
+    interrupt: Arc<AtomicBool>,
     /// Chat 调用方的回信通道（forwarder 模式）
     ///
     /// `handle_chat` 创建 oneshot channel，sender 存入此字段，
@@ -180,6 +197,7 @@ impl Session {
             history: VecDeque::with_capacity(cap),
             turn_id: 0,
             config,
+            interrupt: Arc::new(AtomicBool::new(false)),
             pending_reply: None,
             last_chat_options: ChatOptions::default(),
             consumed_tokens: 0,
@@ -230,6 +248,7 @@ impl Session {
     /// Idle → Thinking：分配 turn_id + 创建取消通道
     ///
     /// 返回 `(turn_id, cancel_rx)`；若非 Idle 则返回 None（busy 拒绝）。
+    /// 供工具多轮的 `resume_thinking` 复用；**不重置中断标志**。
     pub fn start_thinking(&mut self) -> Option<(u64, oneshot::Receiver<()>)> {
         if self.is_busy() {
             return None;
@@ -242,6 +261,48 @@ impl Session {
             cancel: Some(cancel_tx),
         };
         Some((turn_id, cancel_rx))
+    }
+
+    /// **原子启动一轮 Chat**：busy 检查 + turn_id + 取消通道 + history + options + request
+    ///
+    /// 在调用方持有的单一 `&mut self` guard 内完成，消除 `busy 检查` 与
+    /// `start_thinking` 之间的 TOCTOU 窗口：并发第二个 `chat` 会因 `is_busy()`
+    /// 立即返回 `None`，**不会污染 history、不会错乱取消标志**。
+    ///
+    /// 同时重置回合级中断标志（标志随新回合清零）。
+    pub fn start_round(&mut self, message: Message, options: &ChatOptions) -> Option<RoundStart> {
+        if self.is_busy() {
+            return None;
+        }
+        // 新回合：清零上一回合遗留的中断标志
+        self.interrupt.store(false, Ordering::Relaxed);
+        self.turn_id += 1;
+        let turn_id = self.turn_id;
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        self.state = SessionState::Thinking {
+            turn_id,
+            cancel: Some(cancel_tx),
+        };
+        self.push_history(message);
+        self.last_chat_options = options.clone();
+        let request = self.build_chat_request(options);
+        Some(RoundStart {
+            turn_id,
+            cancel_rx,
+            request,
+        })
+    }
+
+    // ── 回合级中断（与取消通道互补，覆盖面内任意时点）──────────────
+
+    /// 是否收到回合级中断（工具执行中 / 轮隙间检查）
+    pub fn is_interrupted(&self) -> bool {
+        self.interrupt.load(Ordering::Relaxed)
+    }
+
+    /// 置位回合级中断标志（由 [`crate::engine::Engine::interrupt`] 调用）
+    pub fn raise_interrupt(&self) {
+        self.interrupt.store(true, Ordering::Relaxed);
     }
 
     /// 发送取消信号（不直接转 Idle，由 `finish_thinking` 收敛终态）

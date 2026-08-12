@@ -19,7 +19,7 @@
 //! 或任何调用方直接驱动。
 
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -32,7 +32,8 @@ use crate::cache::{CacheConfig, InMemoryCache};
 use crate::observe;
 use crate::provider::{ChatResponse, LLMProvider};
 use crate::session::{
-    ChatOptions, ChatPayload, FinishAction, Session, SessionConfig, SessionId, SessionReply,
+    ChatPayload, FinishAction, RoundStart, Session, SessionConfig, SessionId, SessionReply,
+    TurnOutcome,
 };
 use crate::tool::{ToolExecutor, ToolRegistry};
 
@@ -128,8 +129,6 @@ pub struct Engine {
     tool_executor: Option<ToolExecutor>,
     total_consumed_tokens: Arc<AtomicU64>,
     cache: Option<Arc<InMemoryCache>>,
-    /// 回合级取消标志：session_id → 标志（Interrupt 置位，run_chat 每轮检查）
-    cancels: Arc<DashMap<SessionId, Arc<AtomicBool>>>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -163,7 +162,6 @@ impl Engine {
             tool_executor: None,
             total_consumed_tokens: Arc::new(AtomicU64::new(0)),
             cache,
-            cancels: Arc::new(DashMap::new()),
         }
     }
 
@@ -208,6 +206,11 @@ impl Engine {
         self.sessions.get(&session_id).map(|s| s.consumed_tokens())
     }
 
+    /// 指定会话的 history 消息数（观测 / 测试用）
+    pub fn history_len(&self, session_id: SessionId) -> Option<usize> {
+        self.sessions.get(&session_id).map(|s| s.history_len())
+    }
+
     /// 当前缓存条目数（未启用时为 0）
     pub fn cache_len(&self) -> usize {
         self.cache.as_ref().map(|c| c.len()).unwrap_or(0)
@@ -217,34 +220,26 @@ impl Engine {
 
     /// 发起一轮 Chat，返回句柄（快速返回，实际执行在派生任务中）
     ///
-    /// 同步段完成：会话创建 / busy 拒绝 / 预算守门 / 取消标志注册，
-    /// 不进行任何 await。实际回合由内部 spawn 的 `run_chat` 执行。
+    /// 同步段原子完成：会话创建 / busy 拒绝（含 `start_thinking`）/ 预算守门 /
+    /// history 写入 / request 组装，不进行任何 await。**并发第二个 `chat`（同 session）
+    /// 会在 `start_round` 的单一 guard 内被 `Busy` 拒绝，不会再污染 history 或
+    /// 错乱取消标志（TOCTOU 修复）。**
     pub fn chat(
         &self,
         session_id: SessionId,
         payload: ChatPayload,
     ) -> Result<ChatHandle, EngineStartError> {
-        // 0. 创建/获取会话（短暂持锁，无 await）
-        if !self.get_or_create_session(session_id) {
+        // 0. 原子创建会话（DashMap entry，避免 max_sessions 竞态）
+        if !self.ensure_session(session_id) {
             return Err(EngineStartError::MaxSessions);
         }
 
-        // 1. busy 拒绝（显式可见）
-        if self
-            .sessions
-            .get(&session_id)
-            .map(|s| s.is_busy())
-            .unwrap_or(false)
-        {
-            return Err(EngineStartError::Busy);
-        }
-
-        // 2. 预算守门：会话级 + 全局级（软限制，check-then-act）
+        // 1. 预算守门：会话级 + 全局级（软限制，check-then-act）
         if let Err(e) = self.check_budget(&session_id) {
             return Err(EngineStartError::Budget(e));
         }
 
-        // 3. 注入工具声明（若本轮未显式指定）
+        // 2. 注入工具声明（若本轮未显式指定）
         let mut options = payload.options;
         if let Some(registry) = &self.tools {
             if options.tools.is_empty() {
@@ -252,23 +247,21 @@ impl Engine {
             }
         }
 
-        // 4. 写入 history + options（锁内）
-        if let Some(mut s) = self.sessions.get_mut(&session_id) {
-            s.push_history(payload.message.clone());
-            s.set_chat_options(options.clone());
-        }
+        // 3. 原子启动回合：busy 检查 + turn_id + 取消通道 + history + request
+        //    在 Session 单一 guard 内完成，并发 Chat 在此被 `Busy` 拒绝，
+        //    且不会留下半写状态。
+        let round = self
+            .sessions
+            .get_mut(&session_id)
+            .and_then(|mut s| s.start_round(payload.message, &options))
+            .ok_or(EngineStartError::Busy)?;
 
-        // 5. 回合取消标志
-        let flag = Arc::new(AtomicBool::new(false));
-        self.cancels.insert(session_id, flag);
-
-        // 6. spawn 回合执行
+        // 4. spawn 回合执行
         let engine = self.clone();
         let (reply_tx, reply_rx) = oneshot::channel();
         tokio::spawn(async move {
-            let reply = engine.run_chat(&session_id, options).await;
+            let reply = engine.run_chat(&session_id, round).await;
             let _ = reply_tx.send(reply);
-            engine.cancels.remove(&session_id);
         });
 
         Ok(ChatHandle {
@@ -280,29 +273,37 @@ impl Engine {
 
     /// 中断一个会话的当前回合（幂等）
     ///
-    /// 任一时点生效：LLM 等待中即时打断；轮隙间由下次检查拦截。
+    /// 任一时点生效：LLM 等待中即时打断；轮隙间（工具执行 / 思考间隙）由
+    /// `Session` 内的回合级中断标志逐轮检查拦截。
+    ///
+    /// 返回 `true` 表示**确实对活动回合发出取消**；会话为空或空闲（Idle，无活动回合）
+    /// 返回 `false`。不再存在「已在取消中 vs 首次触发」被混淆的情况（M1 修复）。
     pub fn interrupt(&self, session_id: SessionId) -> bool {
-        let flag = match self.cancels.get(&session_id) {
-            Some(f) => f.clone(),
+        let mut s = match self.sessions.get_mut(&session_id) {
+            Some(s) => s,
             None => return false,
         };
-        if flag.swap(true, Ordering::SeqCst) {
-            return true; // 已在取消中
+        // 仅活动回合可取消；Idle 无回合可取消
+        if !s.is_busy() {
+            return false;
         }
-        // 触发正在等待的 LLM 调用
-        if let Some(mut s) = self.sessions.get_mut(&session_id) {
-            s.cancel_thinking();
-        }
+        // 置位回合级标志（轮隙间检查）+ 触发 LLM 等待中的取消通道
+        s.raise_interrupt();
+        s.cancel_thinking();
         true
     }
 
     // ── 内部 ──────────────────────────────────
 
     /// 创建或获取会话；超限返回 false
-    fn get_or_create_session(&self, session_id: SessionId) -> bool {
+    ///
+    /// 用 `or_insert_with`（内部走 dashmap 的 insert 路径），避免裸 `entry()`
+    /// match 触发的 shrink 死锁（dashmap entry/shrink 竞态）。
+    fn ensure_session(&self, session_id: SessionId) -> bool {
         if self.sessions.contains_key(&session_id) {
             return true;
         }
+        // 软边界：并发创建多个新会话时可能最多多建一个（可接受的近似）
         if self.sessions.len() >= self.config.max_sessions {
             return false;
         }
@@ -341,23 +342,11 @@ impl Engine {
     }
 
     /// 执行完整回合（顺序异步闭环，含多轮工具循环）
-    async fn run_chat(&self, session_id: &SessionId, options: ChatOptions) -> EngineReply {
-        let span = observe::turn_span(
-            session_id,
-            self.sessions
-                .get(session_id)
-                .map(|s| s.turn_id())
-                .unwrap_or(0),
-        );
-        let flag = self.cancels.get(session_id).map(|f| f.clone());
-        let cancelled = flag
-            .as_ref()
-            .map(|f| f.clone())
-            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-
+    async fn run_chat(&self, session_id: &SessionId, first: RoundStart) -> EngineReply {
+        let span = observe::turn_span(session_id, first.turn_id);
         let timer = observe::Timer::start();
         let outcome = self
-            .run_chat_inner(session_id, options, cancelled.clone())
+            .run_chat_inner(session_id, first)
             .instrument(span)
             .await;
         observe::record_turn_duration(outcome_label(&outcome), timer.finish());
@@ -365,56 +354,34 @@ impl Engine {
         outcome
     }
 
-    async fn run_chat_inner(
-        &self,
-        session_id: &SessionId,
-        options: ChatOptions,
-        cancelled: Arc<AtomicBool>,
-    ) -> EngineReply {
+    async fn run_chat_inner(&self, session_id: &SessionId, first: RoundStart) -> EngineReply {
         let timeout = self.config.session.timeout.thinking_timeout;
-        let mut phase = Phase::First(options);
+        // RoundSource::First 仅在首迭代由 chat() 原子启动；此后经 resume 恢复。
+        // 每迭代用 mem::replace 统一取本轮输入（fresh owned），规避跨迭代 move 累积。
+        let mut src = RoundSource::First(first);
 
         loop {
-            if cancelled.load(Ordering::SeqCst) {
-                return EngineReply::Cancelled;
-            }
-
-            // 1. 启动本轮 thinking（拿到 turn_id + 本轮取消通道）
-            let (turn_id, cancel_rx, request) = match &phase {
-                Phase::First(opts) => {
-                    let pair = self
-                        .sessions
-                        .get_mut(session_id)
-                        .and_then(|mut s| s.start_thinking());
-                    match pair {
-                        Some((turn_id, cancel_rx)) => {
-                            let req = self
-                                .sessions
-                                .get(session_id)
-                                .map(|s| s.build_chat_request(opts))
-                                .unwrap_or_default();
-                            (turn_id, cancel_rx, req)
-                        }
-                        None => {
-                            return EngineReply::Error("failed to start thinking".into());
-                        }
-                    }
-                }
-                Phase::Resume => {
+            let cur = std::mem::replace(&mut src, RoundSource::Resume);
+            let (turn_id, cancel_rx, request) = match cur {
+                RoundSource::First(f) => (f.turn_id, f.cancel_rx, f.request),
+                RoundSource::Resume => {
                     match self
                         .sessions
                         .get_mut(session_id)
                         .and_then(|mut s| s.resume_thinking())
                     {
-                        Some((turn_id, cancel_rx, req)) => (turn_id, cancel_rx, req),
-                        None => {
-                            return EngineReply::Error("resume failed (not awaiting)".into());
-                        }
+                        Some(x) => x,
+                        None => return EngineReply::Error("resume failed (not awaiting)".into()),
                     }
                 }
             };
 
-            // 2. 缓存命中检查（不调 LLM；catch_unwind 兜底降级为真实调用）
+            // 回合级中断（轮隙间：工具执行后 / 思考间隙）
+            if self.is_interrupted(session_id) {
+                return EngineReply::Cancelled;
+            }
+
+            // 缓存命中检查（不调 LLM；catch_unwind 兜底降级为真实调用）
             let cache_key = self
                 .cache
                 .as_ref()
@@ -430,33 +397,32 @@ impl Engine {
                 });
             observe::cache_access(cached.is_some());
 
-            // 3. 执行 LLM（命中缓存则跳过）
+            // 执行 LLM（命中缓存则跳过）；三路 select（LLM / 取消 / 超时）+ catch_unwind
             let outcome = if let Some(resp) = cached {
-                crate::session::TurnOutcome::Cached(Box::new(resp))
+                TurnOutcome::Cached(Box::new(resp))
             } else {
-                // 三路 select（LLM / 取消 / 超时）+ catch_unwind
                 let fut = self.provider.chat(request);
                 let result = AssertUnwindSafe(async {
                     tokio::select! {
                         res = fut => match res {
-                            Ok(r) => crate::session::TurnOutcome::Success(Box::new(r)),
-                            Err(e) => crate::session::TurnOutcome::Error(e),
+                            Ok(r) => TurnOutcome::Success(Box::new(r)),
+                            Err(e) => TurnOutcome::Error(e),
                         },
-                        _ = cancel_rx => crate::session::TurnOutcome::Cancelled,
-                        _ = tokio::time::sleep(timeout) => crate::session::TurnOutcome::Timeout,
+                        _ = cancel_rx => TurnOutcome::Cancelled,
+                        _ = tokio::time::sleep(timeout) => TurnOutcome::Timeout,
                     }
                 })
                 .catch_unwind()
                 .await;
                 match result {
                     Ok(o) => o,
-                    Err(payload) => crate::session::TurnOutcome::Panic(panic_message(payload)),
+                    Err(payload) => TurnOutcome::Panic(panic_message(payload)),
                 }
             };
 
             // 缓存写入：真实调用成功且无工具调用才可缓存
             if let (Some(cache), Some(key)) = (&self.cache, &cache_key) {
-                if let crate::session::TurnOutcome::Success(resp) = &outcome {
+                if let TurnOutcome::Success(resp) = &outcome {
                     if resp.message.tool_calls.is_empty() {
                         let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
                             cache.set(key.clone(), (**resp).clone());
@@ -465,14 +431,16 @@ impl Engine {
                 }
             }
 
-            // 4. 终态收敛（session 内累加 consumed_tokens；guard 短暂持有后立即释放）
-            // 4b. 全局 Token 累计：**每轮真实成功**都计入（含 AwaitingCalls 中间轮），
-            //     与 session 级口径一致；缓存命中不计量。
-            if let crate::session::TurnOutcome::Success(resp) = &outcome {
+            // 全局 Token 累计：**每轮真实成功**都计入（含 AwaitingCalls 中间轮），
+            // 与 session 级口径一致；缓存命中不计量。
+            if let TurnOutcome::Success(resp) = &outcome {
                 add_tokens(&self.total_consumed_tokens, tokens_from_response(resp));
             }
 
-            // 4. 终态收敛（session 内累加 consumed_tokens；guard 短暂持有后立即释放）
+            // 记录是否超时（outcome 即将被收敛消费）
+            let timed_out = matches!(&outcome, TurnOutcome::Timeout);
+
+            // 终态收敛（session 内累加 consumed_tokens；guard 短暂持有后立即释放）
             let action = self
                 .sessions
                 .get_mut(session_id)
@@ -486,30 +454,42 @@ impl Engine {
                     return EngineReply::Success(Box::new(resp));
                 }
                 FinishAction::Idle { response: None } => {
-                    // 错误 / 取消 / 超时 / panic
-                    if cancelled.load(Ordering::SeqCst) {
+                    // 取消 / 超时 / 错误 / panic
+                    if self.is_interrupted(session_id) {
                         return EngineReply::Cancelled;
+                    }
+                    // M2：超时独立归类，不与普通错误混淆
+                    if timed_out {
+                        return EngineReply::Timeout;
                     }
                     return EngineReply::Error("turn ended without success".into());
                 }
-                FinishAction::AwaitingCalls { tool_calls, .. } => {
+                FinishAction::AwaitingCalls {
+                    response,
+                    tool_calls,
+                } => {
                     if self.tool_executor.is_none() || self.tools.is_none() {
-                        // 无工具能力但模型发起了工具调用：强制 Idle + 返回响应
+                        // M3：无工具能力但模型发起了工具调用 → 返回模型原文，不吞正文
                         if let Some(mut s) = self.sessions.get_mut(session_id) {
                             s.force_idle();
                         }
-                        return EngineReply::Error(
-                            "model requested tools but tools are not enabled".into(),
-                        );
+                        return EngineReply::Success(Box::new(response));
                     }
-                    // 6. 执行工具（并行 + 截断 + 隔离 + 超时）
+                    // 执行工具（并行 + 截断 + 隔离 + 超时），随后进入恢复轮
                     self.execute_tools(session_id, tool_calls).await;
-                    phase = Phase::Resume;
+                    // src 已在迭代顶部置为 RoundSource::Resume，循环继续恢复
                 }
             }
         }
     }
 
+    /// 会话是否收到回合级中断
+    fn is_interrupted(&self, session_id: &SessionId) -> bool {
+        self.sessions
+            .get(session_id)
+            .map(|s| s.is_interrupted())
+            .unwrap_or(false)
+    }
     /// 执行一批工具调用，将结果回写进 session 的 AwaitingCalls pending
     async fn execute_tools(
         &self,
@@ -536,11 +516,11 @@ impl Engine {
     }
 }
 
-/// 回合阶段
-enum Phase {
-    /// 首轮：使用传入 options
-    First(ChatOptions),
-    /// 后续轮：由 resume_thinking 从已收集的工具结果恢复
+/// 每轮输入来源
+enum RoundSource {
+    /// 首轮：由 chat() 原子启动的 RoundStart
+    First(RoundStart),
+    /// 后续工具轮：从 AwaitingCalls 的 pending 结果恢复
     Resume,
 }
 

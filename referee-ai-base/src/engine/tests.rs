@@ -412,3 +412,48 @@ async fn multi_turn_accumulates_all_round_tokens() {
         "every round must count toward global budget"
     );
 }
+
+#[tokio::test]
+async fn concurrent_chat_same_session_only_one_ok() {
+    // H1 回归：同一 session 连续两个 Chat，仅第一个成功（StartRound 原子置
+    // Thinking），第二个显式 Busy；且被拒的 Chat **不会**污染 history。
+    let engine = Engine::new(Arc::new(PendingProvider), config());
+    let sid = session_id();
+
+    let (r1, r2) = (
+        engine.chat(sid, chat_payload("a")),
+        engine.chat(sid, chat_payload("b")),
+    );
+    let (handle, busy) = match (r1, r2) {
+        (Ok(h), Err(EngineStartError::Busy)) => (h, true),
+        (Err(EngineStartError::Busy), Ok(h)) => (h, true),
+        o => panic!("expected exactly one Ok + one Busy, got {o:?}"),
+    };
+    assert!(busy, "second concurrent chat must be rejected as Busy");
+
+    // 被拒的 Chat 不应把消息写进 history（不重复污染）
+    assert_eq!(
+        engine.history_len(sid),
+        Some(1),
+        "only the first (accepted) chat should appear in history"
+    );
+
+    handle.cancel();
+}
+
+#[tokio::test]
+async fn many_new_sessions_start_safely() {
+    // 多个新 session 连续启动不挂起（ensure_session 经 DashMap or_insert 路径，
+    // 不触发裸 entry 的 shrink 死锁）。
+    let engine = Engine::new(Arc::new(PendingProvider), config());
+    let sids: Vec<_> = (0..8).map(|_| session_id()).collect();
+    let handles: Vec<_> = sids
+        .iter()
+        .map(|sid| engine.chat(*sid, chat_payload("hi")))
+        .map(|r| r.expect("must start for fresh session"))
+        .collect();
+    for h in &handles {
+        h.cancel();
+    }
+    assert_eq!(engine.session_count(), 8);
+}
