@@ -457,3 +457,110 @@ async fn many_new_sessions_start_safely() {
     }
     assert_eq!(engine.session_count(), 8);
 }
+
+#[tokio::test]
+async fn interrupt_semantics_idle_vs_active() {
+    // M1 语义：空闲会话不可取消（返回 false）；活动回合可取消（返回 true）；
+    // 已取消但回合未终结时仍可再次取消（语义清晰，不分「首次/重复」）。
+    let engine = Engine::new(Arc::new(PendingProvider), config());
+    let sid = session_id();
+
+    // 从未 chat → 空闲，interrupt 返回 false（不误报「已取消」）
+    assert!(
+        !engine.interrupt(sid),
+        "idle session must not report interruptible"
+    );
+
+    let handle = engine.chat(sid, chat_payload("a")).unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await; // 进入 Thinking
+
+    assert!(engine.interrupt(sid), "active round must be interruptible");
+    // 仍在 Thinking（等待收敛）→ 再中断仍返回 true
+    assert!(
+        engine.interrupt(sid),
+        "still thinking → interrupt still true"
+    );
+
+    let reply = wait_with_timeout(handle).await;
+    assert!(matches!(reply, EngineReply::Cancelled), "got {reply:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_burst_same_session_strictly_one() {
+    // H1 强并发边界：8 线程 × 16 路 barrier 同步同时 chat **同一 session**。
+    // start_round 在单一 guard 内原子置 Thinking → 必须严格恰一个成功、其余 Busy，
+    // 且被拒的 Chat 不得污染 history。
+    let engine = Arc::new(Engine::new(Arc::new(PendingProvider), config()));
+    let sid = session_id();
+    let barrier = Arc::new(tokio::sync::Barrier::new(16));
+
+    let tasks: Vec<_> = (0..16)
+        .map(|i| {
+            let e = engine.clone();
+            let b = barrier.clone();
+            tokio::spawn(async move {
+                b.wait().await;
+                e.chat(sid, chat_payload(&format!("m{i}")))
+            })
+        })
+        .collect();
+
+    let mut ok = 0usize;
+    let mut busy = 0usize;
+    let mut handles = Vec::new();
+    let mut others = Vec::new();
+    for t in tasks {
+        match t.await.expect("task panicked") {
+            Ok(h) => {
+                ok += 1;
+                handles.push(h);
+            }
+            Err(EngineStartError::Busy) => busy += 1,
+            Err(o) => others.push(format!("{o:?}")),
+        }
+    }
+
+    assert_eq!(ok, 1, "exactly one chat must start, got {ok}");
+    assert_eq!(busy, 15, "all the rest must be Busy, got {busy}");
+    assert!(others.is_empty(), "unexpected errors: {others:?}");
+    assert_eq!(
+        engine.history_len(sid),
+        Some(1),
+        "rejected concurrent chats must not pollute history"
+    );
+
+    for h in handles {
+        h.cancel();
+    }
+}
+
+#[tokio::test]
+async fn session_reusable_after_cancel() {
+    // 中断收敛后会话回到 Idle，不永久卡 busy：可再次发起 Chat 并再次取消。
+    let engine = Engine::new(Arc::new(PendingProvider), config());
+    let sid = session_id();
+
+    let h1 = engine.chat(sid, chat_payload("first")).unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    h1.cancel();
+    assert!(matches!(
+        wait_with_timeout(h1).await,
+        EngineReply::Cancelled
+    ));
+
+    // 会话应已复位 → 第二轮可正常启动
+    assert!(!engine.interrupt(sid), "idle after cancel");
+    let h2 = engine.chat(sid, chat_payload("second")).unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(engine.interrupt(sid), "second round active");
+    let h2b = h2;
+    // wait 由 interrupt 驱动收敛
+    h2b.cancel();
+    assert!(matches!(
+        wait_with_timeout(h2b).await,
+        EngineReply::Cancelled
+    ));
+
+    // history 记录了两轮用户消息（被拒的除外），不因中断而丢失状态一致
+    assert_eq!(engine.history_len(sid), Some(2));
+}
