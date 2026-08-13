@@ -7,6 +7,8 @@
 //! - [`AgentRuntime`]：实现 `referee-core::Extension`，把 base 引擎接入内核消息
 //!   路由（`Chat` / `Interrupt`）。
 //! - [`tool::AgentTool`]：对等/子 Agent 协作（Agent as Tool）。
+//! - [`tool::mcp`]：MCP 2.0 stdio 客户端桥（远程 MCP 工具接入 `Tool` 抽象；
+//!   按需拓展，启用 `mcp-stdio` feature 后加载）。
 //! - [`artifact`]：带 ACL 的工件存储（业务层对等成果共享的安全能力）。
 //!
 //! ## 定位
@@ -15,11 +17,19 @@
 
 pub mod artifact;
 pub mod tool;
+// Agent Skills 开放标准（SKILL.md）注入，按需拓展，启用 `skills` feature 后加载
+#[cfg(feature = "skills")]
+pub mod skill;
 
 pub use artifact::{
     Artifact, ArtifactStore, BoardId, InMemoryArtifactStore, StoreConfig, StoreError,
 };
 pub use tool::{AgentTool, ArtifactReader, ListMyBoard};
+#[cfg(feature = "skills")]
+pub use skill::{
+    render_skill_context, KeywordRouter, RegistryConfig as SkillRegistryConfig, RegistryError as SkillRegistryError,
+    Skill, SkillConfig, SkillDeclaration, SkillError, SkillRegistry, SkillRouter,
+};
 
 use std::sync::Arc;
 

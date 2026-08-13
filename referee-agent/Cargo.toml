@@ -12,6 +12,10 @@ deepseek  = ["referee-ai-base/deepseek"]
 openai    = ["referee-ai-base/openai"]
 anthropic = ["referee-ai-base/anthropic"]
 responses = ["referee-ai-base/responses"]
+# MCP 2.0 stdio 客户端桥（按需拓展，默认不加载；stdio 桥零新增依赖）
+mcp-stdio = []
+# Agent Skills 开放标准（SKILL.md）注入（按需拓展，默认不加载；零新增依赖）
+skills = []
 
 [dependencies]
 referee-core  = { path = "../referee-core" }

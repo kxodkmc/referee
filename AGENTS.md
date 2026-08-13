@@ -27,7 +27,9 @@
 - **referee-ai-base（地基积木）**：✅ 已完成——厂商抽象、会话状态机、工具执行（同步/异步
   派发）、通用 KV、预算、提示词、缓存、可观测、会话引擎（最小闭环 + 流式 + 会话生命周期）。
 - **referee-agent（业务封装）**：✅ 已完成核心——Extension 集成、对等协作（Agent as Tool）、
-  ACL 工件存储、成果板读取工具；记忆 / MCP / Skills 等业务策略不预置（由使用方二次封装）。
+  ACL 工件存储、成果板读取工具；MCP 2.0 stdio 客户端桥 / Agent Skills（SKILL.md）注入以
+  按需 feature `mcp-stdio` / `skills` 提供（默认不加载、零新增依赖）；记忆等业务策略不预置
+  （由使用方二次封装）。
 
 ## 工作约束
 

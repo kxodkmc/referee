@@ -8,7 +8,7 @@
 ┌─────────────────────────────────────────────────────────────┐
 │ referee-agent（业务封装，开箱即用）                            │
 │   AgentRuntime (Extension) · 对等协作 AgentTool · ACL 工件存储 │
-│   · 成果板读取工具（list_my_board / read_artifact）             │
+│   · 成果板读取工具 · MCP stdio（mcp-stdio）· Skills（skills）  │
 ├─────────────────────────────────────────────────────────────┤
 │ referee-ai-base（核心支撑，地基积木）                          │
 │   provider · session · tool · store · budget · prompt ·      │
@@ -25,7 +25,7 @@
 |------|------|------|
 | [`referee-core`](referee-core/) | **微内核**：路由 / 原语 / 治理（背压、熔断、监督、停机、DLQ、WAL） | 25 条 |
 | [`referee-ai-base`](referee-ai-base/) | **核心支撑（地基）**：厂商抽象、会话引擎（最小闭环 + 流式输出 + 会话生命周期）、工具执行（同步/异步派发）、通用 KV、预算、提示词、缓存、可观测 | 116 条 |
-| [`referee-agent`](referee-agent/) | **业务封装（开箱即用）**：Extension 集成、对等协作、ACL 工件存储、成果板读取工具 | 17 条 |
+| [`referee-agent`](referee-agent/) | **业务封装（开箱即用）**：Extension 集成、对等协作、ACL 工件存储、成果板读取工具；MCP stdio（`mcp-stdio`）与 Skills（`skills`）按需 feature | 17 条（默认） |
 
 合计 **158 条测试全绿**（`cargo test --workspace`）。
 
@@ -44,6 +44,8 @@ referee-agent   = { path = "referee-agent" }               # 开箱即用 Agent�
 3. 需要完整/协作者 Agent 时，用 `referee-agent` 的 `AgentRuntime`（实现 `Extension` trait）
    注册为内核扩展，即获得多会话 + 对等协作能力；需要边生成边消费时用 base 引擎的
    `chat_stream` 流式接口，会话生命周期（快照 / 枚举 / 删除 / 空闲回收）由引擎直接提供。
+   需要接入远程工具或注入技能时，启用 `referee-agent` 的 `mcp-stdio` / `skills` feature
+   （默认关闭，核心保持轻量）。
 
 ## 文档地图
 
@@ -78,8 +80,9 @@ Phase 1 骨架与背压 → Phase 2 invoke 原语 → Phase 3 容错与隔离 �
 ### referee-agent（业务封装）— 完成核心；扩展能力可在此基础上建设
 
 Extension 集成、对等协作（Agent as Tool）、ACL 工件存储与成果板读取工具
-（`list_my_board` / `read_artifact`）。记忆 / MCP / Skills 等业务策略由使用者或
-二次封装搭建（不预置在地基层）。
+（`list_my_board` / `read_artifact`）。MCP 2.0 stdio 客户端桥以按需 feature
+**`mcp-stdio`**、Agent Skills（SKILL.md）注入以按需 feature **`skills`** 提供
+（默认不加载，零新增依赖）；记忆等业务策略不预置（由使用方二次封装）。
 
 ### referee-ai-base（核心支撑地基）— 已完成（含近期增强）
 

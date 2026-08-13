@@ -2,7 +2,8 @@
 
 > 建立在 `referee-ai-base`（地基）之上的**业务层**：把 base 的积木（厂商抽象、
 > 会话引擎、工具执行、预算、缓存）组装为可直接使用的 Agent 运行时，并提供业务能力：
-> Extension 集成、对等协作（Agent as Tool）、带 ACL 的工件存储与成果板读取工具。
+> Extension 集成、对等协作（Agent as Tool）、带 ACL 的工件存储与成果板读取工具，
+> 以及 MCP 2.0 stdio 客户端桥（按需 feature `mcp-stdio`）。
 >
 > **分层**：`referee-core`（内核，通信与治理）→ `referee-ai-base`（核心支撑积木）
 > → `referee-agent`（本模块，业务封装，开箱即用）。
@@ -14,7 +15,8 @@
 | 业务层 | 基于 `referee-ai-base` 组装；base 提供最小闭环积木，本模块提供「如何把它们变成完整、可用、协作的 Agent」 |
 | Extension 集成 | `AgentRuntime` 实现 `referee-core::Extension`，把 base 引擎接入内核消息路由（`Chat` / `Interrupt`） |
 | 业务能力 | 对等/子 Agent 协作（`AgentTool`，Agent as Tool）、ACL 工件存储（`artifact`）、成果板读取工具（`list_my_board` / `read_artifact`） |
-| 不预置 | 记忆、MCP、Skills 等业务策略由使用者/二次封装搭建，本模块与 base 均不绑定 |
+| 按需拓展 | MCP 2.0 stdio 客户端桥（`tool::mcp`）以 feature `mcp-stdio` 按需加载，默认不编译，核心保持轻量 |
+| 不预置 | 记忆等业务策略由使用者/二次封装搭建；Agent Skills 注入（`skill`）以 feature `skills` 按需提供（默认不加载，核心保持轻量） |
 
 ### 启用方式
 
@@ -26,7 +28,12 @@ referee-core    = { path = "referee-core" }
 ```
 
 features（默认 `["xiaomi", "deepseek"]`）通过 `referee-agent` 转发到 `referee-ai-base`
-裁剪厂商适配器。
+裁剪厂商适配器。协议桥接均为按需 feature（默认关闭，零新增依赖）：
+
+```toml
+[dependencies]
+referee-agent = { path = "referee-agent", features = ["xiaomi", "deepseek", "mcp-stdio", "skills"] }
+```
 
 ## 2. 架构
 
@@ -54,7 +61,9 @@ features（默认 `["xiaomi", "deepseek"]`）通过 `referee-agent` 转发到 `r
 | [`AgentRuntime`](src/lib.rs) | `Extension` 实现：接收 `Chat` / `Interrupt` 消息，委托 base `Engine` 驱动回合；观测（会话数 / token / 缓存）；转发会话管理（`remove_session` / `list_sessions` / `session_info`）；`chat_stream` 库级流式；`register_peer_tool` / `register_artifact_tools` |
 | [`tool::AgentTool`](src/tool/agent_tool.rs) | 对等/子 Agent 工具（Agent as Tool）：`Local` 分类不占 IO 槽位，同步 RPC 调用目标会话，大结果 ACL 落库；`peer_depth` 嵌套深度限制 |
 | [`tool::ArtifactReader`](src/tool/artifact_reader.rs) | 成果板读取工具：`list_my_board` 列本会话板内条目、`read_artifact` 按 ID 凭证读取成果正文（读取路径仍经 ArtifactStore ACL 校验） |
+| [`tool::mcp`](src/tool/mcp/mod.rs) | MCP 2.0 stdio 客户端桥（按需 feature `mcp-stdio`）：子进程管理（有界读取/并发分发/取消/停机）、`server/discover` + `tools/list` + `tools/call`、`_meta` 注入 + 版本协商（-32022）、MRTR `InputRequiredResult` 三策略；`McpServer` 把远程工具经 `Tool` 抽象接入注册表 |
 | [`artifact`](src/artifact/mod.rs) | 带 ACL 的工件存储：owner / 授权读者读取校验，有界（数量 + 字节双上限），成果板（`BoardId`）组织 |
+| [`skill`](src/skill/mod.rs) | Agent Skills 开放标准（SKILL.md）注入（按需 feature `skills`）：极简 frontmatter 解析（零依赖 YAML）、有界注册表（`SkillRegistry`）、关键词路由（含 CJK 匹配）、`render_skill_context` 注入渲染；渐进式披露 L1 元数据 / L2 正文 / L3 资源，零新增依赖 |
 
 ## 4. 快速上手
 
@@ -105,6 +114,35 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### 接入 Agent Skills（`skills` feature）
+
+装载一次、逐轮注入：`skills/` 目录（每个技能一个子目录，含 `SKILL.md`）→ 注册表 →
+关键词路由 → 渲染注入到本轮 system prompt：
+
+```rust
+use std::path::Path;
+use std::sync::Arc;
+use referee_agent::skill::{load_root, SkillConfig, SkillRegistry,
+                           KeywordRouter, render_skill_context};
+use referee_ai_base::session::ChatOptions;
+
+// 启动时装载一次（有界：单资源/总字节/条数均有上限）
+let registry = SkillRegistry::with_defaults();
+for s in load_root(Path::new("./skills"), &SkillConfig::default())? {
+    registry.register(Arc::new(s))?;
+}
+let router = KeywordRouter::default();
+
+// 每轮对话前：用用户消息路由 → 渲染 L1/L2 → 拼进本轮 system prompt
+let activated = router.select(user_message, &registry.all());
+let mut options = ChatOptions::default();
+options.system_prompt = Some(format!("你是助手。\n\n{}", render_skill_context(&activated)));
+```
+
+技能正文经 `ChatOptions.system_prompt` 注入，再由 base `build_prompt` 做预算截断，
+**完全复用现有背压治理**（base 零改动）。Skill 是纯数据注入（渐进式披露），并非工具，
+不执行 `scripts/`。
+
 ## 5. 设计约束（继承 base + 业务）
 
 - base 保证最小闭环的并发正确性（回合内顺序异步、协作取消、无跨 await 持锁、错误显式可见），并提供流式输出与会话生命周期管理。
@@ -117,6 +155,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 ```bash
 cargo test -p referee-agent     # 库单测（artifact ACL / 成果读取工具）+ 集成（peer 对等协作 6 条验收，含嵌套深度与异步工具回归）
+cargo test -p referee-agent --features mcp-stdio   # MCP 2.0 协议单测（21 条：_meta 注入 / 版本协商 / discover / tools/call / MRTR）
+cargo test -p referee-agent --features skills      # Agent Skills（frontmatter / 注册 / 路由 / 端到端注入 build_prompt）
 cargo clippy -p referee-agent --all-targets -- -D warnings
 ```
 
