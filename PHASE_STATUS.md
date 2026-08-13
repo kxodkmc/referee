@@ -1,7 +1,7 @@
 # Phase 状态跟踪
 
 > 用途：记录已完成阶段、验收结果与遗留事项，供后续阶段开工前核对进度。
-> 更新时间：Phase 4 完成时（cargo build / test / clippy / fmt 全部通过）。
+> 更新时间：2026-08-12（三层拆分 + 流式/会话管理/异步工具派发落地后）。
 
 ## 总览
 
@@ -312,21 +312,39 @@ referee-core/
 | `priority.rs` 置于 `kernel/` 而非 `common/` | 保持 common 纯数据层，避免 common → extension 反向依赖（详见 Phase 4 偏差表） |
 | 停机信号用 `watch` 而非 `Notify` | `notify_waiters` 不存储 permit，存在通知丢失竞态（详见 Phase 4 偏差表） |
 
-## referee-agent 阶段状态（P0 ~ P3 + 预算治理 + P5 已完成）
+## referee-agent 阶段状态（已随三层重构收口；业务扩展不预置）
 
-> 本仓库当前共 **169 条测试全绿**（referee-core 25 + referee-agent 144）。
-> referee-agent 各阶段验收口径见 `AGENT_RUNTIME_PLAN.md`（规划文档）与对应测试文件。
+> 本仓库当前共 **158 条测试全绿**（referee-core 25 + referee-ai-base 116 + referee-agent 17）。
+> 三层拆分（`d8da019`）后：地基能力在 `referee-ai-base`，业务封装在 `referee-agent`；
+> 原规划中的记忆（P4）/ MCP 与 Skills（P7）**按重构决策移除**，计量与可观测（P6）
+> 以精简形态落地于 base（`observe` + `budget`）。各阶段验收口径见
+> `AGENT_RUNTIME_PLAN.md`（历史规划）与 `REFACTOR_PLAN.md`（重构执行规划）。
 
 ### 阶段总览
 
 | 阶段 | 主题 | 状态 | 测试 |
 |------|------|------|------|
-| P0 | 厂商抽象层（LLMProvider + MiMo/DeepSeek 适配器 + 流式 + 错误归一） | ✅ 完成 | deepseek 13 / xiaomi 13 / equivalence 5 |
-| P1 | 会话状态机（并发正确性 + 中断 + 幽灵治理 + 消息驱动） | ✅ 完成 | session_test 14 + 单元 |
-| P2 | 工具调用（Tool trait + 注册表 + 并行执行 + 多轮循环） | ✅ 完成 | tool_test 9 + 单元 |
-| P3 | 对等智能体协作 + 工件存储（Agent as Tool + ArtifactStore ACL） | ✅ 完成 | peer_test 4 + 单元 |
-| 预算治理 | Token 双层级限额（Session + 全局共享计数器） | ✅ 完成 | budget_test 6 + 单元 |
-| P5 | 提示词组装与缓存（PromptBuilder 预算截断 + 内存 LRU/TTL 缓存 + 合成流） | ✅ 完成 | cache_test 7 + 模块单测 20 |
+| P0 | 厂商抽象层（LLMProvider + MiMo/DeepSeek 适配器 + 流式 + 错误归一） | ✅ 完成（base） | deepseek 13 / xiaomi 13 / equivalence 5 |
+| P1 | 会话状态机（并发正确性 + 中断 + 幽灵治理 + 消息驱动） | ✅ 完成（base） | session_test 14 + 单元 |
+| P2 | 工具调用（Tool trait + 注册表 + 并行执行 + 多轮循环） | ✅ 完成（base，同步/异步派发已增强） | tool_test 9 + 单元 |
+| P3 | 对等智能体协作 + 工件存储（Agent as Tool + ArtifactStore ACL） | ✅ 完成（agent，含成果板读取工具） | peer_test 6 + 单元 |
+| 预算治理 | Token 双层级限额（Session + 全局共享计数器） | ✅ 完成（base） | budget_test 6 + 单元 |
+| P5 | 提示词组装与缓存（PromptBuilder 预算截断 + 内存 LRU/TTL 缓存 + 合成流） | ✅ 完成（base，`PromptParts` 参数封装） | cache_test 7 + 模块单测 20 |
+| P4 | 记忆模块 | ❌ 移除（重构决策：业务扩展不预置） | — |
+| P6 | 计量与可观测 | ✅ 精简落地（base `observe` + 引擎重试门控 `llm_retry`） | observe/engine 单元 |
+| P7 | MCP 与 Skills | ❌ 移除（重构决策：协议桥接基于 Tool 自接） | — |
+
+### 近期新增能力（2026-08-12）
+
+| 能力 | 位置 | 说明 |
+|------|------|------|
+| 子智能体嵌套深度限制 | base `session` / `engine`（`peer_depth`） | 会话级嵌套上限，Agent 级联调用受限，杜绝失控递归 |
+| 异步工具派发 | base `tool/executor.rs` | 按保留参数 `wait` / 工具 `default_wait` 分流同步/异步工具；异步结果入队、下一轮模型调用自动注入 |
+| 流式输出引擎 | base `engine/stream.rs` | `chat_stream` 返回 `ChatHandle`，`wait()` 得 `EngineReply::Streaming`；chunk 转发 + `StreamAccumulator` 收敛，终态与非流式一致 |
+| 会话生命周期管理 | base `engine/session_mgmt.rs` | `SessionPhase` / `SessionSnapshot` 快照、`list_sessions` / `remove_session`、`start_idle_reaper` 空闲回收（仅回收 Idle 会话） |
+| 成果板读取工具 | agent `tool/artifact_reader.rs` | `list_my_board` 列本人板内条目、`read_artifact` 按 ID 凭证读正文；经 `register_artifact_tools` 一键注册 |
+| 提示词参数封装 | base `prompt/mod.rs` | `PromptParts` 统一碎片参数，替代 9 个位置参数，新增参数不破坏调用方 |
+| 引擎重试门控 | base `provider` / `engine` | `LlmError::is_retryable` 判定 + `llm_retry` 指标，仅可恢复错误触发重试 |
 
 ### 关键设计决策（agent 层）
 
@@ -340,6 +358,11 @@ referee-core/
 | 全局预算计数器可注入共享（`Arc<AtomicU64>`） | 主 Agent + 子 Agent 是不同 Runtime，各自独立计数无法约束任务总盘子；共享同一计数器即系统级总预算（`sub_agent_shared_global_budget`：40+60+40=140 跨 runtime 合并） |
 | Session 级与全局共用 `tokens_from_response` | 统一计量口径（usage 优先、缺失时保守估算响应文本）；避免「Session 计 AwaitingCalls、全局漏计」的不一致（converge 开头统一计数，覆盖工具调用轮） |
 | 预算为软限制（check-then-act） | 单轮消耗无法预知，只能拒绝「累计 ≥ limit 后的新请求」：允许最后一次超额，其后拒绝；并发下最多超额一轮并发量（budget_test 断言口径即此语义） |
+| 子智能体嵌套深度上限（`peer_depth`） | 对等工具可无限级联（A→B→C→…）且每级都在 AwaitingCalls 中占用会话 → 失控递归会耗尽会话/预算；会话配置 `max_peer_depth` 上限，超限直接拒绝（`peer_depth_limit_rejected`） |
+| 工具按等待决策分流（`split_by_wait`） | 同步工具（等待结果回填本轮）与异步工具（派发后由结果队列在下一轮模型调用自动注入）语义不同，混跑会阻塞异步路径；保留参数 `wait` > 工具 `default_wait` > 默认不等待，统一决策 |
+| 流式走引擎级通道而非协议层回信 | Envelope metadata JSON 只能承载一次性回信（无流式通道），故 `chat_stream` 为库 API（不经 Envelope 协议）；`StreamAccumulator` 收敛出完整 `ChatResponse`，`finish_thinking` 复用 → 流式与非流式在 Session 上终态一致 |
+| 空闲回收仅清理 Idle 会话 | Thinking / AwaitingCalls 在途任务由回合收敛自己终结；reaper 只回收「Idle 且超时」的会话（`Idle 超时 = 配置 timeout`），扫描间隔 = timeout/2，`ReaperHandle::stop` 优雅退出 |
+| 引擎重试仅对可恢复错误 | `LlmError::Network/Server/RateLimited` 才重试（`is_retryable`），BadRequest/Auth/Protocol 等重试无意义且放大账单；重试计数上 `llm_retry` 指标 |
 
 ### 对规划文档的偏差（均有意为之，均已验证）
 
@@ -358,13 +381,19 @@ referee-core/
 | System 截断按估算系数反推字符数并扣除后缀成本 | `budget*4` 字符超预算；字符数做字节切片索引对中文必 panic（CJK 回归测试） |
 | 验收 4（流式缓存语义）由 `synthetic_stream` 函数级单测覆盖 | 协议层无流式回信通道（Envelope metadata JSON 一次性回信），集成层回 `SessionReply::Success` |
 | 预算验收语义修正（软限制） | 原方案验收 1/2「预计本轮超限即拒绝」无法实现——前置检查只能看到已消耗量；改为「允许最后一次超额，其后拒绝」并写入测试断言 |
+| 验收 4（流式缓存语义）原先由函数级单测覆盖，现已有引擎级流式 | 5d4440b 前的协议层无流式回信通道；近期 `chat_stream`（base `engine/stream.rs`）提供库级流式接口，`synthetic_stream` 单测仍保留 |
+| 异步派发路线在工具层落地（非子 Agent 派发） | 原待办「P3 异步派发路线」指向子 Agent 的 emit 派发；实际先落地工具层异步派发（`split_by_wait` + 结果队列自动注入），子 Agent 超长任务的异步路线仍留待后续 |
 
 ## 后续阶段待办
 
-> referee-core Phase 1 ~ 6 已全部完成；referee-agent P0 ~ P3 + 预算治理已完成。
-> 待办：referee-agent P4（记忆模块）/ P6（计量收口 + 全链路可观测）/ P7（MCP 与 Skills）；
-> P3 异步派发路线 + 白名单可见性注入（同步路线的超长任务增强）；预算任务级级联（子任务消耗计入父任务，超出共享计数器的系统级口径）；
-> P5 后续：system prompt 注入点（SessionConfig 预留）、memory/artifacts 片段接入（P4 落地后）。
+> referee-core Phase 1 ~ 6 已全部完成；referee-ai-base（P0/P1/P2/预算/P5 + 流式/会话管理）
+> 与 referee-agent（P3 业务封装 + 成果读取工具）已完成。
+> 已关闭：P4 记忆模块、P7 MCP 与 Skills（重构决策移除，业务扩展不预置）；
+> P3 异步派发路线（工具层异步派发已落地）。
+> 剩余待办：
+> - 子 Agent 超长任务的异步派发增强（`SubagentDone` 编解码保留未启用）与白名单可见性注入；
+> - 预算任务级级联（子任务消耗计入父任务，超出共享计数器的系统级口径）；
+> - P5 后续：system prompt 注入点（SessionConfig 预留）、memory/artifacts 片段接入。
 
 ## 开工前核对清单
 

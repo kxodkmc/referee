@@ -151,6 +151,8 @@ impl ToolExecutor {
     /// 批量执行工具调用，返回所有结果（仅等待类；调用方应先 `truncate`）
     ///
     /// - 全部并行执行，`join_all` 等到最后一个（每个独立 `catch_unwind` + `timeout`）
+    /// - `max_concurrency`：可选并发上限；`Some(1)` 强制串行（厂商不支持并行工具时降级），
+    ///   `None` 沿用执行器默认 `max_concurrency`
     pub async fn execute_batch(
         &self,
         tool_calls: Vec<ToolCall>,
@@ -158,10 +160,15 @@ impl ToolExecutor {
         session_id: uuid::Uuid,
         turn_id: u64,
         peer_depth: u32,
+        max_concurrency: Option<usize>,
     ) -> Vec<ExecutedTool> {
         if tool_calls.is_empty() {
             return Vec::new();
         }
+
+        let sem = max_concurrency
+            .map(|n| Arc::new(Semaphore::new(n)))
+            .unwrap_or_else(|| self.semaphore.clone());
 
         // 并行执行
         let kernel = self.kernel.clone();
@@ -169,7 +176,7 @@ impl ToolExecutor {
         let futures: Vec<_> = tool_calls
             .into_iter()
             .map(|tc| {
-                let sem = self.semaphore.clone();
+                let sem = sem.clone();
                 let registry = registry.clone();
                 let timeout = self.config.tool_timeout;
                 let kernel = kernel.clone();
@@ -240,8 +247,10 @@ async fn guarded_execute(
     let tool_call_id = tc.id.clone();
     let tool_name = tc.function.name.clone();
     AssertUnwindSafe(async {
-        execute_single(registry, tc, session_id, turn_id, peer_depth, timeout, sem, kernel, store)
-            .await
+        execute_single(
+            registry, tc, session_id, turn_id, peer_depth, timeout, sem, kernel, store,
+        )
+        .await
     })
     .catch_unwind()
     .await
@@ -494,7 +503,7 @@ mod tests {
         let exec = ToolExecutor::with_defaults();
         let calls = vec![make_call("a", "{}"), make_call("b", "{}")];
         let results = exec
-            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0, 0)
+            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0, 0, None)
             .await;
 
         assert_eq!(results.len(), 2);
@@ -532,7 +541,7 @@ mod tests {
         let exec = ToolExecutor::with_defaults();
         let calls = vec![make_call("panic", "{}"), make_call("ok", "{}")];
         let results = exec
-            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0, 0)
+            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0, 0, None)
             .await;
 
         assert_eq!(results.len(), 2);
@@ -559,7 +568,7 @@ mod tests {
         });
         let calls = vec![make_call("slow", "{}")];
         let results = exec
-            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0, 0)
+            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0, 0, None)
             .await;
 
         assert_eq!(results.len(), 1);
@@ -572,7 +581,7 @@ mod tests {
         let exec = ToolExecutor::with_defaults();
         let calls = vec![make_call("nonexistent", "{}")];
         let results = exec
-            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0, 0)
+            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0, 0, None)
             .await;
 
         assert_eq!(results.len(), 1);
@@ -600,7 +609,7 @@ mod tests {
         let calls = vec![make_call("local_a", "{}"), make_call("local_b", "{}")];
         let start = std::time::Instant::now();
         let results = exec
-            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0, 0)
+            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0, 0, None)
             .await;
         let elapsed = start.elapsed();
 
@@ -636,7 +645,7 @@ mod tests {
         let calls = vec![make_call("r_a", "{}"), make_call("r_b", "{}")];
         let start = std::time::Instant::now();
         let results = exec
-            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0, 0)
+            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0, 0, None)
             .await;
         let elapsed = start.elapsed();
 
@@ -741,11 +750,15 @@ mod tests {
                 uuid::Uuid::new_v4(),
                 0,
                 0,
+                None,
             )
             .await;
         assert_eq!(results.len(), 1);
         let received = seen.lock().clone().expect("tool must have run");
         assert_eq!(received.get("x"), Some(&json!(1)));
-        assert!(received.get("wait").is_none(), "reserved wait key must be stripped");
+        assert!(
+            received.get("wait").is_none(),
+            "reserved wait key must be stripped"
+        );
     }
 }

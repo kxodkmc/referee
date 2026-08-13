@@ -1,7 +1,8 @@
 # Referee AI Base — Agent 核心支撑层（地基）
 
 业务无关的**基础 AI 设施**积木，提供「接 LLM → 组装 prompt → 调工具 → 管预算 →
-回复」的最小闭环。不预置记忆、MCP、Skills 等业务策略；业务化、开箱即用的完整 Agent
+回复」的最小闭环，并在此基础上提供**流式输出**与**会话生命周期管理**（快照 / 枚举 /
+删除 / 空闲回收）。不预置记忆、MCP、Skills 等业务策略；业务化、开箱即用的完整 Agent
 封装在 `referee-agent`。
 
 ## 模块
@@ -10,13 +11,13 @@
 |------|------|
 | `provider` | 厂商唯一 I/O 边界：`LLMProvider` trait、纯数据模型、错误归一与重试、能力声明、OpenAI 兼容底座 + 厂商适配器 |
 | `session` | 会话状态机（Idle/Thinking/AwaitingCalls）、超时、终态自管（`run_turn`） |
-| `tool` | 工具抽象 `Tool` + 有界注册表 + 并行/截断/panic 隔离/超时执行器 |
+| `tool` | 工具抽象 `Tool` + 有界注册表 + 并行/截断/panic 隔离/超时执行器 + 同步/异步派发（`wait` 分流） |
 | `store` | 通用有界 KV 存储抽象（成果/大结果落库），后端可替换 |
 | `budget` | Token 预算治理（Session 级 + 全局共享计数器） |
-| `prompt` | 提示词组装与优先级截断（杜绝 Prompt 爆炸） |
+| `prompt` | 提示词组装与优先级截断（杜绝 Prompt 爆炸），`PromptParts` 统一参数封装 |
 | `cache` | LRU + TTL 语义缓存，流式一致性合成 |
-| `observe` | 可观测门面（tracing span、metrics、计时） |
-| `engine` | 会话引擎：把最小闭环收敛到单任务顺序异步流程，可直接驱动 |
+| `observe` | 可观测门面（tracing span、metrics、计时、LLM 重试计数） |
+| `engine` | 会话引擎：最小闭环收敛到单任务顺序异步流程；流式输出（`chat_stream`）与会话生命周期管理（快照/枚举/删除/空闲回收） |
 
 ## 快速上手
 
@@ -32,7 +33,27 @@ let handle = engine.chat(session_id, ChatPayload::default() /* 或构造 */).unw
 let reply = tokio::time::timeout(Duration::from_secs(30), handle.wait()).await??;
 // 中断
 handle.cancel();
+
+// 流式发起一轮会话：句柄 wait() 得到 EngineReply::Streaming，逐 chunk 消费
+let handle = engine.chat_stream(session_id, ChatPayload::default())?;
+if let referee_ai_base::EngineReply::Streaming(mut chunks) = handle.wait().await? {
+    while let Some(chunk) = chunks.next().await {
+        // chunk: Result<StreamChunk, LlmError> —— 边生成边消费
+    }
+}
 ```
+
+## 流式与会话生命周期
+
+- **流式输出**：`engine.chat_stream` 与 `chat` 同构（同一 `prepare_round` / `finish_thinking`
+  收敛），仅 LLM 调用段改为 `provider.chat_stream`；chunk 逐条转发给调用方并交给
+  `StreamAccumulator` 累积，收敛出的完整 `ChatResponse` 走与非流式一致的终态 ——
+  **流式与非流式在 Session 上结果一致**。取消逐 chunk 检查、超时覆盖整体、panic 兜底。
+- **会话快照**：`session_info(id)` 返回 `SessionSnapshot { state / history_len /
+  consumed_tokens / peer_depth }`（`state` 为 `SessionPhase::Idle | Thinking | AwaitingCalls`）。
+- **枚举与删除**：`list_sessions()` 枚举全部会话 ID；`remove_session(id)` 直接移除。
+- **空闲回收**：`start_idle_reaper()` 启动后台任务，周期移除「Idle 且空闲超时」的会话
+  （Thinking / AwaitingCalls 在途任务不受影响），返回 `ReaperHandle`（`stop()` 优雅退出）。
 
 ## 设计约束
 

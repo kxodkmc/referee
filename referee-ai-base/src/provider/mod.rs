@@ -424,6 +424,16 @@ pub enum LlmError {
     Protocol(String),
 }
 
+impl LlmError {
+    /// 是否为可恢复错误（引擎层据此决定是否重试）
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            LlmError::Network(_) | LlmError::Server { .. } | LlmError::RateLimited { .. }
+        )
+    }
+}
+
 // ───────────────────────────────────────────────
 // 重试策略
 // ───────────────────────────────────────────────

@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::provider::{
     ChatResponse, FinishReason, LLMProvider, LlmError, Message, ProviderCapabilities, ProviderId,
@@ -18,8 +18,10 @@ use crate::tool::{
 };
 use crate::{
     budget::BudgetConfig, ChatHandle, Engine, EngineConfig, EngineReply, EngineStartError,
+    SessionPhase,
 };
 use futures::stream::{self, BoxStream};
+use futures::StreamExt;
 
 // ───────────────────────────────────────────────
 // Mock 提供器
@@ -141,6 +143,7 @@ fn chat_payload(text: &str) -> ChatPayload {
     ChatPayload {
         message: Message::user(text),
         options: ChatOptions::default(),
+        peer_depth: 0,
     }
 }
 
@@ -733,10 +736,8 @@ async fn subagent_depth_limit_enforced() {
     let sid_b = session_id();
     let payload = ChatPayload {
         message: Message::user("go"),
-        options: ChatOptions {
-            peer_depth: 1,
-            ..Default::default()
-        },
+        options: ChatOptions::default(),
+        peer_depth: 1,
     };
     let r1 = wait_with_timeout(engine.chat(sid_b, payload).unwrap()).await;
     assert!(matches!(
@@ -752,10 +753,8 @@ async fn subagent_depth_limit_enforced() {
     let sid_c = session_id();
     let payload = ChatPayload {
         message: Message::user("go"),
-        options: ChatOptions {
-            peer_depth: 2,
-            ..Default::default()
-        },
+        options: ChatOptions::default(),
+        peer_depth: 2,
     };
     let r2 = wait_with_timeout(engine.chat(sid_c, payload).unwrap()).await;
     assert!(matches!(
@@ -768,7 +767,381 @@ async fn subagent_depth_limit_enforced() {
         "depth-limited call must be rejected without a resume round"
     );
     assert!(
-        !provider.requests_tools.lock().last().unwrap().contains("sub"),
+        !provider
+            .requests_tools
+            .lock()
+            .last()
+            .unwrap()
+            .contains("sub"),
         "depth 2 must drop subagent tool declaration"
+    );
+}
+
+// ─────────────────────────────────────────────
+// 会话生命周期 + 空闲回收（3.2 / 4.2）
+// ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn session_lifecycle_remove_list_info() {
+    let engine = Engine::new(Arc::new(PendingProvider), config());
+    let s1 = session_id();
+    let s2 = session_id();
+    engine.chat(s1, chat_payload("a")).unwrap();
+    engine.chat(s2, chat_payload("b")).unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let listed = engine.list_sessions();
+    assert_eq!(listed.len(), 2);
+
+    let info = engine.session_info(s1).expect("session must exist");
+    assert_eq!(info.state, SessionPhase::Thinking);
+    assert_eq!(info.history_len, 1);
+
+    // 移除正在 Thinking 的会话不 panic（DashMap remove 安全）
+    assert!(engine.remove_session(s1));
+    assert!(!engine.remove_session(s1));
+    assert_eq!(engine.session_count(), 1);
+    assert!(engine.session_info(s1).is_none());
+    assert!(engine.session_info(s2).is_some());
+
+    engine.interrupt(s2);
+}
+
+#[tokio::test]
+async fn idle_reaper_removes_stale_sessions() {
+    let mut cfg = config();
+    cfg.session.idle_timeout = Some(Duration::from_millis(100));
+    let engine = Engine::new(
+        mock(vec![Ok(resp("ok", vec![])), Ok(resp("ok", vec![]))]),
+        cfg,
+    );
+    let s1 = session_id();
+    let s2 = session_id();
+    wait_with_timeout(engine.chat(s1, chat_payload("a")).unwrap()).await;
+    wait_with_timeout(engine.chat(s2, chat_payload("b")).unwrap()).await;
+
+    let reaper = engine.start_idle_reaper().expect("reaper must start");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(engine.session_count(), 0, "idle sessions must be reaped");
+    reaper.stop();
+}
+
+#[tokio::test]
+async fn idle_reaper_skips_active_sessions() {
+    let mut cfg = config();
+    cfg.session.idle_timeout = Some(Duration::from_millis(100));
+    let engine = Engine::new(Arc::new(PendingProvider), cfg);
+    let s1 = session_id();
+    let handle = engine.chat(s1, chat_payload("a")).unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let reaper = engine.start_idle_reaper().expect("reaper must start");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert_eq!(engine.session_count(), 1, "Thinking session must survive");
+    reaper.stop();
+    handle.cancel();
+}
+
+#[tokio::test]
+async fn no_idle_timeout_means_no_reaper() {
+    let engine = Engine::new(mock(vec![Ok(resp("ok", vec![]))]), config());
+    assert!(engine.start_idle_reaper().is_none());
+}
+
+// ─────────────────────────────────────────────
+// 流式输出（4.1）
+// ─────────────────────────────────────────────
+
+/// 流式 mock 的共享流类型（Arc<Mutex<Option<...>>> 便于逐次取流）
+type SharedStream =
+    Arc<parking_lot::Mutex<Option<BoxStream<'static, Result<StreamChunk, LlmError>>>>>;
+
+struct StreamMockProvider {
+    stream: SharedStream,
+}
+
+impl StreamMockProvider {
+    fn new(stream: BoxStream<'static, Result<StreamChunk, LlmError>>) -> Self {
+        Self {
+            stream: Arc::new(parking_lot::Mutex::new(Some(stream))),
+        }
+    }
+}
+
+fn caps_streaming() -> &'static ProviderCapabilities {
+    static C: ProviderCapabilities = ProviderCapabilities {
+        parallel_tool_calls: true,
+        system_role: true,
+        streaming: true,
+        usage_reported: true,
+        max_output_tokens: 1024,
+    };
+    &C
+}
+
+#[async_trait::async_trait]
+impl LLMProvider for StreamMockProvider {
+    fn id(&self) -> ProviderId {
+        ProviderId::new("stream-mock")
+    }
+    fn capabilities(&self) -> &ProviderCapabilities {
+        caps_streaming()
+    }
+    async fn chat(&self, _req: crate::provider::ChatRequest) -> Result<ChatResponse, LlmError> {
+        Err(LlmError::BadRequest("use chat_stream".into()))
+    }
+    async fn chat_stream(
+        &self,
+        _req: crate::provider::ChatRequest,
+    ) -> Result<BoxStream<'static, Result<StreamChunk, LlmError>>, LlmError> {
+        self.stream
+            .lock()
+            .take()
+            .ok_or_else(|| LlmError::Protocol("stream consumed".into()))
+    }
+}
+
+fn delta(content: &str) -> StreamChunk {
+    StreamChunk::Delta {
+        content: Some(content.into()),
+        reasoning_content: None,
+        tool_calls: vec![],
+        role: Some(crate::provider::Role::Assistant),
+    }
+}
+
+#[tokio::test]
+async fn streaming_returns_chunks_and_converges() {
+    let chunks = vec![
+        Ok(delta("Hello")),
+        Ok(delta(" world")),
+        Ok(StreamChunk::Finish {
+            finish_reason: FinishReason::Stop,
+            usage: Some(TokenUsage {
+                total_tokens: 8,
+                ..Default::default()
+            }),
+        }),
+    ];
+    let engine = Engine::new(
+        Arc::new(StreamMockProvider::new(Box::pin(stream::iter(chunks)))),
+        config(),
+    );
+    let sid = session_id();
+    let handle = engine.chat_stream(sid, chat_payload("hi")).unwrap();
+    let reply = wait_with_timeout(handle).await;
+
+    let mut stream = match reply {
+        EngineReply::Streaming(s) => s,
+        other => panic!("expected Streaming, got {other:?}"),
+    };
+
+    let mut contents = Vec::new();
+    let mut finished = false;
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(StreamChunk::Delta { content, .. }) => {
+                if let Some(c) = content {
+                    contents.push(c);
+                }
+            }
+            Ok(StreamChunk::Finish { .. }) => finished = true,
+            Err(_) => panic!("unexpected stream error"),
+        }
+    }
+    assert_eq!(contents, vec!["Hello".to_string(), " world".to_string()]);
+    assert!(finished, "stream must end with Finish chunk");
+
+    // 会话收敛与非流式一致：history 含 user + assistant("Hello world")，状态 Idle
+    assert_eq!(engine.history_len(sid), Some(2));
+    assert_eq!(engine.session_consumed_tokens(sid), Some(8));
+    assert_eq!(
+        engine.session_info(sid).map(|s| s.state),
+        Some(SessionPhase::Idle)
+    );
+}
+
+#[tokio::test]
+async fn streaming_interruptible() {
+    // 无限 Delta 流：interrupt 应打断并结束转发流
+    let inf = stream::repeat(Ok(delta("x")));
+    let engine = Engine::new(Arc::new(StreamMockProvider::new(Box::pin(inf))), config());
+    let sid = session_id();
+    let handle = engine.chat_stream(sid, chat_payload("hi")).unwrap();
+    let reply = wait_with_timeout(handle.clone()).await;
+
+    let mut stream = match reply {
+        EngineReply::Streaming(s) => s,
+        other => panic!("expected Streaming, got {other:?}"),
+    };
+
+    // 消费若干 chunk 后中断
+    stream.next().await;
+    stream.next().await;
+    assert!(handle.cancel(), "cancel must be accepted (session busy)");
+
+    // 流应在取消后结束（有界消费，最多读 100 个 chunk 后必结束）
+    let mut count = 0;
+    while stream.next().await.is_some() {
+        count += 1;
+        assert!(count < 100, "stream must terminate after interrupt");
+    }
+}
+
+// ─────────────────────────────────────────────
+// 错误重试（4.3）
+// ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn retry_recovers_from_rate_limited() {
+    let provider = mock(vec![
+        Err(LlmError::RateLimited { retry_after: None }),
+        Err(LlmError::RateLimited { retry_after: None }),
+        Ok(resp("recovered", vec![])),
+    ]);
+    let mut cfg = config();
+    cfg.max_retries = 2;
+    let engine = Engine::new(provider.clone(), cfg);
+    let reply = wait_with_timeout(engine.chat(session_id(), chat_payload("hi")).unwrap()).await;
+    match reply {
+        EngineReply::Success(r) => assert_eq!(r.message.content.as_text().unwrap(), "recovered"),
+        other => panic!("expected Success, got {other:?}"),
+    }
+    assert_eq!(
+        provider.call_count.load(Ordering::SeqCst),
+        3,
+        "two retries then success"
+    );
+}
+
+#[tokio::test]
+async fn max_retries_zero_keeps_old_behavior() {
+    let provider = mock(vec![Err(LlmError::RateLimited { retry_after: None })]);
+    let mut cfg = config();
+    cfg.max_retries = 0;
+    let engine = Engine::new(provider.clone(), cfg);
+    let reply = wait_with_timeout(engine.chat(session_id(), chat_payload("hi")).unwrap()).await;
+    assert!(matches!(reply, EngineReply::Error(_)));
+    assert_eq!(provider.call_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn non_retryable_error_not_retried() {
+    let provider = mock(vec![Err(LlmError::BadRequest("bad".into()))]);
+    let mut cfg = config();
+    cfg.max_retries = 2;
+    let engine = Engine::new(provider.clone(), cfg);
+    let reply = wait_with_timeout(engine.chat(session_id(), chat_payload("hi")).unwrap()).await;
+    assert!(matches!(reply, EngineReply::Error(_)));
+    assert_eq!(
+        provider.call_count.load(Ordering::SeqCst),
+        1,
+        "BadRequest must not retry"
+    );
+}
+
+// ─────────────────────────────────────────────
+// 能力声明驱动降级（5.2）
+// ─────────────────────────────────────────────
+
+struct SerialProvider {
+    responses: Arc<parking_lot::Mutex<VecDeque<Result<ChatResponse, LlmError>>>>,
+}
+
+fn caps_serial() -> &'static ProviderCapabilities {
+    static C: ProviderCapabilities = ProviderCapabilities {
+        parallel_tool_calls: false,
+        system_role: true,
+        streaming: false,
+        usage_reported: true,
+        max_output_tokens: 1024,
+    };
+    &C
+}
+
+#[async_trait::async_trait]
+impl LLMProvider for SerialProvider {
+    fn id(&self) -> ProviderId {
+        ProviderId::new("serial-mock")
+    }
+    fn capabilities(&self) -> &ProviderCapabilities {
+        caps_serial()
+    }
+    async fn chat(&self, _req: crate::provider::ChatRequest) -> Result<ChatResponse, LlmError> {
+        self.responses
+            .lock()
+            .pop_front()
+            .unwrap_or_else(|| Err(LlmError::Protocol("no more responses".into())))
+    }
+    async fn chat_stream(
+        &self,
+        _req: crate::provider::ChatRequest,
+    ) -> Result<BoxStream<'static, Result<StreamChunk, LlmError>>, LlmError> {
+        Ok(Box::pin(stream::empty()))
+    }
+}
+
+#[tokio::test]
+async fn serial_tool_execution_when_parallel_unsupported() {
+    // Remote 慢工具（等待类）：不支持并行工具的 Provider 下应串行执行
+    #[async_trait::async_trait]
+    impl Tool for SlowRemote {
+        fn name(&self) -> &str {
+            "slow_remote"
+        }
+        fn description(&self) -> &str {
+            "slow remote"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn default_wait(&self) -> bool {
+            true
+        }
+        async fn execute(
+            &self,
+            _c: ToolContext,
+            _a: serde_json::Value,
+        ) -> Result<ToolOutput, ToolError> {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok(ToolOutput::text("ok"))
+        }
+    }
+    struct SlowRemote;
+
+    let registry = ToolRegistry::new(RegistryConfig::default());
+    registry.register(Arc::new(SlowRemote)).unwrap();
+    let executor = crate::tool::ToolExecutor::new(ExecutorConfig {
+        max_per_turn: 10,
+        tool_timeout: Duration::from_secs(2),
+        max_concurrency: 5,
+    });
+
+    let provider = Arc::new(SerialProvider {
+        responses: Arc::new(parking_lot::Mutex::new(
+            vec![
+                Ok(resp(
+                    "",
+                    vec![tool_call("slow_remote"), tool_call("slow_remote")],
+                )),
+                Ok(resp("done", vec![])),
+            ]
+            .into(),
+        )),
+    });
+    let engine = Engine::new(provider, config()).with_tools(registry, executor);
+
+    let start = Instant::now();
+    let reply = wait_with_timeout(engine.chat(session_id(), chat_payload("go")).unwrap()).await;
+    let elapsed = start.elapsed();
+    match reply {
+        EngineReply::Success(r) => assert_eq!(r.message.content.as_text().unwrap(), "done"),
+        other => panic!("expected Success, got {other:?}"),
+    }
+    assert!(
+        elapsed >= Duration::from_millis(90),
+        "parallel-unsupported provider must serialize tools, took {elapsed:?}"
     );
 }

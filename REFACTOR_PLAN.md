@@ -1,5 +1,8 @@
 # Referee-AI-Base 重构执行规划
 
+> **状态：✅ 已完成（2026-08-12，提交 `d8da019`）**——三层拆分落地、全量测试与
+> clippy/fmt 通过；本文保留为重构边界与验收口径的历史记录。
+>
 > 目标：将现有 `referee-agent`（业务级 Agent 运行时）重构拆分为两层——
 > **地基层 `referee-ai-base`**（基础 AI 设施，积木式、可拓展、易维护）与
 > **业务层 `referee-agent`**（完整 Agent 业务封装，开箱即用）。
@@ -60,7 +63,8 @@ referee-agent     业务封装：AgentRuntime(Extension) + 对等协作(AgentToo
 
 ### 2.2 referee-agent（业务封装，改造现有 crate）
 - 保留 `AgentRuntime`（`referee-core::Extension` 实现）、消息路由
-  （chat/interrupt/tool_result/resume）、`register_peer_tool`、turn 编排。
+  （chat/interrupt/tool_result/resume）、`register_peer_tool`。
+  （turn 编排已提炼至 base `engine`，`turn.rs` 移除。）
 - 依赖 `referee-ai-base` 作为地基，组装 base 的积木。
 - 对等协作 `AgentTool` 迁移于此（业务：Agent as Tool）。
 - 依赖：`referee-core` + `referee-ai-base` + 业务所需的 crate。

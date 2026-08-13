@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use referee_agent::artifact::{ArtifactStore, InMemoryArtifactStore, StoreError};
+use referee_agent::artifact::{ArtifactStore, InMemoryArtifactStore};
 use referee_agent::tool::AgentTool;
 use referee_agent::AgentRuntime;
 use referee_ai_base::engine::{Engine, EngineConfig};
@@ -127,7 +127,7 @@ impl LLMProvider for PeerMockProvider {
                     m.role == referee_ai_base::Role::User
                         && m.content
                             .as_text()
-                            .map(|t| t.contains("Artifact created"))
+                            .map(|t| t.contains("artifact_id"))
                             .unwrap_or(false)
                 });
                 Ok(mock_response(if injected { "injected" } else { fallback }))
@@ -213,6 +213,7 @@ fn chat_msg(session_id: SessionId, content: &str) -> SessionMessage {
         payload: ChatPayload {
             message: Message::user(content),
             options: ChatOptions::default(),
+            peer_depth: 0,
         },
     }
 }
@@ -301,7 +302,11 @@ async fn resource_pool_deadlock_fixed() {
         Arc::new(PeerMockProvider::new(vec![
             Behavior::Ok(mock_tool_response(
                 "calling agent_b",
-                vec![make_tool_call("tc_peer", "agent_b", r#"{"task":"work","wait":true}"#)],
+                vec![make_tool_call(
+                    "tc_peer",
+                    "agent_b",
+                    r#"{"task":"work","wait":true}"#,
+                )],
             )),
             Behavior::EchoLastToolResult("a_fallback"),
         ])),
@@ -316,7 +321,11 @@ async fn resource_pool_deadlock_fixed() {
         Arc::new(PeerMockProvider::new(vec![
             Behavior::Ok(mock_tool_response(
                 "calling agent_d",
-                vec![make_tool_call("tc_peer", "agent_d", r#"{"task":"work","wait":true}"#)],
+                vec![make_tool_call(
+                    "tc_peer",
+                    "agent_d",
+                    r#"{"task":"work","wait":true}"#,
+                )],
             )),
             Behavior::EchoLastToolResult("c_fallback"),
         ])),
@@ -365,7 +374,11 @@ async fn cyclic_call_rejected() {
         Arc::new(PeerMockProvider::new(vec![
             Behavior::Ok(mock_tool_response(
                 "calling agent_b",
-                vec![make_tool_call("tc_ab", "agent_b", r#"{"task":"ping","wait":true}"#)],
+                vec![make_tool_call(
+                    "tc_ab",
+                    "agent_b",
+                    r#"{"task":"ping","wait":true}"#,
+                )],
             )),
             Behavior::EchoLastToolResult("a_fallback"),
         ])),
@@ -379,7 +392,11 @@ async fn cyclic_call_rejected() {
         Arc::new(PeerMockProvider::new(vec![
             Behavior::Ok(mock_tool_response(
                 "calling agent_a",
-                vec![make_tool_call("tc_ba", "agent_a", r#"{"task":"confirm","wait":true}"#)],
+                vec![make_tool_call(
+                    "tc_ba",
+                    "agent_a",
+                    r#"{"task":"confirm","wait":true}"#,
+                )],
             )),
             Behavior::EchoLastToolResult("b_fallback"),
         ])),
@@ -434,16 +451,15 @@ async fn cyclic_call_rejected() {
 }
 
 // ═══════════════════════════════════════════════
-// 验收 3 — 工件访问控制（端到端）
+// 验收 3 — 成果板端到端（父侧落库 + ID 凭证读取 + 父列自己板）
 // ═══════════════════════════════════════════════
 #[tokio::test]
-async fn artifact_acl_end_to_end() {
+async fn artifact_board_end_to_end() {
     let kernel = Kernel::new();
     let store: Arc<dyn ArtifactStore> = Arc::new(InMemoryArtifactStore::with_defaults());
 
     let sid_a = Uuid::new_v4();
     let sid_b = Uuid::new_v4();
-    let sid_c = Uuid::new_v4();
 
     let long_text = format!("secret-{}", "x".repeat(5000));
     let rid_b = setup_runtime(
@@ -457,7 +473,7 @@ async fn artifact_acl_end_to_end() {
     )
     .await;
 
-    // 以 A 的身份执行 AgentTool（注入 ACL 工件存储；大结果落库 + 授权读者）
+    // 以 A 的身份执行 AgentTool：写入 A 的成果板，owner = B（子），返回结果 ID
     let tool = AgentTool::new("agent_b", "peer", rid_b, sid_b).with_artifact_store(store.clone());
     let ctx = ToolContext {
         tool_call_id: "tc_peer".into(),
@@ -465,7 +481,7 @@ async fn artifact_acl_end_to_end() {
         turn_id: 0,
         kernel: Some(kernel.clone()),
         store: None,
-        wait: false, // 非等待模式：无论大小都落库成果板，仅回传 Artifact ID
+        wait: false,
         peer_depth: 0,
     };
     let out = tool
@@ -473,25 +489,28 @@ async fn artifact_acl_end_to_end() {
         .await
         .expect("peer execute ok");
 
-    let artifact_id = out
-        .content
-        .strip_prefix("Artifact created: ")
-        .expect("large result must be stored as artifact")
+    let parsed: Value = serde_json::from_str(&out.content).expect("artifact id json");
+    let artifact_id = parsed["artifact_id"]
+        .as_str()
+        .expect("artifact_id")
         .to_string();
 
-    // A（被授权读者）可读
+    // 凭证读取：持 ID 即可读正文
     let got = store
-        .get(&artifact_id, sid_a)
+        .get(&artifact_id)
         .await
         .expect("read ok")
         .expect("artifact exists");
-    assert_eq!(got.owner, sid_b, "owner must be the producing agent");
-    // C（未授权）被拒
-    let err = store
-        .get(&artifact_id, sid_c)
-        .await
-        .expect_err("C must be denied");
-    assert!(matches!(err, StoreError::PermissionDenied(_)));
+    assert_eq!(
+        got.owner_session, sid_b,
+        "owner must be the producing (child) agent"
+    );
+    assert_eq!(got.title, "give me the secret");
+
+    // 父 A 列自己的板，看到该条目（按 seq 排序）
+    let items = store.list_by_creator(sid_a).await.unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].id, artifact_id);
 }
 
 // ═══════════════════════════════════════════════
@@ -699,11 +718,19 @@ async fn subagent_nesting_depth_limit_chain() {
         Arc::new(PeerMockProvider::new(vec![
             Behavior::Ok(mock_tool_response(
                 "call c",
-                vec![make_tool_call("tc_c", "agent_c", r#"{"task":"go","wait":true}"#)],
+                vec![make_tool_call(
+                    "tc_c",
+                    "agent_c",
+                    r#"{"task":"go","wait":true}"#,
+                )],
             )),
             Behavior::Ok(mock_tool_response(
                 "call c again",
-                vec![make_tool_call("tc_c2", "agent_c", r#"{"task":"go2","wait":true}"#)],
+                vec![make_tool_call(
+                    "tc_c2",
+                    "agent_c",
+                    r#"{"task":"go2","wait":true}"#,
+                )],
             )),
             Behavior::EchoLastToolResult("b_fallback"),
         ])),
@@ -729,7 +756,11 @@ async fn subagent_nesting_depth_limit_chain() {
         Arc::new(PeerMockProvider::new(vec![
             Behavior::Ok(mock_tool_response(
                 "call b",
-                vec![make_tool_call("tc_b", "agent_b", r#"{"task":"root","wait":true}"#)],
+                vec![make_tool_call(
+                    "tc_b",
+                    "agent_b",
+                    r#"{"task":"root","wait":true}"#,
+                )],
             )),
             Behavior::EchoLastToolResult("a_fallback"),
         ])),

@@ -114,7 +114,11 @@ impl ToolRegistry {
     /// 当会话当前深度 `current_depth >= max_depth` 时，剔除 `depth_limited` 工具
     /// （子 Agent 工具）——LLM 看不到即无法发起更深嵌套调用（声明层防线）。
     /// 未达上限时行为与 [`declarations`](Self::declarations) 一致。
-    pub fn declarations_for_depth(&self, current_depth: u32, max_depth: u32) -> Vec<ToolDeclaration> {
+    pub fn declarations_for_depth(
+        &self,
+        current_depth: u32,
+        max_depth: u32,
+    ) -> Vec<ToolDeclaration> {
         self.tools
             .iter()
             .filter(|r| !(r.value().depth_limited() && current_depth >= max_depth))
@@ -256,8 +260,10 @@ mod tests {
     #[test]
     fn declarations_for_depth_filters_subagent_tools_at_limit() {
         let reg = ToolRegistry::with_defaults();
-        reg.register(Arc::new(DummyTool { name: "plain".into() }))
-            .unwrap();
+        reg.register(Arc::new(DummyTool {
+            name: "plain".into(),
+        }))
+        .unwrap();
         reg.register(Arc::new(DepthLimitedTool { name: "sub".into() }))
             .unwrap();
 

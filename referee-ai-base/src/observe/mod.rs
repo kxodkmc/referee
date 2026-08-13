@@ -39,6 +39,11 @@ pub fn tool_completed(ok: bool) {
         .increment(1);
 }
 
+/// 统计一次引擎层 LLM 重试（可恢复错误触发）
+pub fn llm_retry() {
+    metrics::counter!("referee_base_llm_retry_total").increment(1);
+}
+
 /// 统计一次预算拒绝（kind: session/global）
 pub fn budget_rejected(kind: &'static str) {
     metrics::counter!("referee_base_budget_rejected_total", "scope" => kind).increment(1);

@@ -148,32 +148,42 @@ impl PromptFragment {
     }
 }
 
+/// 提示词组装参数 — 碎片参数统一封装，新增参数不破坏既有调用方
+pub struct PromptParts {
+    /// 系统提示词（最高优先级，最后保留）
+    pub system: Option<Message>,
+    pub tools: Vec<ToolDeclaration>,
+    pub history: Vec<Message>,
+    pub memory: Vec<Message>,
+    pub artifacts: Vec<Message>,
+    pub temperature: Option<f32>,
+    pub max_tokens: Option<usize>,
+    pub thinking: ThinkingConfig,
+    /// 上下文 Token 预算上限（0 = 不截断）
+    pub prompt_budget: usize,
+}
+
 /// 组装并截断 Prompt，生成最终 `ChatRequest`
-///
-/// # 参数
-/// - `system_msg` / `tools` / `history` / `memory` / `artifacts`：待组装片段
-/// - `temperature` / `max_tokens` / `thinking`：请求参数（透传进 ChatRequest，
-///   不因截断而丢失；也是缓存键 params_hash 的输入）
-/// - `prompt_budget`：上下文 Token 预算上限（0 = 不截断）
 ///
 /// 返回的 `ChatRequest` 保证：片段总估算 ≤ `prompt_budget`（System 按字符
 /// 截断兜底，其余按优先级丢弃）。
-#[allow(clippy::too_many_arguments)]
-pub fn build_prompt(
-    system_msg: Option<Message>,
-    tools: Vec<ToolDeclaration>,
-    history: Vec<Message>,
-    memory: Vec<Message>,
-    artifacts: Vec<Message>,
-    temperature: Option<f32>,
-    max_tokens: Option<usize>,
-    thinking: ThinkingConfig,
-    prompt_budget: usize,
-) -> ChatRequest {
+pub fn build_prompt(parts: PromptParts) -> ChatRequest {
+    let PromptParts {
+        system,
+        tools,
+        history,
+        memory,
+        artifacts,
+        temperature,
+        max_tokens,
+        thinking,
+        prompt_budget,
+    } = parts;
+
     // 预算 0 = 不截断
     if prompt_budget == 0 {
         let mut messages = Vec::with_capacity(history.len() + memory.len() + artifacts.len());
-        if let Some(sys) = system_msg {
+        if let Some(sys) = system {
             messages.push(sys);
         }
         messages.extend(history);
@@ -191,7 +201,7 @@ pub fn build_prompt(
 
     // 1. 按优先级组装片段列表：System > Tools > History > Memory > Artifacts
     let mut fragments: Vec<PromptFragment> = Vec::new();
-    if let Some(sys) = system_msg {
+    if let Some(sys) = system {
         fragments.push(PromptFragment::System(sys));
     }
     if !tools.is_empty() {
@@ -247,6 +257,32 @@ pub fn build_prompt(
 mod tests {
     use super::*;
 
+    /// 测试便捷封装：位置参数 → PromptParts（保持既有断言可读）
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        system: Option<Message>,
+        tools: Vec<ToolDeclaration>,
+        history: Vec<Message>,
+        memory: Vec<Message>,
+        artifacts: Vec<Message>,
+        temperature: Option<f32>,
+        max_tokens: Option<usize>,
+        thinking: ThinkingConfig,
+        prompt_budget: usize,
+    ) -> ChatRequest {
+        build_prompt(PromptParts {
+            system,
+            tools,
+            history,
+            memory,
+            artifacts,
+            temperature,
+            max_tokens,
+            thinking,
+            prompt_budget,
+        })
+    }
+
     fn msg(role: Role, text: &str) -> Message {
         Message {
             role,
@@ -267,7 +303,7 @@ mod tests {
     fn truncation_respects_priority_order() {
         // 验收 3 语义：按优先级截断，System/Tools 保留，History/Artifacts 丢弃。
         // 预算 150：System(≈50) + Tools(≈6) 保留后剩余 < 99 → History(≈199)/Artifacts(≈99) 均丢弃
-        let req = build_prompt(
+        let req = build(
             Some(msg(Role::System, &text_of_tokens(50))),
             vec![ToolDeclaration {
                 name: "tool".into(),
@@ -318,7 +354,7 @@ mod tests {
     #[test]
     fn system_truncates_text_not_dropped() {
         // System 超预算：按字符截断，绝不整段丢弃，且截断后估算 ≤ 预算
-        let req = build_prompt(
+        let req = build(
             Some(msg(Role::System, &text_of_tokens(500))),
             vec![],
             vec![],
@@ -341,7 +377,7 @@ mod tests {
     fn system_truncate_cjk_no_panic() {
         // 中文文本截断：字节切片陷阱回归（字符数做字节索引会 panic）
         let system = "系统提示词：" .to_string() + &"这是一个很长的中文系统提示词，用来验证预算不足时的文本截断逻辑不会因为多字节字符而崩溃。".repeat(50);
-        let req = build_prompt(
+        let req = build(
             Some(msg(Role::System, &system)),
             vec![],
             vec![],
@@ -360,7 +396,7 @@ mod tests {
     #[test]
     fn history_sliding_window_keeps_recent() {
         // 每条消息 7 字符 ≈ 5 token；预算 11 只够最近 2 条 → 保留最新、丢最旧
-        let req = build_prompt(
+        let req = build(
             None,
             vec![],
             vec![
@@ -384,7 +420,7 @@ mod tests {
     fn history_window_fixes_leading_role() {
         // 窗口切在中间残留裸 assistant 开头 → 丢弃，修正为首条为 user。
         // 每条 2 字符 ≈ 2 token；预算 6 保留 [a1, q2, a2]（各 2）→ 首条裸 assistant 被丢弃 → [q2, a2]
-        let req = build_prompt(
+        let req = build(
             None,
             vec![],
             vec![
@@ -417,7 +453,7 @@ mod tests {
             },
         }];
         let tool = msg(Role::Tool, "result");
-        let req = build_prompt(
+        let req = build(
             None,
             vec![],
             vec![a.clone(), tool],
@@ -436,7 +472,7 @@ mod tests {
 
     #[test]
     fn budget_zero_means_no_truncation() {
-        let req = build_prompt(
+        let req = build(
             None,
             vec![],
             vec![msg(Role::User, "a"), msg(Role::User, "b")],
@@ -452,7 +488,7 @@ mod tests {
 
     #[test]
     fn params_preserved_through_truncation() {
-        let req = build_prompt(
+        let req = build(
             None,
             vec![],
             vec![msg(Role::User, "hi")],

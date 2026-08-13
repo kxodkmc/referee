@@ -312,7 +312,7 @@ fn inject_tool_result_flushes_on_next_start_round() {
 
     // 下一次模型调用（新回合）构建请求前合并注入
     let round = session
-        .start_round(Message::user("continue"), &ChatOptions::default())
+        .start_round(Message::user("continue"), &ChatOptions::default(), 0)
         .expect("start ok");
     let req = round.request;
     let last = req.messages.last().expect("has messages");
@@ -325,7 +325,7 @@ fn empty_injection_is_ignored() {
     let mut session = Session::new(SessionConfig::default());
     session.inject_tool_result(String::new());
     let round = session
-        .start_round(Message::user("hi"), &ChatOptions::default())
+        .start_round(Message::user("hi"), &ChatOptions::default(), 0)
         .expect("start ok");
     // 仅用户消息，无注入占位
     assert_eq!(round.request.messages.len(), 1);
@@ -348,7 +348,10 @@ fn resume_thinking_flushes_async_injections_after_tool_results() {
     assert_eq!(req.messages.len(), 3);
     assert_eq!(req.messages[1].role, Role::Tool);
     assert_eq!(req.messages[2].role, Role::User);
-    assert_eq!(req.messages[2].content.as_text().unwrap(), "real async result");
+    assert_eq!(
+        req.messages[2].content.as_text().unwrap(),
+        "real async result"
+    );
 }
 
 #[test]
@@ -371,4 +374,44 @@ fn settle_dispatched_converges_pure_dispatch_round() {
 
     // 非 AwaitingCalls 状态重复收敛返回 false
     assert!(!session.settle_dispatched());
+}
+
+// ─────────────────────────────────────────────
+// System Prompt 注入（3.1）
+// ─────────────────────────────────────────────
+
+#[test]
+fn system_prompt_from_options_becomes_first_message() {
+    let mut session = Session::new(SessionConfig::default());
+    session.push_history(Message::user("hello"));
+    let opts = ChatOptions {
+        system_prompt: Some("You are a helpful assistant".into()),
+        ..Default::default()
+    };
+    let req = session.build_chat_request(&opts);
+    assert_eq!(req.messages[0].role, Role::System);
+    assert_eq!(
+        req.messages[0].content.as_text(),
+        Some("You are a helpful assistant")
+    );
+}
+
+#[test]
+fn default_system_prompt_falls_back() {
+    let mut session = Session::new(SessionConfig {
+        default_system_prompt: Some("Default persona".into()),
+        ..Default::default()
+    });
+    session.push_history(Message::user("hello"));
+    let req = session.build_chat_request(&ChatOptions::default());
+    assert_eq!(req.messages[0].role, Role::System);
+    assert_eq!(req.messages[0].content.as_text(), Some("Default persona"));
+}
+
+#[test]
+fn no_system_prompt_keeps_user_first() {
+    let mut session = Session::new(SessionConfig::default());
+    session.push_history(Message::user("hello"));
+    let req = session.build_chat_request(&ChatOptions::default());
+    assert_eq!(req.messages[0].role, Role::User);
 }

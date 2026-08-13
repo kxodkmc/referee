@@ -2,7 +2,7 @@
 
 > 建立在 `referee-ai-base`（地基）之上的**业务层**：把 base 的积木（厂商抽象、
 > 会话引擎、工具执行、预算、缓存）组装为可直接使用的 Agent 运行时，并提供业务能力：
-> Extension 集成、对等协作（Agent as Tool）、带 ACL 的工件存储。
+> Extension 集成、对等协作（Agent as Tool）、带 ACL 的工件存储与成果板读取工具。
 >
 > **分层**：`referee-core`（内核，通信与治理）→ `referee-ai-base`（核心支撑积木）
 > → `referee-agent`（本模块，业务封装，开箱即用）。
@@ -13,7 +13,7 @@
 |----|------|
 | 业务层 | 基于 `referee-ai-base` 组装；base 提供最小闭环积木，本模块提供「如何把它们变成完整、可用、协作的 Agent」 |
 | Extension 集成 | `AgentRuntime` 实现 `referee-core::Extension`，把 base 引擎接入内核消息路由（`Chat` / `Interrupt`） |
-| 业务能力 | 对等/子 Agent 协作（`AgentTool`，Agent as Tool）、ACL 工件存储（`artifact`） |
+| 业务能力 | 对等/子 Agent 协作（`AgentTool`，Agent as Tool）、ACL 工件存储（`artifact`）、成果板读取工具（`list_my_board` / `read_artifact`） |
 | 不预置 | 记忆、MCP、Skills 等业务策略由使用者/二次封装搭建，本模块与 base 均不绑定 |
 
 ### 启用方式
@@ -39,6 +39,8 @@ features（默认 `["xiaomi", "deepseek"]`）通过 `referee-agent` 转发到 `r
 │  referee-agent：AgentRuntime (implements Extension)            │
 │    · handle_chat / handle_interrupt → 转译 base 引擎调用        │
 │    · register_peer_tool / with_artifact_store（业务能力）       │
+│    · register_artifact_tools（list_my_board / read_artifact）   │
+│    · chat_stream / remove_session / list_sessions / session_info│
 ├──────────────────────────────────────────────────────────────┤
 │  referee-ai-base：Engine（会话引擎，最小闭环）                   │
 │    provider │ session │ tool │ store │ budget │ prompt │ cache│
@@ -49,9 +51,10 @@ features（默认 `["xiaomi", "deepseek"]`）通过 `referee-agent` 转发到 `r
 
 | 模块 | 职责 |
 |------|------|
-| [`AgentRuntime`](src/lib.rs) | `Extension` 实现：接收 `Chat` / `Interrupt` 消息，委托 base `Engine` 驱动回合；观测（会话数 / token / 缓存）；`register_peer_tool` |
-| [`tool::AgentTool`](src/tool/agent_tool.rs) | 对等/子 Agent 工具（Agent as Tool）：`Local` 分类不占 IO 槽位，同步 RPC 调用目标会话，大结果 ACL 落库 |
-| [`artifact`](src/artifact/mod.rs) | 带 ACL 的工件存储：owner / 授权读者读取校验，有界（数量 + 字节双上限） |
+| [`AgentRuntime`](src/lib.rs) | `Extension` 实现：接收 `Chat` / `Interrupt` 消息，委托 base `Engine` 驱动回合；观测（会话数 / token / 缓存）；转发会话管理（`remove_session` / `list_sessions` / `session_info`）；`chat_stream` 库级流式；`register_peer_tool` / `register_artifact_tools` |
+| [`tool::AgentTool`](src/tool/agent_tool.rs) | 对等/子 Agent 工具（Agent as Tool）：`Local` 分类不占 IO 槽位，同步 RPC 调用目标会话，大结果 ACL 落库；`peer_depth` 嵌套深度限制 |
+| [`tool::ArtifactReader`](src/tool/artifact_reader.rs) | 成果板读取工具：`list_my_board` 列本会话板内条目、`read_artifact` 按 ID 凭证读取成果正文（读取路径仍经 ArtifactStore ACL 校验） |
+| [`artifact`](src/artifact/mod.rs) | 带 ACL 的工件存储：owner / 授权读者读取校验，有界（数量 + 字节双上限），成果板（`BoardId`）组织 |
 
 ## 4. 快速上手
 
@@ -104,15 +107,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 ## 5. 设计约束（继承 base + 业务）
 
-- base 保证最小闭环的并发正确性（回合内顺序异步、协作取消、无跨 await 持锁、错误显式可见）。
+- base 保证最小闭环的并发正确性（回合内顺序异步、协作取消、无跨 await 持锁、错误显式可见），并提供流式输出与会话生命周期管理。
 - `AgentRuntime.handle` 零阻塞：只做转译 + spawn，回复在派生任务中异步完成。
 - 对等能力信任边界：`kernel` / artifact 句柄仅授予可信注册工具（`register_peer_tool`）。
+- 成果读取工具读取路径仍经 ArtifactStore ACL 强制校验（凭证式 ID 不代表越权）。
 - `referee-core` 零改动。
 
 ## 6. 测试
 
 ```bash
-cargo test -p referee-agent     # 库单测（artifact ACL）+ 集成（peer 对等协作 4 项验收）
+cargo test -p referee-agent     # 库单测（artifact ACL / 成果读取工具）+ 集成（peer 对等协作 6 条验收，含嵌套深度与异步工具回归）
 cargo clippy -p referee-agent --all-targets -- -D warnings
 ```
 

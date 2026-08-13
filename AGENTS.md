@@ -22,16 +22,18 @@
 
 ## 开发路线图
 
-- **Phase 1 — 骨架与背压验证**：Kernel + Router、有界 register、背压压力测试（Never-Consuming 扩展 + 循环 emit 至 ResourceExhausted，验证内存不增长）。
-- **Phase 2 — 原语与上下文**：MessageContext/reply、emit、invoke（correlation_id 关联 + Timeout 超时切断）。
-- **Phase 3 — 容错与隔离**：catch_unwind 熔断、Panic 存活测试、死循环不阻塞 Runtime 的心跳测试。
-- **Phase 4 — 治理闭环**：优先级路由、监督自愈、优雅停机、死信降级。
-- **Phase 5 — 可观测层**：tracing 全链路关联、metrics 核心指标。
-- **Phase 6 — 并发安全**：KernelContext 受限通信、老化防饥饿、状态路由原子合并、WAL 崩溃兜底。
+- **Phase 1 ~ 6（referee-core）**：✅ 全部完成——骨架与背压 → invoke 原语 → 容错与隔离 →
+  治理闭环 → 可观测层 → 并发安全与 WAL。
+- **referee-ai-base（地基积木）**：✅ 已完成——厂商抽象、会话状态机、工具执行（同步/异步
+  派发）、通用 KV、预算、提示词、缓存、可观测、会话引擎（最小闭环 + 流式 + 会话生命周期）。
+- **referee-agent（业务封装）**：✅ 已完成核心——Extension 集成、对等协作（Agent as Tool）、
+  ACL 工件存储、成果板读取工具；记忆 / MCP / Skills 等业务策略不预置（由使用方二次封装）。
 
 ## 工作约束
 
-- 遵循 `referee-core/` 目录结构（kernel / common / extension / tests 分层），职责不越界。
-- 改动后运行对应测试（`tests/backpressure_test.rs`、`tests/isolation_test.rs`）与 `cargo check`。
-- 依赖仅使用规范清单内的库（tokio、dashmap、parking_lot、serde、bytes、thiserror、async-trait、uuid、futures、tracing、metrics、tracing-subscriber[dev]），不擅自引入新依赖。
+- 遵循三层目录结构（`referee-core` 内核 / `referee-ai-base` 地基 / `referee-agent` 业务封装），职责不越界。
+- 改动后运行对应测试（core：`tests/backpressure_test.rs`、`tests/isolation_test.rs`；base/agent：对应模块测试）与 `cargo check`。
+- 依赖仅使用规范清单内的库，不擅自引入新依赖：
+  - `referee-core`：tokio、dashmap、parking_lot、serde、bytes、thiserror、async-trait、uuid、futures、tracing、metrics、tracing-subscriber[dev]
+  - `referee-ai-base` / `referee-agent`：上列 + `serde_json`、`reqwest`（base 专用）
 - 提交前自查：是否引入无界分配？是否破坏 Panic 隔离？是否违反数据/行为分离？

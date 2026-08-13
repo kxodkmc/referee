@@ -15,9 +15,7 @@
 //!   将调用者显式加入 `allowed_readers`，仅回传 Artifact ID（主智能体只收到
 //!   「完成与否」通知，自主决定是否查看原文）；等待模式仅大结果落库。
 
-use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use async_trait::async_trait;
 use referee_ai_base::provider::Message;
@@ -124,10 +122,8 @@ impl Tool for AgentTool {
             session_id: self.target_session_id,
             payload: ChatPayload {
                 message: Message::user(task),
-                options: ChatOptions {
-                    peer_depth: ctx.peer_depth + 1,
-                    ..Default::default()
-                },
+                options: ChatOptions::default(),
+                peer_depth: ctx.peer_depth + 1,
             },
         };
         let resp_env = kernel
@@ -143,24 +139,25 @@ impl Tool for AgentTool {
             SessionReply::Success { message, .. } => {
                 let content = message.content.as_text().unwrap_or("").to_string();
 
-                // 5. 成果落库：非等待（异步派发）时无论大小都落库成果板，仅回传
-                //    Artifact ID（主智能体只收到「完成与否」通知，自主决定是否查看原文）；
-                //    等待模式仅大结果落库（避免截断长文本）。
+                // 5. 成果落库：非等待（异步派发）时无论大小都写入调用者（父）的成果板，
+                //    仅回传结果 ID（父自主决定是否查看正文）；等待模式仅大结果落库。
                 if !ctx.wait || content.len() > LARGE_RESULT_THRESHOLD {
                     if let Some(store) = &self.artifact_store {
-                        let artifact = Artifact {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            // 内容由目标 Agent 产出，归属目标 Session
-                            owner: self.target_session_id,
-                            allowed_readers: HashSet::from([ctx.session_id]),
-                            content_type: "text/plain".into(),
-                            bytes: content.into_bytes(),
-                            created_at: SystemTime::now(),
-                        };
+                        let board = store.ensure_board(ctx.session_id).await.map_err(|e| {
+                            ToolError::Execution(format!("ensure board failed: {e}"))
+                        })?;
+                        let artifact = Artifact::new(
+                            board,
+                            self.target_session_id,
+                            self.name.clone(),
+                            task,
+                            "text/plain",
+                            content.into_bytes(),
+                        );
                         return match store.store(artifact).await {
-                            Ok(artifact_id) => {
-                                Ok(ToolOutput::text(format!("Artifact created: {artifact_id}")))
-                            }
+                            Ok(artifact_id) => Ok(ToolOutput::from_json(
+                                &json!({ "artifact_id": artifact_id }),
+                            )),
                             Err(StoreError::CapacityExceeded) => {
                                 Err(ToolError::Execution("artifact store full".into()))
                             }

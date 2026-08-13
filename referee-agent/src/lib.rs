@@ -16,12 +16,14 @@
 pub mod artifact;
 pub mod tool;
 
-pub use artifact::{Artifact, ArtifactStore, InMemoryArtifactStore, StoreConfig, StoreError};
-pub use tool::AgentTool;
+pub use artifact::{
+    Artifact, ArtifactStore, BoardId, InMemoryArtifactStore, StoreConfig, StoreError,
+};
+pub use tool::{AgentTool, ArtifactReader, ListMyBoard};
 
 use std::sync::Arc;
 
-use referee_ai_base::engine::{Engine, EngineReply};
+use referee_ai_base::engine::{ChatHandle, Engine, EngineReply, EngineStartError, SessionSnapshot};
 use referee_ai_base::session::{ChatPayload, SessionId, SessionMessage, SessionReply};
 use referee_core::extension::{CapabilityId, Extension, KernelContext};
 use referee_core::Envelope;
@@ -82,6 +84,33 @@ impl AgentRuntime {
         self.engine.session_count()
     }
 
+    /// 移除指定会话（转发引擎）
+    pub fn remove_session(&self, session_id: SessionId) -> bool {
+        self.engine.remove_session(session_id)
+    }
+
+    /// 枚举全部会话 ID（转发引擎）
+    pub fn list_sessions(&self) -> Vec<SessionId> {
+        self.engine.list_sessions()
+    }
+
+    /// 查询单个会话的运行快照（转发引擎）
+    pub fn session_info(&self, session_id: SessionId) -> Option<SessionSnapshot> {
+        self.engine.session_info(session_id)
+    }
+
+    /// 流式发起一轮 Chat（库 API，不经 Envelope 协议）
+    ///
+    /// 返回句柄，`wait()` 得到 `EngineReply::Streaming`；调用方消费 chunk 流，
+    /// 引擎内部累积收敛与非流式一致。适合需要边生成边消费的集成方直接调用。
+    pub fn chat_stream(
+        &self,
+        session_id: SessionId,
+        payload: ChatPayload,
+    ) -> Result<ChatHandle, EngineStartError> {
+        self.engine.chat_stream(session_id, payload)
+    }
+
     /// 全局已消耗 Token 数（观测）
     pub fn total_consumed_tokens(&self) -> u64 {
         self.engine.total_consumed_tokens()
@@ -113,6 +142,21 @@ impl AgentRuntime {
             tool = tool.with_artifact_store(store.clone());
         }
         self.engine.register_tool(Arc::new(tool))
+    }
+
+    /// 注册成果板读取工具（`list_my_board` / `read_artifact`）
+    ///
+    /// 需已 `with_artifact_store` 且引擎已 `with_tools`。
+    pub fn register_artifact_tools(&self) -> Result<(), referee_ai_base::tool::RegistryError> {
+        let store = self
+            .artifact_store
+            .clone()
+            .ok_or(referee_ai_base::tool::RegistryError::NotEnabled)?;
+        self.engine
+            .register_tool(Arc::new(ListMyBoard::new(store.clone())))?;
+        self.engine
+            .register_tool(Arc::new(ArtifactReader::new(store)))?;
+        Ok(())
     }
 
     // ── 消息处理 ──────────────────────────────

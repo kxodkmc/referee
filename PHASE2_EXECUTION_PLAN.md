@@ -2,6 +2,11 @@
 
 > 状态：待评审 · 范围：`referee-agent` Phase 2 · 前置：Phase 0 + Phase 1 已完成
 > 核心原则：**零改动 `referee-core`** · **Phase 1 行为向后兼容** · **有界、隔离、可观测**
+>
+> **状态快照（2026-08-12）**：本文为**历史执行方案**。P2 已按此落地（工具抽象 / 有界
+> 注册表 / 并行执行 / 结果回写 / Resume 循环），并随三层重构迁至 `referee-ai-base/tool/`；
+> 同步/异步派发与 `peer_depth` 嵌套限制为落地后的增强（见 PHASE_STATUS.md）。
+> 文中「65 条 Phase 1 测试」为当时口径；「Phase 7 实现 MCP/Skills」已被重构决策移除。
 
 ---
 

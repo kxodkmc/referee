@@ -2,6 +2,13 @@
 
 > 状态：已批准（D1/D2 通过） · 性质：规划文档，非实现
 > 定位：`referee-agent` 作为**可选 SDK 式扩展模块**，独立于内核，不触碰 `referee-core` 任何代码；用户按需求启用，我们提供但不强制。
+>
+> **状态快照（2026-08-12）**：本文为**历史规划**，阶段验收口径仍有效；实际演进以
+> [`REFACTOR_PLAN.md`](REFACTOR_PLAN.md)（三层拆分：地基入 `referee-ai-base`）与
+> [`PHASE_STATUS.md`](PHASE_STATUS.md)（完成状态与偏差记录）为准。
+> P0/P1/P2/P3/预算治理/P5 已按规划落地（大部分迁至 base）；**P4 记忆、P7 MCP/Skills
+> 已按重构决策移除**（业务扩展不预置）；P6 计量与可观测以精简形态落地于 base
+> （`observe` + `budget` + 引擎重试门控）。
 
 ---
 
@@ -81,6 +88,10 @@ memory-persist = []  # 记忆/成果落盘（接 referee-core WalSink 抽象）
 
 ### 3.1 目录结构
 
+> 注：以下为**规划时结构**（provider/session/tool/budget/prompt/cache/observe/engine 均在
+> referee-agent 下）；2026-08-12 三层重构后，地基模块已迁至 `referee-ai-base`，
+> `referee-agent` 仅保留业务封装（AgentRuntime / AgentTool / artifact），见 REFACTOR_PLAN.md。
+
 ```
 referee-agent/
 ├── Cargo.toml                      # 依赖：referee-core + reqwest(D1) + serde_json(D2) + 白名单库
@@ -141,10 +152,10 @@ referee-agent/
 | P2 | 工具调用 | Tool trait + 并行执行 + 结果回写 | P1 | ✅ 完成 |
 | P3 | 子 Agent 与成果 | ArtifactStore + 派发/聚合 + 可见性注入 | P2 | ✅ 完成（路线偏差见 §5.4） |
 | 预算治理 | Token 双层级限额 | Session 级 + 全局共享计数器 | P1/P2 | ✅ 完成（提前落地，见 §5.4.1） |
-| P4 | 记忆模块 | 三层记忆 + 注入策略 + 容量 | P1 | ⏳ 待开发 |
+| P4 | 记忆模块 | 三层记忆 + 注入策略 + 容量 | P1 | ❌ 移除（重构决策，见 REFACTOR_PLAN） |
 | P5 | 提示词与缓存 | PromptBuilder + 预算 + 缓存命中 | P0/P4 | ✅ 完成（缓存/预算部分已落地，见 §5.6） |
-| P6 | 计量与可观测 | Token 用量 + 全链路 tracing + metrics | P0–P5 | ⏳ 待开发 |
-| P7 | MCP 与 Skills | MCP stdio 桥 + Skills 注册 | P2 | ⏳ 待开发 |
+| P6 | 计量与可观测 | Token 用量 + 全链路 tracing + metrics | P0–P5 | ✅ 精简落地（base observe/budget，见 PHASE_STATUS） |
+| P7 | MCP 与 Skills | MCP stdio 桥 + Skills 注册 | P2 | ❌ 移除（重构决策，见 REFACTOR_PLAN） |
 
 **为什么是这个顺序**：
 - P0 是唯一 I/O 边界，先立边界，后续所有模块都只面对统一接口，不写厂商分支。
@@ -297,6 +308,9 @@ pub trait Tool: Send + Sync {
 
 ### 5.5 Phase 4 — 记忆模块
 
+> 状态：❌ **已移除**（2026-08-12 三层重构决策，见 REFACTOR_PLAN.md §2.3）——记忆属
+> 业务策略，由使用者/二次封装基于 base `store` 抽象搭建，不预置在地基层。
+
 **目标**：三层记忆 + 注入策略 + 容量治理。
 
 | 层 | 作用域 | 生命周期 | 存储 |
@@ -353,6 +367,10 @@ pub trait Tool: Send + Sync {
 
 ### 5.7 Phase 6 — Token 计量与可观测
 
+> 状态：✅ **精简落地于 referee-ai-base**（2026-08-12）——`observe`（tracing span +
+> metrics 计数器 + LLM 重试计数）与 `budget`（双层级计量）为地基；验收 1 的计量语义
+> 由 budget_test 覆盖。
+
 **目标**：用量可算、全链路可追、指标可断言。
 
 - `TokenUsage { prompt, completion, total }`：厂商 `usage` 字段优先（`usage_reported=true`），缺失走 `estimate_tokens`（字符/字节近似，零依赖）。
@@ -365,6 +383,9 @@ pub trait Tool: Send + Sync {
 3. metrics 输出可断言（复用 `observability_test.rs` 收集方式）。
 
 ### 5.8 Phase 7 — MCP 与 Skills 适配
+
+> 状态：❌ **已移除**（2026-08-12 三层重构决策，见 REFACTOR_PLAN.md §2.3）——MCP/Skills
+> 属协议桥接集成层，基于 base `Tool` trait 由使用者自接，不预置。
 
 **目标**：外部能力接入；默认零新依赖。
 

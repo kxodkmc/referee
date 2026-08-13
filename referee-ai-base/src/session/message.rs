@@ -67,6 +67,12 @@ pub struct ChatPayload {
     /// 可选参数覆盖（None 时用 Session 默认配置）
     #[serde(default)]
     pub options: ChatOptions,
+    /// 子智能体嵌套深度（0 = 主调用；每经一次子 Agent 工具调用 +1）
+    ///
+    /// 框架内部字段：仅可信注册的工具（如 `AgentTool`）随调用下传，目标会话据此
+    /// 限制更深的嵌套调用。外部调用方默认 0，不得自行声明深度（防绕过上限）。
+    #[serde(default)]
+    pub peer_depth: u32,
 }
 
 /// Chat 可选参数 — 覆盖会话级默认值
@@ -84,13 +90,9 @@ pub struct ChatOptions {
     /// 深度思考配置
     #[serde(default)]
     pub thinking: ThinkingConfig,
-    /// 子智能体嵌套深度（0 = 主调用；每经一次子 Agent 工具调用 +1）
-    ///
-    /// 经 `AgentTool` 透传给目标会话，目标侧据此限制更深的嵌套调用。
-    /// 信任边界：该字段随 Envelope 传输、可被构造方伪造——**仅可信注册的工具**
-    /// （如 `AgentTool`）应设置，不可信调用方不得自行声明深度（防绕过上限）。
+    /// 本轮系统提示词（覆盖会话级默认值；None 时回退到 `SessionConfig.default_system_prompt`）
     #[serde(default)]
-    pub peer_depth: u32,
+    pub system_prompt: Option<String>,
 }
 
 /// 消息编解码错误
@@ -209,6 +211,7 @@ mod tests {
             payload: ChatPayload {
                 message: Message::user("hello"),
                 options: ChatOptions::default(),
+                peer_depth: 0,
             },
         };
         let env = msg.to_envelope();
@@ -224,5 +227,34 @@ mod tests {
         };
         let env = msg.to_envelope();
         assert_eq!(env.priority, PRIORITY_INTERRUPT);
+    }
+
+    #[test]
+    fn chat_payload_peer_depth_roundtrip() {
+        // 框架内部深度字段随 Envelope 传输（AgentTool 下传 +1 后目标侧可读）
+        let msg = SessionMessage::Chat {
+            session_id: Uuid::new_v4(),
+            payload: ChatPayload {
+                message: Message::user("hi"),
+                options: ChatOptions::default(),
+                peer_depth: 2,
+            },
+        };
+        let env = msg.to_envelope();
+        match SessionMessage::from_envelope(&env).unwrap() {
+            SessionMessage::Chat { payload, .. } => assert_eq!(payload.peer_depth, 2),
+            other => panic!("expected Chat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chat_payload_peer_depth_defaults_zero_on_decode() {
+        // 外部构造方不声明深度 → 反序列化缺省 0（不可绕过嵌套限制）
+        let json = r#"{"kind":"chat","session_id":"00000000-0000-0000-0000-000000000000","message":{"role":"user","content":"hi"},"options":{}}"#;
+        let msg: SessionMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            SessionMessage::Chat { payload, .. } => assert_eq!(payload.peer_depth, 0),
+            other => panic!("expected Chat, got {other:?}"),
+        }
     }
 }

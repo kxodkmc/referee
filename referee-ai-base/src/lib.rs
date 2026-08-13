@@ -41,7 +41,10 @@ pub mod store;
 pub mod tool;
 
 // 便捷重导出
-pub use engine::{ChatHandle, Engine, EngineConfig, EngineReply, EngineStartError};
+pub use engine::{
+    ChatHandle, Engine, EngineConfig, EngineReply, EngineStartError, ReaperHandle, SessionPhase,
+    SessionSnapshot,
+};
 pub use provider::{LLMProvider, Message, Role};
 pub use session::{ChatOptions, ChatPayload, SessionId, SessionMessage, SessionReply};
 pub use store::{InMemoryStore, Store, StoreConfig, StoreError, StoredValue};

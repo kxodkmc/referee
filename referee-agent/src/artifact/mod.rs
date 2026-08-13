@@ -1,29 +1,19 @@
-//! 工件存储 — 有界、带 ACL 的成果载体（对等智能体协作的数据底座）
+//! 成果板存储 — 有界、以 ID 为访问凭证的子智能体成果载体
 //!
-//! ## 设计约束
-//! - **数据/行为分离**：`Artifact` 是纯数据载体（id / owner / readers / bytes /
-//!   元数据），不包含任何逻辑句柄；权限判定完全由 `ArtifactStore` 执行。
-//! - **访问控制**：读取者必须为 `owner` 或显式授权的 `allowed_readers` 成员；
-//!   授权操作（`grant_access`）仅 owner 可执行。杜绝「猜中 ID 即越权读取」。
-//! - **有界存储**：数量 + 总字节双上限，超限返回 `CapacityExceeded`，
-//!   绝不无界增长（背压硬约束）。
+//! ## 模型
+//! - **板归属**：每层调用者（父会话）各自建板，作用域隔离、互不影响。
+//! - **写入**：子智能体只写自己被调入板内的条目（`owner_session` 标识归属）。
+//! - **读取**：板创建者可 `list_by_creator` 列自己板内条目；任何持结果 ID 者
+//!   可 `get` 正文（ID = capability，上抛 ID 即完成授权）。
+//! - **排序**：每个条目含板内单调 `seq` 与 `created_at` / `updated_at`，
+//!   `list_by_creator` 按 `seq` 排序供调用者判断产出顺序。
 //!
-//! ## 用法
-//! ```text
-//! store.store(artifact)        → Ok(artifact_id)
-//! store.get(id, requester)     → Ok(Some(..)) / Ok(None) / Err(PermissionDenied)
-//! store.grant_access(id, owner, reader) → Ok(()) / Err(..)
-//! ```
-
-//! ## 信任边界（安全声明）
-//! 写入路径（`store` / `grant_access`）的调用方必须是**可信注册的工具**
-//! （当前唯一写入者为 `AgentTool`，生成新鲜 UUID、owner 固定为产出 Agent）。
-//! store 层不校验 acting principal——一旦引入不可信调用方，须为写入路径
-//! 增加主体验证（拒绝同 id 覆盖 + 校验 owner 声明），本模块的「猜中 ID
-//! 即越权读取」防线仅覆盖读取路径。
+//! ## 信任边界
+//! 写入者当前唯一为可信注册的 `AgentTool`（生成不可预测 UUID、`owner_session`
+//! 固定为其调入的子会话），故 store 层不校验写入主体；引入不可信写入工具前
+//! 需为写入路径增加主体验证。读取路径由 ID 凭证语义天然隔离（不知 ID 即不可读）。
 
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -32,54 +22,85 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// 工件 — 纯数据载体
+/// 成果板标识（UUID，由 store 生成，不可预测）
+pub type BoardId = uuid::Uuid;
+
+/// 工件 — 成果板内的一个条目（纯数据载体）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Artifact {
-    /// 工件 ID（创建方生成，通常为 UUID 字符串）
+    /// 结果 ID（访问凭证：持有即可读正文）
     pub id: String,
-    /// 创建者（拥有全部权限，含授权他人读取）
-    pub owner: uuid::Uuid,
-    /// 显式授权的读者（owner 之外）
-    pub allowed_readers: HashSet<uuid::Uuid>,
+    /// 所属成果板（由调用者创建）
+    pub board: BoardId,
+    /// 写入该条目的子会话实例（强身份归属）
+    pub owner_session: uuid::Uuid,
+    /// 产出智能体类型名（弱标签，展示用）
+    pub producer_label: String,
+    /// 条目标题（任务摘要）
+    pub title: String,
     /// 内容 MIME 类型
     pub content_type: String,
     /// 内容字节
     pub bytes: Vec<u8>,
-    /// 创建时间
+    /// 板内单调序号（顺序线索）
+    pub seq: u64,
+    /// 首次写入时间
     pub created_at: SystemTime,
+    /// 最近更新时间（结果可更新）
+    pub updated_at: SystemTime,
+}
+
+impl Artifact {
+    /// 构造新条目（ID 由框架生成不可预测 UUID；`seq` / 时间戳由 store 归一）
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        board: BoardId,
+        owner_session: uuid::Uuid,
+        producer_label: impl Into<String>,
+        title: impl Into<String>,
+        content_type: impl Into<String>,
+        bytes: Vec<u8>,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            board,
+            owner_session,
+            producer_label: producer_label.into(),
+            title: title.into(),
+            content_type: content_type.into(),
+            bytes,
+            seq: 0,
+            created_at: SystemTime::now(),
+            updated_at: SystemTime::now(),
+        }
+    }
 }
 
 /// 存储错误
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum StoreError {
-    /// 请求者无读取 / 授权权限
-    #[error("permission denied for artifact {0}")]
-    PermissionDenied(String),
-    /// 工件不存在
-    #[error("artifact not found: {0}")]
+    /// 工件或成果板不存在
+    #[error("not found: {0}")]
     NotFound(String),
     /// 存储容量耗尽（数量或总字节超限）
     #[error("capacity exceeded")]
     CapacityExceeded,
 }
 
-/// 工件存储抽象 — 所有读取路径强制鉴权
+/// 成果板存储抽象 — 读取路径以 ID 为凭证
 #[async_trait]
 pub trait ArtifactStore: Send + Sync {
-    /// 存储工件，返回其 ID（与 `artifact.id` 一致）
+    /// 写入条目，返回其 ID（与 `artifact.id` 一致）；`seq` / `updated_at` 由实现归一
     async fn store(&self, artifact: Artifact) -> Result<String, StoreError>;
 
-    /// 鉴权读取：仅 `owner` 或 `allowed_readers` 成员可读。
-    /// 返回 `None` 表示工件不存在；权限不足返回 `PermissionDenied`。
-    async fn get(&self, id: &str, requester: uuid::Uuid) -> Result<Option<Artifact>, StoreError>;
+    /// 按 ID 读取正文（凭证语义，无需 requester）；不存在返回 `Ok(None)`
+    async fn get(&self, id: &str) -> Result<Option<Artifact>, StoreError>;
 
-    /// owner 授权他人读取
-    async fn grant_access(
-        &self,
-        id: &str,
-        owner: uuid::Uuid,
-        reader: uuid::Uuid,
-    ) -> Result<(), StoreError>;
+    /// 列出创建者自己板内的全部条目，按 `seq` 升序
+    async fn list_by_creator(&self, creator: uuid::Uuid) -> Result<Vec<Artifact>, StoreError>;
+
+    /// 获取或创建调用者的成果板（幂等：同一调用者始终同一板）
+    async fn ensure_board(&self, creator: uuid::Uuid) -> Result<BoardId, StoreError>;
 }
 
 /// 存储容量配置（有界硬约束）
@@ -103,10 +124,12 @@ impl Default for StoreConfig {
 /// 存储内部状态
 struct StoreInner {
     artifacts: HashMap<String, Artifact>,
+    boards: HashMap<BoardId, uuid::Uuid>,
+    board_by_creator: HashMap<uuid::Uuid, BoardId>,
     total_bytes: usize,
 }
 
-/// 内存工件存储 — 有界、线程安全
+/// 内存成果板存储 — 有界、线程安全
 #[derive(Clone)]
 pub struct InMemoryArtifactStore {
     inner: Arc<Mutex<StoreInner>>,
@@ -118,6 +141,8 @@ impl InMemoryArtifactStore {
         Self {
             inner: Arc::new(Mutex::new(StoreInner {
                 artifacts: HashMap::new(),
+                boards: HashMap::new(),
+                board_by_creator: HashMap::new(),
                 total_bytes: 0,
             })),
             config,
@@ -154,16 +179,15 @@ impl InMemoryArtifactStore {
 impl ArtifactStore for InMemoryArtifactStore {
     async fn store(&self, artifact: Artifact) -> Result<String, StoreError> {
         let mut inner = self.inner.lock();
-        let size = artifact.bytes.len();
+        if !inner.boards.contains_key(&artifact.board) {
+            return Err(StoreError::NotFound(format!("board {}", artifact.board)));
+        }
 
-        // 有界检查：数量 + 总字节双上限（同 id 覆盖时剔除旧体积后重新判定）
-        let old_size = inner
-            .artifacts
-            .get(&artifact.id)
-            .map(|a| a.bytes.len())
-            .unwrap_or(0);
-        let would_exceed_count = inner.artifacts.len() >= self.config.max_artifacts
-            && !inner.artifacts.contains_key(&artifact.id);
+        let old = inner.artifacts.get(&artifact.id).cloned();
+        let old_size = old.as_ref().map(|a| a.bytes.len()).unwrap_or(0);
+        let size = artifact.bytes.len();
+        let would_exceed_count =
+            inner.artifacts.len() >= self.config.max_artifacts && old.is_none();
         let would_exceed_bytes = inner
             .total_bytes
             .saturating_sub(old_size)
@@ -173,115 +197,166 @@ impl ArtifactStore for InMemoryArtifactStore {
             return Err(StoreError::CapacityExceeded);
         }
 
+        let seq = old
+            .as_ref()
+            .map(|a| a.seq)
+            .unwrap_or_else(|| next_seq(&inner.artifacts, artifact.board));
+        let created_at = old
+            .as_ref()
+            .map(|a| a.created_at)
+            .unwrap_or(artifact.created_at);
+
+        let mut artifact = artifact;
+        artifact.seq = seq;
+        artifact.created_at = created_at;
+        artifact.updated_at = SystemTime::now();
+
         inner.total_bytes = inner.total_bytes - old_size + size;
         let id = artifact.id.clone();
         inner.artifacts.insert(id.clone(), artifact);
         Ok(id)
     }
 
-    async fn get(&self, id: &str, requester: uuid::Uuid) -> Result<Option<Artifact>, StoreError> {
-        let inner = self.inner.lock();
-        let Some(artifact) = inner.artifacts.get(id) else {
-            return Ok(None);
-        };
-        if artifact.owner == requester || artifact.allowed_readers.contains(&requester) {
-            Ok(Some(artifact.clone()))
-        } else {
-            Err(StoreError::PermissionDenied(id.to_string()))
-        }
+    async fn get(&self, id: &str) -> Result<Option<Artifact>, StoreError> {
+        Ok(self.inner.lock().artifacts.get(id).cloned())
     }
 
-    async fn grant_access(
-        &self,
-        id: &str,
-        owner: uuid::Uuid,
-        reader: uuid::Uuid,
-    ) -> Result<(), StoreError> {
-        let mut inner = self.inner.lock();
-        let Some(artifact) = inner.artifacts.get_mut(id) else {
-            return Err(StoreError::NotFound(id.to_string()));
+    async fn list_by_creator(&self, creator: uuid::Uuid) -> Result<Vec<Artifact>, StoreError> {
+        let inner = self.inner.lock();
+        let Some(board) = inner.board_by_creator.get(&creator).copied() else {
+            return Ok(Vec::new());
         };
-        if artifact.owner != owner {
-            return Err(StoreError::PermissionDenied(id.to_string()));
-        }
-        artifact.allowed_readers.insert(reader);
-        Ok(())
+        let mut items: Vec<Artifact> = inner
+            .artifacts
+            .values()
+            .filter(|a| a.board == board)
+            .cloned()
+            .collect();
+        items.sort_by_key(|a| a.seq);
+        Ok(items)
     }
+
+    async fn ensure_board(&self, creator: uuid::Uuid) -> Result<BoardId, StoreError> {
+        let mut inner = self.inner.lock();
+        if let Some(board) = inner.board_by_creator.get(&creator) {
+            return Ok(*board);
+        }
+        let board = uuid::Uuid::new_v4();
+        inner.boards.insert(board, creator);
+        inner.board_by_creator.insert(creator, board);
+        Ok(board)
+    }
+}
+
+/// 板内下一个 seq（现有最大 seq + 1）
+fn next_seq(artifacts: &HashMap<String, Artifact>, board: BoardId) -> u64 {
+    artifacts
+        .values()
+        .filter(|a| a.board == board)
+        .map(|a| a.seq)
+        .max()
+        .unwrap_or(0)
+        + 1
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn make_artifact(id: &str, owner: uuid::Uuid, bytes: usize) -> Artifact {
-        Artifact {
-            id: id.to_string(),
+    fn make_artifact(board: BoardId, owner: uuid::Uuid, bytes: usize) -> Artifact {
+        Artifact::new(
+            board,
             owner,
-            allowed_readers: HashSet::new(),
-            content_type: "text/plain".into(),
-            bytes: vec![0u8; bytes],
-            created_at: SystemTime::now(),
-        }
+            "producer",
+            "title",
+            "text/plain",
+            vec![0u8; bytes],
+        )
     }
 
     #[tokio::test]
-    async fn owner_can_read() {
+    async fn store_and_get_by_id_credential() {
         let store = InMemoryArtifactStore::with_defaults();
         let owner = uuid::Uuid::new_v4();
-        store.store(make_artifact("a1", owner, 4)).await.unwrap();
-        let got = store.get("a1", owner).await.unwrap().unwrap();
-        assert_eq!(got.owner, owner);
+        let board = store.ensure_board(owner).await.unwrap();
+        let id = store.store(make_artifact(board, owner, 4)).await.unwrap();
+        let got = store.get(&id).await.unwrap().expect("must exist");
+        assert_eq!(got.owner_session, owner);
+        assert_eq!(got.bytes, vec![0u8; 4]);
     }
 
     #[tokio::test]
-    async fn authorized_reader_can_read() {
+    async fn list_by_creator_returns_only_own_board_sorted_by_seq() {
         let store = InMemoryArtifactStore::with_defaults();
-        let owner = uuid::Uuid::new_v4();
-        let reader = uuid::Uuid::new_v4();
-        let mut artifact = make_artifact("a1", owner, 4);
-        artifact.allowed_readers.insert(reader);
-        store.store(artifact).await.unwrap();
-        assert!(store.get("a1", reader).await.unwrap().is_some());
+        let parent_a = uuid::Uuid::new_v4();
+        let parent_b = uuid::Uuid::new_v4();
+        let child = uuid::Uuid::new_v4();
+
+        let board_a = store.ensure_board(parent_a).await.unwrap();
+        let board_b = store.ensure_board(parent_b).await.unwrap();
+
+        store.store(make_artifact(board_a, child, 2)).await.unwrap();
+        store.store(make_artifact(board_a, child, 3)).await.unwrap();
+        store.store(make_artifact(board_b, child, 1)).await.unwrap();
+
+        let items_a = store.list_by_creator(parent_a).await.unwrap();
+        assert_eq!(items_a.len(), 2);
+        assert_eq!(items_a[0].seq, 1);
+        assert_eq!(items_a[1].seq, 2);
+
+        let items_b = store.list_by_creator(parent_b).await.unwrap();
+        assert_eq!(items_b.len(), 1);
+        assert_eq!(items_b[0].board, board_b);
     }
 
     #[tokio::test]
-    async fn unauthorized_reader_denied() {
+    async fn ensure_board_is_idempotent() {
         let store = InMemoryArtifactStore::with_defaults();
-        let owner = uuid::Uuid::new_v4();
-        let stranger = uuid::Uuid::new_v4();
-        store.store(make_artifact("s", owner, 4)).await.unwrap();
-        let err = store.get("s", stranger).await.unwrap_err();
-        assert!(matches!(err, StoreError::PermissionDenied(_)));
+        let creator = uuid::Uuid::new_v4();
+        let b1 = store.ensure_board(creator).await.unwrap();
+        let b2 = store.ensure_board(creator).await.unwrap();
+        assert_eq!(b1, b2);
     }
 
     #[tokio::test]
-    async fn grant_access_allows_reader() {
+    async fn store_requires_existing_board() {
         let store = InMemoryArtifactStore::with_defaults();
-        let owner = uuid::Uuid::new_v4();
-        let reader = uuid::Uuid::new_v4();
-        store.store(make_artifact("s", owner, 4)).await.unwrap();
-        store.grant_access("s", owner, reader).await.unwrap();
-        assert!(store.get("s", reader).await.unwrap().is_some());
+        let err = store
+            .store(make_artifact(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), 1))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotFound(_)));
     }
 
     #[tokio::test]
-    async fn non_owner_cannot_grant() {
+    async fn update_preserves_seq_and_created_at() {
         let store = InMemoryArtifactStore::with_defaults();
         let owner = uuid::Uuid::new_v4();
-        let attacker = uuid::Uuid::new_v4();
-        let reader = uuid::Uuid::new_v4();
-        store.store(make_artifact("s", owner, 4)).await.unwrap();
-        let err = store.grant_access("s", attacker, reader).await.unwrap_err();
-        assert!(matches!(err, StoreError::PermissionDenied(_)));
+        let board = store.ensure_board(owner).await.unwrap();
+        let first = make_artifact(board, owner, 4);
+        let first_created = first.created_at;
+        let id = store.store(first.clone()).await.unwrap();
+
+        let mut updated = first;
+        updated.id = id.clone();
+        updated.bytes = vec![1u8; 8];
+        store.store(updated).await.unwrap();
+
+        let got = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(got.seq, 1, "update must keep seq");
+        assert_eq!(got.created_at, first_created, "update must keep created_at");
+        assert_eq!(got.bytes.len(), 8, "update must replace bytes");
     }
 
     #[tokio::test]
     async fn missing_artifact_is_none() {
         let store = InMemoryArtifactStore::with_defaults();
-        let who = uuid::Uuid::new_v4();
-        assert!(store.get("nope", who).await.unwrap().is_none());
-        let err = store.grant_access("nope", who, who).await.unwrap_err();
-        assert!(matches!(err, StoreError::NotFound(_)));
+        assert!(store.get("nope").await.unwrap().is_none());
+        assert!(store
+            .list_by_creator(uuid::Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -291,13 +366,13 @@ mod tests {
             max_total_bytes: 1024 * 1024,
         });
         let owner = uuid::Uuid::new_v4();
-        store.store(make_artifact("a", owner, 4)).await.unwrap();
-        let err = store.store(make_artifact("b", owner, 4)).await.unwrap_err();
+        let board = store.ensure_board(owner).await.unwrap();
+        store.store(make_artifact(board, owner, 4)).await.unwrap();
+        let err = store
+            .store(make_artifact(board, owner, 4))
+            .await
+            .unwrap_err();
         assert!(matches!(err, StoreError::CapacityExceeded));
-        // 同 id 覆盖不受数量限制
-        store.store(make_artifact("a", owner, 8)).await.unwrap();
-        assert_eq!(store.len(), 1);
-        assert_eq!(store.total_bytes(), 8);
     }
 
     #[tokio::test]
@@ -307,9 +382,13 @@ mod tests {
             max_total_bytes: 10,
         });
         let owner = uuid::Uuid::new_v4();
-        store.store(make_artifact("a", owner, 6)).await.unwrap();
-        store.store(make_artifact("b", owner, 4)).await.unwrap();
-        let err = store.store(make_artifact("c", owner, 1)).await.unwrap_err();
+        let board = store.ensure_board(owner).await.unwrap();
+        store.store(make_artifact(board, owner, 6)).await.unwrap();
+        store.store(make_artifact(board, owner, 4)).await.unwrap();
+        let err = store
+            .store(make_artifact(board, owner, 1))
+            .await
+            .unwrap_err();
         assert!(matches!(err, StoreError::CapacityExceeded));
     }
 }

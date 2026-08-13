@@ -52,6 +52,7 @@ pub use timeout::TimeoutConfig;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
 use tracing::{info, warn};
@@ -126,6 +127,10 @@ pub struct SessionConfig {
     pub default_max_tokens: Option<usize>,
     /// 【P5 提示词】上下文 Token 预算上限（0 = 不截断，超限按优先级截断）
     pub prompt_budget_tokens: usize,
+    /// 会话级默认系统提示词（Agent 角色设定 / 工具使用指导；ChatOptions 未指定时生效）
+    pub default_system_prompt: Option<String>,
+    /// 会话空闲超时（None = 永不超时，默认）。超时后由空闲回收任务移除 Idle 会话。
+    pub idle_timeout: Option<Duration>,
 }
 
 impl Default for SessionConfig {
@@ -136,6 +141,8 @@ impl Default for SessionConfig {
             default_temperature: None,
             default_max_tokens: None,
             prompt_budget_tokens: 8000,
+            default_system_prompt: None,
+            idle_timeout: None,
         }
     }
 }
@@ -182,6 +189,9 @@ pub struct Session {
     /// 请求时作为 user 消息合并注入 history。绝不为此主动触发 LLM 调用。
     /// 有界：超限丢弃最旧（背压硬约束，防结果堆积无界增长）。
     pending_injections: VecDeque<String>,
+    /// 最近一次活动时间（`start_round` 与 `inject_tool_result` 时刷新），
+    /// 供空闲回收任务判定 Idle 会话是否超时（4.2）。
+    last_active: Instant,
 }
 
 /// 异步工具结果注入队列容量上限（超限丢最旧 + 告警）
@@ -214,6 +224,7 @@ impl Session {
             consumed_tokens: 0,
             pending_injections: VecDeque::new(),
             peer_depth: 0,
+            last_active: Instant::now(),
         }
     }
 
@@ -240,6 +251,16 @@ impl Session {
     /// 本会话已消耗 Token 数（预算治理计量）
     pub fn consumed_tokens(&self) -> u64 {
         self.consumed_tokens
+    }
+
+    /// 最近一次活动时间（空闲回收判定用）
+    pub fn last_active(&self) -> Instant {
+        self.last_active
+    }
+
+    /// 是否处于 Idle（无进行中回合）
+    pub fn is_idle(&self) -> bool {
+        !self.is_busy()
     }
 
     // ─────────────────────────────────────────────
@@ -288,12 +309,18 @@ impl Session {
     /// 立即返回 `None`，**不会污染 history、不会错乱取消标志**。
     ///
     /// 同时重置回合级中断标志（标志随新回合清零）。
-    pub fn start_round(&mut self, message: Message, options: &ChatOptions) -> Option<RoundStart> {
+    pub fn start_round(
+        &mut self,
+        message: Message,
+        options: &ChatOptions,
+        peer_depth: u32,
+    ) -> Option<RoundStart> {
         if self.is_busy() {
             return None;
         }
         // 新回合：清零上一回合遗留的中断标志
         self.interrupt.store(false, Ordering::Relaxed);
+        self.last_active = Instant::now();
         self.turn_id += 1;
         let turn_id = self.turn_id;
         let (cancel_tx, cancel_rx) = oneshot::channel();
@@ -303,8 +330,8 @@ impl Session {
         };
         self.push_history(message);
         self.last_chat_options = options.clone();
-        // 记录本轮子智能体嵌套深度（回合内 resume 保持不变）
-        self.peer_depth = options.peer_depth;
+        // 记录本轮子智能体嵌套深度（框架内部字段，回合内 resume 保持不变）
+        self.peer_depth = peer_depth;
         // 合并注入：新回合构建请求前，把已完成的不等待工具结果追加为 user 消息
         self.flush_injections();
         let request = self.build_chat_request(options);
@@ -437,6 +464,7 @@ impl Session {
         if content.is_empty() {
             return;
         }
+        self.last_active = Instant::now();
         if self.pending_injections.len() >= MAX_PENDING_INJECTIONS {
             warn!(
                 "async tool result queue full, dropping oldest ({} pending)",
@@ -566,17 +594,22 @@ impl Session {
         let history: Vec<Message> = self.history.iter().cloned().collect();
         let temperature = options.temperature.or(self.config.default_temperature);
         let max_tokens = options.max_tokens.or(self.config.default_max_tokens);
-        crate::prompt::build_prompt(
-            None, // system：预留注入点（由业务层/调用方提供）
-            options.tools.clone(),
+        let system = options
+            .system_prompt
+            .clone()
+            .or_else(|| self.config.default_system_prompt.clone())
+            .map(Message::system);
+        crate::prompt::build_prompt(crate::prompt::PromptParts {
+            system,
+            tools: options.tools.clone(),
             history,
-            Vec::new(), // 记忆片段：预留扩展点（业务层可注入）
-            Vec::new(), // 工件片段：预留扩展点（业务层可注入）
+            memory: Vec::new(),
+            artifacts: Vec::new(),
             temperature,
             max_tokens,
-            options.thinking,
-            self.config.prompt_budget_tokens,
-        )
+            thinking: options.thinking,
+            prompt_budget: self.config.prompt_budget_tokens,
+        })
     }
 
     /// 保存 ChatOptions（供 resume 使用）

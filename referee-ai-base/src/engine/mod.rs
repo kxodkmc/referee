@@ -21,8 +21,10 @@
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use dashmap::DashMap;
+use futures::stream::BoxStream;
 use futures::FutureExt;
 use tokio::sync::oneshot;
 use tracing::Instrument;
@@ -30,12 +32,17 @@ use tracing::Instrument;
 use crate::budget::{add_tokens, tokens_from_response, BudgetConfig, BudgetError};
 use crate::cache::{CacheConfig, InMemoryCache};
 use crate::observe;
-use crate::provider::{ChatResponse, LLMProvider};
+use crate::provider::{ChatResponse, LLMProvider, LlmError, StreamChunk};
 use crate::session::{
     ChatPayload, FinishAction, RoundStart, Session, SessionConfig, SessionId, SessionReply,
     TurnOutcome,
 };
 use crate::tool::{ExecutedTool, ToolExecutor, ToolRegistry};
+
+pub mod session_mgmt;
+pub mod stream;
+
+pub use session_mgmt::{ReaperHandle, SessionPhase, SessionSnapshot};
 
 /// 引擎配置
 #[derive(Debug, Clone)]
@@ -53,6 +60,8 @@ pub struct EngineConfig {
     /// 例：`max_subagent_depth = 2` 允许 主A → 子B → 附属C（C 深度 2 达上限，
     /// 不能再调更深的子 Agent），B（深度 1）仍可调用。
     pub max_subagent_depth: u32,
+    /// 引擎层重试次数（可恢复错误 Network/Server/RateLimited 触发，默认 1）
+    pub max_retries: u32,
 }
 
 impl Default for EngineConfig {
@@ -63,15 +72,17 @@ impl Default for EngineConfig {
             cache: CacheConfig::default(),
             max_sessions: 100,
             max_subagent_depth: 2,
+            max_retries: 1,
         }
     }
 }
 
 /// 引擎回信 — `chat` 的执行产物
-#[derive(Debug, Clone)]
 pub enum EngineReply {
     /// 正常完成（含缓存命中；缓存命中不计量 Token）
     Success(Box<ChatResponse>),
+    /// 流式输出：调用方消费 chunk 流（含累积 Delta 与最终 Finish）
+    Streaming(BoxStream<'static, Result<StreamChunk, LlmError>>),
     /// 会话忙碌：已有回合进行中，拒绝并发 Chat
     Busy { turn_id: u64 },
     /// 会话不存在 / 预算超限 / 回合异常
@@ -80,6 +91,21 @@ pub enum EngineReply {
     Cancelled,
     /// 回合超时未完成
     Timeout,
+}
+
+impl std::fmt::Debug for EngineReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EngineReply::Success(r) => f.debug_tuple("Success").field(r).finish(),
+            EngineReply::Streaming(_) => f.write_str("Streaming(..)"),
+            EngineReply::Busy { turn_id } => {
+                f.debug_struct("Busy").field("turn_id", turn_id).finish()
+            }
+            EngineReply::Error(msg) => f.debug_tuple("Error").field(msg).finish(),
+            EngineReply::Cancelled => f.write_str("Cancelled"),
+            EngineReply::Timeout => f.write_str("Timeout"),
+        }
+    }
 }
 
 /// 发起 Chat 的启动阶段错误（同步、可立即返回的错误）
@@ -128,12 +154,12 @@ impl ChatHandle {
 /// 所有字段为 `Arc`，`Clone` 后可在多 task 间共享、注册应使用同一实例。
 #[derive(Clone)]
 pub struct Engine {
-    sessions: Arc<DashMap<SessionId, Session>>,
-    provider: Arc<dyn LLMProvider>,
-    config: EngineConfig,
+    pub(crate) sessions: Arc<DashMap<SessionId, Session>>,
+    pub(crate) provider: Arc<dyn LLMProvider>,
+    pub(crate) config: EngineConfig,
     tools: Option<ToolRegistry>,
     tool_executor: Option<ToolExecutor>,
-    total_consumed_tokens: Arc<AtomicU64>,
+    pub(crate) total_consumed_tokens: Arc<AtomicU64>,
     cache: Option<Arc<InMemoryCache>>,
 }
 
@@ -222,6 +248,33 @@ impl Engine {
         self.cache.as_ref().map(|c| c.len()).unwrap_or(0)
     }
 
+    // ── 会话生命周期（转发至 session_mgmt）────────────────
+
+    /// 移除指定会话，返回是否确有会话被移除
+    pub fn remove_session(&self, session_id: SessionId) -> bool {
+        session_mgmt::remove_session(&self.sessions, session_id)
+    }
+
+    /// 枚举全部会话 ID
+    pub fn list_sessions(&self) -> Vec<SessionId> {
+        session_mgmt::list_sessions(&self.sessions)
+    }
+
+    /// 查询单个会话的运行快照（不存在返回 None）
+    pub fn session_info(&self, session_id: SessionId) -> Option<SessionSnapshot> {
+        self.sessions
+            .get(&session_id)
+            .map(|s| session_mgmt::snapshot(&s))
+    }
+
+    /// 启动空闲回收任务；`idle_timeout` 未配置（None）时返回 None
+    pub fn start_idle_reaper(&self) -> Option<ReaperHandle> {
+        self.config
+            .session
+            .idle_timeout
+            .map(|t| session_mgmt::start_idle_reaper(self.sessions.clone(), t))
+    }
+
     // ── 主入口 ────────────────────────────────
 
     /// 发起一轮 Chat，返回句柄（快速返回，实际执行在派生任务中）
@@ -235,37 +288,8 @@ impl Engine {
         session_id: SessionId,
         payload: ChatPayload,
     ) -> Result<ChatHandle, EngineStartError> {
-        // 0. 原子创建会话（DashMap entry，避免 max_sessions 竞态）
-        if !self.ensure_session(session_id) {
-            return Err(EngineStartError::MaxSessions);
-        }
+        let round = self.prepare_round(session_id, payload)?;
 
-        // 1. 预算守门：会话级 + 全局级（软限制，check-then-act）
-        if let Err(e) = self.check_budget(&session_id) {
-            return Err(EngineStartError::Budget(e));
-        }
-
-        // 2. 注入工具声明（若本轮未显式指定）；按嵌套深度过滤子 Agent 工具
-        let mut options = payload.options;
-        if let Some(registry) = &self.tools {
-            if options.tools.is_empty() {
-                options.tools = registry.declarations_for_depth(
-                    options.peer_depth,
-                    self.config.max_subagent_depth,
-                );
-            }
-        }
-
-        // 3. 原子启动回合：busy 检查 + turn_id + 取消通道 + history + request
-        //    在 Session 单一 guard 内完成，并发 Chat 在此被 `Busy` 拒绝，
-        //    且不会留下半写状态。
-        let round = self
-            .sessions
-            .get_mut(&session_id)
-            .and_then(|mut s| s.start_round(payload.message, &options))
-            .ok_or(EngineStartError::Busy)?;
-
-        // 4. spawn 回合执行
         let engine = self.clone();
         let (reply_tx, reply_rx) = oneshot::channel();
         tokio::spawn(async move {
@@ -278,6 +302,60 @@ impl Engine {
             session_id,
             rx: Arc::new(tokio::sync::Mutex::new(Some(reply_rx))),
         })
+    }
+
+    /// 流式发起一轮 Chat：返回句柄，`wait()` 得到 [`EngineReply::Streaming`]
+    ///
+    /// 同步段与 [`chat`](Self::chat) 完全一致；执行段改用流式，chunk 逐条透传，
+    /// 引擎内部累积收敛为 `ChatResponse` 后走与非流式相同的 `finish_thinking` 路径。
+    pub fn chat_stream(
+        &self,
+        session_id: SessionId,
+        payload: ChatPayload,
+    ) -> Result<ChatHandle, EngineStartError> {
+        let round = self.prepare_round(session_id, payload)?;
+
+        let engine = self.clone();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let reply = engine.run_stream(&session_id, round).await;
+            let _ = reply_tx.send(reply);
+        });
+
+        Ok(ChatHandle {
+            engine: self.clone(),
+            session_id,
+            rx: Arc::new(tokio::sync::Mutex::new(Some(reply_rx))),
+        })
+    }
+
+    /// 同步段：会话创建 / 预算守门 / 工具声明注入 / 原子启动回合
+    ///
+    /// 不进行任何 await；并发第二个 `chat`（同 session）在 `start_round` 的单一
+    /// guard 内被 `Busy` 拒绝，不污染 history 或错乱取消标志。
+    fn prepare_round(
+        &self,
+        session_id: SessionId,
+        payload: ChatPayload,
+    ) -> Result<RoundStart, EngineStartError> {
+        if !self.ensure_session(session_id) {
+            return Err(EngineStartError::MaxSessions);
+        }
+        if let Err(e) = self.check_budget(&session_id) {
+            return Err(EngineStartError::Budget(e));
+        }
+        let mut options = payload.options;
+        let peer_depth = payload.peer_depth;
+        if let Some(registry) = &self.tools {
+            if options.tools.is_empty() {
+                options.tools =
+                    registry.declarations_for_depth(peer_depth, self.config.max_subagent_depth);
+            }
+        }
+        self.sessions
+            .get_mut(&session_id)
+            .and_then(|mut s| s.start_round(payload.message, &options, peer_depth))
+            .ok_or(EngineStartError::Busy)
     }
 
     /// 中断一个会话的当前回合（幂等）
@@ -371,7 +449,7 @@ impl Engine {
 
         loop {
             let cur = std::mem::replace(&mut src, RoundSource::Resume);
-            let (turn_id, cancel_rx, request) = match cur {
+            let (turn_id, mut cancel_rx, request) = match cur {
                 RoundSource::First(f) => (f.turn_id, f.cancel_rx, f.request),
                 RoundSource::Resume => {
                     match self
@@ -406,27 +484,12 @@ impl Engine {
                 });
             observe::cache_access(cached.is_some());
 
-            // 执行 LLM（命中缓存则跳过）；三路 select（LLM / 取消 / 超时）+ catch_unwind
+            // 执行 LLM（命中缓存则跳过）；引擎层重试 + 三路 select + catch_unwind
             let outcome = if let Some(resp) = cached {
                 TurnOutcome::Cached(Box::new(resp))
             } else {
-                let fut = self.provider.chat(request);
-                let result = AssertUnwindSafe(async {
-                    tokio::select! {
-                        res = fut => match res {
-                            Ok(r) => TurnOutcome::Success(Box::new(r)),
-                            Err(e) => TurnOutcome::Error(e),
-                        },
-                        _ = cancel_rx => TurnOutcome::Cancelled,
-                        _ = tokio::time::sleep(timeout) => TurnOutcome::Timeout,
-                    }
-                })
-                .catch_unwind()
-                .await;
-                match result {
-                    Ok(o) => o,
-                    Err(payload) => TurnOutcome::Panic(panic_message(payload)),
-                }
+                self.llm_call_with_retry(session_id, request, &mut cancel_rx, timeout)
+                    .await
             };
 
             // 缓存写入：真实调用成功且无工具调用才可缓存
@@ -496,8 +559,65 @@ impl Engine {
         }
     }
 
+    /// 引擎层 LLM 调用 + 可恢复错误重试
+    ///
+    /// `Cancelled` / `Timeout` / `Panic` 与不可恢复错误不重试；每次重试前检查
+    /// 中断，每次重试发 `tracing::warn!` + metrics 计数。
+    async fn llm_call_with_retry(
+        &self,
+        session_id: &SessionId,
+        request: crate::provider::ChatRequest,
+        cancel_rx: &mut oneshot::Receiver<()>,
+        timeout: Duration,
+    ) -> TurnOutcome {
+        let max_retries = self.config.max_retries;
+        let mut attempt = 0u32;
+        loop {
+            if self.is_interrupted(session_id) {
+                return TurnOutcome::Cancelled;
+            }
+            let outcome = self
+                .single_llm_call(request.clone(), cancel_rx, timeout)
+                .await;
+            match outcome {
+                TurnOutcome::Error(e) if e.is_retryable() && attempt < max_retries => {
+                    attempt += 1;
+                    tracing::warn!(error = %e, attempt, "llm call failed, retrying");
+                    observe::llm_retry();
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// 单次 LLM 调用：三路 select（LLM / 取消 / 超时）+ catch_unwind
+    async fn single_llm_call(
+        &self,
+        request: crate::provider::ChatRequest,
+        cancel_rx: &mut oneshot::Receiver<()>,
+        timeout: Duration,
+    ) -> TurnOutcome {
+        let fut = self.provider.chat(request);
+        let result = AssertUnwindSafe(async {
+            tokio::select! {
+                res = fut => match res {
+                    Ok(r) => TurnOutcome::Success(Box::new(r)),
+                    Err(e) => TurnOutcome::Error(e),
+                },
+                _ = &mut *cancel_rx => TurnOutcome::Cancelled,
+                _ = tokio::time::sleep(timeout) => TurnOutcome::Timeout,
+            }
+        })
+        .catch_unwind()
+        .await;
+        match result {
+            Ok(outcome) => outcome,
+            Err(payload) => TurnOutcome::Panic(panic_message(payload)),
+        }
+    }
+
     /// 会话是否收到回合级中断
-    fn is_interrupted(&self, session_id: &SessionId) -> bool {
+    pub(crate) fn is_interrupted(&self, session_id: &SessionId) -> bool {
         self.sessions
             .get(session_id)
             .map(|s| s.is_interrupted())
@@ -509,7 +629,7 @@ impl Engine {
     /// - 派发类（不等待）：占位结果立即收敛（保证 assistant tool_calls 与 tool 结果
     ///   配对），后台任务执行完成后结果入队，等待下一次模型调用/回合合并注入
     /// - 等待类：同步执行（并行 + 隔离 + 超时），完成后收敛结果
-    async fn run_tool_calls(
+    pub(crate) async fn run_tool_calls(
         &self,
         session_id: &SessionId,
         turn_id: u64,
@@ -567,7 +687,8 @@ impl Engine {
                     s.finish_tool_call(&tc.id, DISPATCHED_PLACEHOLDER.to_string());
                 }
             }
-            let handles = executor.dispatch_batch(dispatched, &registry, *session_id, turn_id, depth);
+            let handles =
+                executor.dispatch_batch(dispatched, &registry, *session_id, turn_id, depth);
             let engine = self.clone();
             let sid = *session_id;
             tokio::spawn(async move {
@@ -588,8 +709,21 @@ impl Engine {
 
         // 4. 等待类：同步执行并收敛结果
         if !waiting.is_empty() {
+            // 能力降级：厂商不支持并行工具时强制串行（Some(1)）
+            let max_concurrent = if self.provider.capabilities().parallel_tool_calls {
+                None
+            } else {
+                Some(1)
+            };
             let results = executor
-                .execute_batch(waiting, &registry, *session_id, turn_id, depth)
+                .execute_batch(
+                    waiting,
+                    &registry,
+                    *session_id,
+                    turn_id,
+                    depth,
+                    max_concurrent,
+                )
                 .await;
             for r in results {
                 observe::tool_completed(!r.result.is_empty());
@@ -619,7 +753,7 @@ const DEPTH_LIMIT_MESSAGE: &str =
     "Rejected: subagent nesting depth limit reached. This agent cannot call sub-agents.";
 
 /// 工具轮处理结果
-enum ToolRound {
+pub(crate) enum ToolRound {
     /// 有待等待的工具 → 继续 resume 循环
     Resume,
     /// 纯派发轮（全部不等待）→ 回合就此结束
@@ -627,7 +761,7 @@ enum ToolRound {
 }
 
 /// 每轮输入来源
-enum RoundSource {
+pub(crate) enum RoundSource {
     /// 首轮：由 chat() 原子启动的 RoundStart
     First(RoundStart),
     /// 后续工具轮：从 AwaitingCalls 的 pending 结果恢复
@@ -635,7 +769,7 @@ enum RoundSource {
 }
 
 /// 提取 panic 消息
-fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+pub(crate) fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     payload
         .downcast_ref::<&str>()
         .map(|s| s.to_string())
@@ -647,6 +781,7 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 fn outcome_label(reply: &EngineReply) -> &'static str {
     match reply {
         EngineReply::Success(_) => "success",
+        EngineReply::Streaming(_) => "streaming",
         EngineReply::Busy { .. } => "busy",
         EngineReply::Error(_) => "error",
         EngineReply::Cancelled => "cancelled",
@@ -659,6 +794,9 @@ impl From<EngineReply> for SessionReply {
     fn from(r: EngineReply) -> Self {
         match r {
             EngineReply::Success(resp) => SessionReply::from_response(*resp),
+            EngineReply::Streaming(_) => SessionReply::Error {
+                message: "streaming reply must be consumed directly, not over envelope".into(),
+            },
             EngineReply::Busy { turn_id } => SessionReply::Busy { turn_id },
             EngineReply::Error(msg) => SessionReply::Error { message: msg },
             EngineReply::Cancelled => SessionReply::Cancelled,

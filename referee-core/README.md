@@ -269,7 +269,7 @@ referee-core/
 
 ```bash
 cargo test -p referee-core -- --nocapture     # 25 条测试（Phase 1 ~ 6）
-cargo test --workspace                        # 全量回归（core 25 + agent 65 = 90 条）
+cargo test --workspace                        # 全量回归（core 25 + base 116 + agent 17 = 158 条）
 cargo clippy --all-targets -- -D warnings     # 零警告
 cargo fmt --check                             # 格式整洁
 ```
@@ -294,6 +294,7 @@ cargo fmt --check                             # 格式整洁
 | 文档 | 说明 |
 |------|------|
 | [`../README.md`](../README.md) | 仓库总览（目录 / 大纲） |
-| [`../referee-agent/README.md`](../referee-agent/README.md) | 智能体运行时模块描述 |
+| [`../referee-ai-base/README.md`](../referee-ai-base/README.md) | 核心支撑层模块描述（会话引擎 / 流式 / 会话生命周期） |
+| [`../referee-agent/README.md`](../referee-agent/README.md) | 业务封装层模块描述 |
 | [`../PHASE_STATUS.md`](../PHASE_STATUS.md) | Phase 状态跟踪（含关键设计决策与偏差记录） |
 | [`../AGENTS.md`](../AGENTS.md) | 工程约束（设计思想 / 依赖清单 / 工作纪律） |
