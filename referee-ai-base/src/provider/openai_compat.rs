@@ -294,8 +294,10 @@ fn parse_chat_response(json: &Value) -> Result<ChatResponse, LlmError> {
     let message_json = first
         .get("message")
         .ok_or_else(|| LlmError::Protocol("missing 'message' in choice".into()))?;
-    let message = parse_message(message_json)?;
     let usage = json.get("usage").filter(|u| !u.is_null()).map(parse_usage);
+    // 把本轮用量挂进消息元数据（供 observe / 审计）
+    let mut message = parse_message(message_json)?;
+    message.usage = usage.clone();
     Ok(ChatResponse {
         id,
         model,
@@ -356,6 +358,7 @@ fn parse_message(m: &Value) -> Result<Message, LlmError> {
         reasoning_content,
         tool_calls,
         tool_call_id,
+        usage: None,
     })
 }
 
@@ -399,6 +402,9 @@ fn parse_usage(u: &Value) -> TokenUsage {
         reasoning_tokens,
         prompt_cache_hit_tokens: prompt_cache_hit,
         prompt_cache_miss_tokens: prompt_cache_miss,
+        // 归一化视角：hit→read，miss→write（厂商无关）
+        cache_read_tokens: prompt_cache_hit,
+        cache_write_tokens: prompt_cache_miss,
     }
 }
 

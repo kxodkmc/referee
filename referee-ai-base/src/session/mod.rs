@@ -555,6 +555,7 @@ impl Session {
                 reasoning_content: None,
                 tool_calls: Vec::new(),
                 tool_call_id: Some(tool_call_id.clone()),
+                usage: None,
             });
         }
     }

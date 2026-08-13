@@ -157,6 +157,9 @@ pub struct Message {
     /// 工具结果消息对应的工具调用 ID（role=Tool 时必需）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// 本轮用量（消息元数据，供 observe / 审计）；回传请求时自动省略
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TokenUsage>,
 }
 
 impl Message {
@@ -167,6 +170,7 @@ impl Message {
             reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
+            usage: None,
         }
     }
 
@@ -177,6 +181,7 @@ impl Message {
             reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
+            usage: None,
         }
     }
 
@@ -187,6 +192,7 @@ impl Message {
             reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
+            usage: None,
         }
     }
 }
@@ -318,6 +324,12 @@ pub struct TokenUsage {
     /// 输入缓存未命中 token 数（DeepSeek）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_cache_miss_tokens: Option<usize>,
+    /// 输入缓存命中 token 数（归一化视角：read；DeepSeek hit→read）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<usize>,
+    /// 输入缓存写入 token 数（归一化视角：write；DeepSeek miss→write）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<usize>,
 }
 
 /// 一次性（非流式）响应

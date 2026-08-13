@@ -126,6 +126,24 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// 复合过滤导出工具声明 — 白名单 + 子 Agent 深度
+    ///
+    /// `allowed` 为 `None` 时不过滤（继承全部）；为 `Some(set)` 时仅导出
+    /// 名字命中白名单的工具。用于 per-Agent 能力白名单（"没启用的工具不进提示词"）。
+    pub fn declarations_visible(
+        &self,
+        allowed: Option<&std::collections::HashSet<String>>,
+        current_depth: u32,
+        max_depth: u32,
+    ) -> Vec<ToolDeclaration> {
+        self.tools
+            .iter()
+            .filter(|r| allowed.map_or(true, |a| a.contains(r.value().name())))
+            .filter(|r| !(r.value().depth_limited() && current_depth >= max_depth))
+            .map(|r| r.value().to_declaration())
+            .collect()
+    }
+
     /// 当前工具数
     pub fn len(&self) -> usize {
         self.tools.len()
@@ -277,5 +295,30 @@ mod tests {
         let names: Vec<_> = decls.iter().map(|d| d.name.as_str()).collect();
         assert!(!names.contains(&"sub"));
         assert!(names.contains(&"plain"));
+    }
+
+    #[test]
+    fn declarations_visible_filters_by_whitelist() {
+        let reg = ToolRegistry::with_defaults();
+        reg.register(Arc::new(DummyTool { name: "a".into() }))
+            .unwrap();
+        reg.register(Arc::new(DummyTool { name: "b".into() }))
+            .unwrap();
+
+        // None = 继承全部
+        let all_decls = reg.declarations_visible(None, 0, 2);
+        let all: Vec<_> = all_decls.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(all.len(), 2);
+
+        // Some(白名单) = 仅命中者
+        let allow: std::collections::HashSet<String> =
+            ["a".into()].into_iter().collect();
+        let visible = reg.declarations_visible(Some(&allow), 0, 2);
+        let vis: Vec<_> = visible.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(vis, vec!["a"]);
+
+        // Some(空) = 无工具
+        let none: std::collections::HashSet<String> = std::collections::HashSet::new();
+        assert!(reg.declarations_visible(Some(&none), 0, 2).is_empty());
     }
 }

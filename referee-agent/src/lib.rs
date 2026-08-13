@@ -15,12 +15,16 @@
 //! base 提供「接 LLM → 组装 prompt → 调工具 → 管预算 → 回复」的地基；
 //! 本模块提供「如何把地基变成一个完整、可用、协作的 Agent」。
 
+pub mod agent;
 pub mod artifact;
 pub mod tool;
 // Agent Skills 开放标准（SKILL.md）注入，按需拓展，启用 `skills` feature 后加载
 #[cfg(feature = "skills")]
 pub mod skill;
 
+pub use agent::{
+    AgentBuilder, AgentDefinition, AgentId, AgentRegistry, BoundAgent, ChatParams, TemplateRef,
+};
 pub use artifact::{
     Artifact, ArtifactStore, BoardId, InMemoryArtifactStore, StoreConfig, StoreError,
 };

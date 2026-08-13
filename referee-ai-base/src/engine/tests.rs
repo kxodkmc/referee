@@ -59,6 +59,7 @@ fn resp(text: &str, tool_calls: Vec<crate::provider::ToolCall>) -> ChatResponse 
             reasoning_content: None,
             tool_calls,
             tool_call_id: None,
+            usage: None,
         },
         finish_reason: if has_tools {
             FinishReason::ToolCalls
