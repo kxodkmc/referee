@@ -1,0 +1,37 @@
+[package]
+name = "referee-ai-base"
+version = "0.1.0"
+edition = "2021"
+description = "Agent 核心支撑层（地基）：LLM 厂商抽象、会话状态机、工具执行、预算治理、提示词组装、缓存与可观测。"
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = ["xiaomi", "deepseek"]
+xiaomi    = []
+deepseek  = []
+openai    = []
+anthropic = []
+responses = []
+
+[dependencies]
+referee-core = { path = "../referee-core" }
+tokio       = { version = "1", features = ["full"] }
+futures     = "0.3"
+async-trait = "0.1"
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+bytes       = "1"
+thiserror   = "1"
+tracing     = "0.1"
+dashmap     = "6"
+uuid        = { version = "1", features = ["v4", "serde"] }
+parking_lot = "0.12"
+metrics     = "0.22"
+reqwest     = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
+[dev-dependencies]
+tokio       = { version = "1", features = ["full", "test-util"] }
+tracing-subscriber = "0.3"
