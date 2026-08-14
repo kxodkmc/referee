@@ -28,7 +28,9 @@ pub use agent::{
 pub use artifact::{
     Artifact, ArtifactStore, BoardId, InMemoryArtifactStore, StoreConfig, StoreError,
 };
-pub use tool::{AgentTool, ArtifactReader, ListMyBoard};
+pub use tool::{
+    AgentTool, ArtifactReader, EditTool, FsConfig, ListMyBoard, ReadTool, ReadToolConfig, WriteTool,
+};
 #[cfg(feature = "skills")]
 pub use skill::{
     render_skill_context, KeywordRouter, RegistryConfig as SkillRegistryConfig, RegistryError as SkillRegistryError,
@@ -170,6 +172,32 @@ impl AgentRuntime {
             .register_tool(Arc::new(ListMyBoard::new(store.clone())))?;
         self.engine
             .register_tool(Arc::new(ArtifactReader::new(store)))?;
+        Ok(())
+    }
+
+    /// 注册本地文本读取工具（`read`）
+    ///
+    /// 需引擎已 `with_tools`。`config` 可指定根目录约束与容量上限。
+    pub fn register_read_tool(
+        &self,
+        config: tool::read::ReadToolConfig,
+    ) -> Result<(), referee_ai_base::tool::RegistryError> {
+        self.engine
+            .register_tool(Arc::new(tool::read::ReadTool::new(config)))
+    }
+
+    /// 注册文件写工具（`write` / `edit`）
+    ///
+    /// 需引擎已 `with_tools`。`config` 为共享文件约束（上限 + 可选 root），
+    /// 与 `read` 的 root 约束应保持一致，保证 read/write/edit 视图统一。
+    pub fn register_fs_write_tools(
+        &self,
+        config: tool::fs_common::FsConfig,
+    ) -> Result<(), referee_ai_base::tool::RegistryError> {
+        self.engine
+            .register_tool(Arc::new(tool::write::WriteTool::new(config.clone())))?;
+        self.engine
+            .register_tool(Arc::new(tool::edit::EditTool::new(config)))?;
         Ok(())
     }
 

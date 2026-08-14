@@ -172,7 +172,7 @@ fn history_eviction() {
         ..Default::default()
     });
     for i in 0..5 {
-        session.push_history(Message::user(format!("msg {i}")));
+        session.push_history(Message::user(format!("msg {i}"))).unwrap();
     }
     assert_eq!(session.history_len(), 3);
     let req = session.build_chat_request(&ChatOptions::default());
@@ -182,10 +182,53 @@ fn history_eviction() {
 }
 
 #[test]
+fn facts_preserved_beyond_window() {
+    let mut session = Session::new(SessionConfig {
+        max_history: 3,
+        ..Default::default()
+    });
+    for i in 0..5 {
+        session.push_history(Message::user(format!("msg {i}"))).unwrap();
+    }
+    // 模型可见窗口有界：只派生最近 3 条
+    assert_eq!(session.history_len(), 3);
+    let req = session.build_chat_request(&ChatOptions::default());
+    let texts: Vec<&str> = req
+        .messages
+        .iter()
+        .filter_map(|m| m.content.as_text())
+        .collect();
+    assert_eq!(texts, vec!["msg 2", "msg 3", "msg 4"]);
+    // 事实源无损：全部 5 条事实仍在，可随时回放/审计
+    assert_eq!(session.log.len(), 5);
+    let facts: Vec<&str> = session
+        .log
+        .snapshot()
+        .iter()
+        .filter_map(|m| m.content.as_text())
+        .collect();
+    assert_eq!(facts, vec!["msg 0", "msg 1", "msg 2", "msg 3", "msg 4"]);
+}
+
+#[test]
+fn fact_log_capacity_exceeded() {
+    let mut session = Session::new(SessionConfig {
+        max_events: 2,
+        ..Default::default()
+    });
+    session.push_history(Message::user("a")).unwrap();
+    session.push_history(Message::user("b")).unwrap();
+    let err = session.push_history(Message::user("c")).unwrap_err();
+    assert!(matches!(err, LogError::CapacityExceeded { max: 2 }));
+    // 拒绝不产生任何副作用：事实仍为前两条
+    assert_eq!(session.log.len(), 2);
+}
+
+#[test]
 fn build_chat_request_includes_history() {
     let mut session = Session::new(SessionConfig::default());
-    session.push_history(Message::user("hello"));
-    session.push_history(Message::assistant("hi there"));
+    session.push_history(Message::user("hello")).unwrap();
+    session.push_history(Message::assistant("hi there")).unwrap();
     let req = session.build_chat_request(&ChatOptions::default());
     assert_eq!(req.messages.len(), 2);
     assert_eq!(req.messages[0].content.as_text(), Some("hello"));
@@ -383,7 +426,7 @@ fn settle_dispatched_converges_pure_dispatch_round() {
 #[test]
 fn system_prompt_from_options_becomes_first_message() {
     let mut session = Session::new(SessionConfig::default());
-    session.push_history(Message::user("hello"));
+    session.push_history(Message::user("hello")).unwrap();
     let opts = ChatOptions {
         system_prompt: Some("You are a helpful assistant".into()),
         ..Default::default()
@@ -402,7 +445,7 @@ fn default_system_prompt_falls_back() {
         default_system_prompt: Some("Default persona".into()),
         ..Default::default()
     });
-    session.push_history(Message::user("hello"));
+    session.push_history(Message::user("hello")).unwrap();
     let req = session.build_chat_request(&ChatOptions::default());
     assert_eq!(req.messages[0].role, Role::System);
     assert_eq!(req.messages[0].content.as_text(), Some("Default persona"));
@@ -411,7 +454,7 @@ fn default_system_prompt_falls_back() {
 #[test]
 fn no_system_prompt_keeps_user_first() {
     let mut session = Session::new(SessionConfig::default());
-    session.push_history(Message::user("hello"));
+    session.push_history(Message::user("hello")).unwrap();
     let req = session.build_chat_request(&ChatOptions::default());
     assert_eq!(req.messages[0].role, Role::User);
 }
