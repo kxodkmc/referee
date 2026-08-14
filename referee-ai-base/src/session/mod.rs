@@ -47,6 +47,8 @@ pub mod timeout;
 
 // 便捷重导出
 pub use log::{LogError, SessionLog};
+#[cfg(feature = "persist")]
+pub use log::{PersistedSessionLog, SessionLogSink};
 pub use message::{ChatOptions, ChatPayload, SessionId, SessionMessage, SessionReply};
 pub use task::{run_turn, TurnOutcome};
 pub use timeout::TimeoutConfig;
@@ -58,6 +60,8 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
 use tracing::{error, info, warn};
+
+use serde::{Deserialize, Serialize};
 
 use crate::budget::tokens_from_response;
 use crate::provider::{ChatRequest, ChatResponse, Message, ToolCall};
@@ -117,7 +121,7 @@ pub enum ToolCallAction {
 }
 
 /// 会话配置 — 每会话独立（从 AgentConfig 模板派生）
-#[derive(Debug, Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SessionConfig {
     /// history 最大消息数（有界，FIFO 淘汰最旧）
     pub max_history: usize,
@@ -135,6 +139,27 @@ pub struct SessionConfig {
     pub default_system_prompt: Option<String>,
     /// 会话空闲超时（None = 永不超时，默认）。超时后由空闲回收任务移除 Idle 会话。
     pub idle_timeout: Option<Duration>,
+    /// 【persist】可插拔会话事实落盘 sink（默认 None；运行时注入，不参与序列化）
+    #[cfg(feature = "persist")]
+    #[serde(skip)]
+    pub log_sink: Option<Arc<dyn SessionLogSink>>,
+}
+
+impl std::fmt::Debug for SessionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("SessionConfig");
+        d.field("max_history", &self.max_history)
+            .field("max_events", &self.max_events)
+            .field("timeout", &self.timeout)
+            .field("default_temperature", &self.default_temperature)
+            .field("default_max_tokens", &self.default_max_tokens)
+            .field("prompt_budget_tokens", &self.prompt_budget_tokens)
+            .field("default_system_prompt", &self.default_system_prompt)
+            .field("idle_timeout", &self.idle_timeout);
+        #[cfg(feature = "persist")]
+        d.field("has_log_sink", &self.log_sink.is_some());
+        d.finish()
+    }
 }
 
 impl Default for SessionConfig {
@@ -148,6 +173,8 @@ impl Default for SessionConfig {
             prompt_budget_tokens: 8000,
             default_system_prompt: None,
             idle_timeout: None,
+            #[cfg(feature = "persist")]
+            log_sink: None,
         }
     }
 }
@@ -171,6 +198,8 @@ pub struct Session {
     pub state: SessionState,
     /// 会话事实源（append-only，有界，超限返回 CapacityExceeded，绝不静默丢弃）
     log: SessionLog,
+    /// 本会话标识（persist 落盘按会话分文件用；默认 nil，经 `with_session_id` 注入）
+    session_id: SessionId,
     turn_id: u64,
     config: SessionConfig,
     /// 回合级取消标志（回合内持续有效，`start_round` 时重置）。
@@ -221,6 +250,7 @@ impl Session {
         Self {
             state: SessionState::Idle,
             log: SessionLog::new(config.max_events),
+            session_id: SessionId::nil(),
             turn_id: 0,
             config,
             interrupt: Arc::new(AtomicBool::new(false)),
@@ -231,6 +261,12 @@ impl Session {
             peer_depth: 0,
             last_active: Instant::now(),
         }
+    }
+
+    /// 注入会话标识（persist 落盘按会话分文件用；引擎在创建时调用）
+    pub fn with_session_id(mut self, id: SessionId) -> Self {
+        self.session_id = id;
+        self
     }
 
     /// 当前轮次 ID（单调递增）
@@ -595,8 +631,22 @@ impl Session {
     // ─────────────────────────────────────────────
 
     /// 追加一条事实到会话日志（事实只增不减；满则返回 `CapacityExceeded`，不静默丢弃）
+    ///
+    /// 配置了落盘 sink 时，内存写入成功后尽力落盘；落盘失败显式 `error!` 记录
+    /// （不吞异常、不阻塞内存会话），内存事实源仍为权威。
     pub fn push_history(&mut self, msg: Message) -> Result<(), LogError> {
-        self.log.append(msg).map(|_| ())
+        self.log.append(msg.clone()).map(|_| ())?;
+        #[cfg(feature = "persist")]
+        if let Some(sink) = &self.config.log_sink {
+            if let Err(e) = sink.append(&self.session_id, &msg) {
+                error!(
+                    error = ?e,
+                    session_id = %self.session_id,
+                    "push_history: persist sink append failed"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// 构建 ChatRequest（从模型可见窗口 + 可选参数 + 预算截断）

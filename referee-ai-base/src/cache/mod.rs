@@ -46,7 +46,7 @@ pub struct CacheKey {
 }
 
 /// 缓存配置 — 挂载于 `AgentConfig`（`enabled=false` 时完全禁用）
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct CacheConfig {
     pub enabled: bool,
     /// 最大条目数（有界，超限按 LRU 淘汰）

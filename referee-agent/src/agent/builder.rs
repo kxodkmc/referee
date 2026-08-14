@@ -17,6 +17,7 @@ use referee_ai_base::tool::ToolRegistry;
 
 use super::definition::{whitelist_to_set, AgentDefinition, ChatParams, TemplateRef};
 use super::id::AgentId;
+use super::template::{interpolate, TemplateError, TemplateRegistry};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BuilderError {
@@ -93,7 +94,7 @@ impl AgentBuilder {
 }
 
 /// 装配结果 — 定义 + 解析后的白名单 + 渲染后的系统片段
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct BoundAgent {
     pub def: Arc<AgentDefinition>,
     /// 系统片段（模板静态段；技能段由上层按 feature 追加）
@@ -117,35 +118,66 @@ impl BoundAgent {
 }
 
 impl AgentDefinition {
-    /// 解析白名单 + 渲染模板 → [`BoundAgent`]
+    /// 无注册表绑定：仅内建模板（Generic/DeepSeek/Claude/Inline）。
+    ///
+    /// `Named` 命名槽位必须经 [`Self::bind_with`] 提供注册表；缺失视为编程错误（panic）。
     pub fn bind(self: &Arc<Self>) -> BoundAgent {
-        BoundAgent {
+        self.bind_with(None, &[])
+            .unwrap_or_else(|e| panic!("bind requires a TemplateRegistry for named templates: {e}"))
+    }
+
+    /// 注册表感知绑定 — 解析白名单 + 渲染模板 → [`BoundAgent`]
+    ///
+    /// 传递设计（参考 DSH `AssembleContext`）：`Named` 模板经 `templates` 解析
+    /// （可替换语义），模板中的 `{{variable}}` 用 `vars` 严格插值，产出稳定
+    /// `SystemSection` 供 base `assemble` 使用。
+    pub fn bind_with(
+        self: &Arc<Self>,
+        templates: Option<&TemplateRegistry>,
+        vars: &[(&str, &str)],
+    ) -> Result<BoundAgent, TemplateError> {
+        Ok(BoundAgent {
             def: self.clone(),
-            system_sections: vec![render_template(&self.template)],
+            system_sections: vec![render_template(&self.template, templates, vars)?],
             tools: whitelist_to_set(&self.tools),
             skills: whitelist_to_set(&self.skills),
             mcp_servers: whitelist_to_set(&self.mcp_servers),
-        }
+        })
     }
 }
 
-/// 渲染模板为稳定系统片段（内容为最小占位，供上层按需定制）
-fn render_template(t: &TemplateRef) -> SystemSection {
-    let text = match t {
-        TemplateRef::Generic => "You are a helpful AI assistant.".to_string(),
-        TemplateRef::DeepSeek => {
-            "You are a capable AI coding assistant. Work step by step, verify your \
-             results, and report honestly including any verification failures."
-                .to_string()
+/// 内建模板静态段（最小占位，供上层按需定制）
+const GENERIC_TEXT: &str = "You are a helpful AI assistant.";
+const DEEPSEEK_TEXT: &str = "You are a capable AI coding assistant. Work step by step, verify \
+     your results, and report honestly including any verification failures.";
+const CLAUDE_TEXT: &str = "You are a capable AI coding assistant. Follow tool-use guidance, make \
+     precise edits, and verify changes before reporting.";
+
+/// 渲染模板为稳定系统片段；`Named` 经注册表解析（可替换），空模板标记可省略
+fn render_template(
+    t: &TemplateRef,
+    templates: Option<&TemplateRegistry>,
+    vars: &[(&str, &str)],
+) -> Result<SystemSection, TemplateError> {
+    let (text, omit_if_empty) = match t {
+        TemplateRef::Generic => (GENERIC_TEXT.to_string(), false),
+        TemplateRef::DeepSeek => (DEEPSEEK_TEXT.to_string(), false),
+        TemplateRef::Claude => (CLAUDE_TEXT.to_string(), false),
+        TemplateRef::Inline(s) => (s.clone(), false),
+        TemplateRef::Named(name) => {
+            let reg = templates.ok_or_else(|| TemplateError::Unknown(name.clone()))?;
+            let text = reg
+                .get(name)
+                .ok_or_else(|| TemplateError::Unknown(name.clone()))?;
+            // 空则整体省略（Named 槽位可被替换为空以禁用该能力）
+            (text, true)
         }
-        TemplateRef::Claude => {
-            "You are a capable AI coding assistant. Follow tool-use guidance, make \
-             precise edits, and verify changes before reporting."
-                .to_string()
-        }
-        TemplateRef::Inline(s) => s.clone(),
     };
-    SystemSection::stable(text)
+    Ok(SystemSection {
+        stable: true,
+        text: interpolate(&text, vars)?,
+        omit_if_empty,
+    })
 }
 
 #[cfg(test)]
@@ -207,5 +239,62 @@ mod tests {
         );
         let bound = def.bind();
         assert!(bound.tools.is_none(), "['*'] 解析为 None（全部）");
+    }
+
+    fn named_def(name: &str) -> Arc<AgentDefinition> {
+        Arc::new(
+            AgentDefinition::builder()
+                .id(AgentId::new(name).unwrap())
+                .description("d")
+                .model("m")
+                .template(TemplateRef::Named(name.to_string()))
+                .build()
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn bind_with_resolves_named_template_and_interpolates() {
+        let templates = TemplateRegistry::with_defaults();
+        templates.register("coder-prompt", "You are {{role}}.").unwrap();
+        let bound = named_def("coder-prompt")
+            .bind_with(Some(&templates), &[("role", "coder")])
+            .unwrap();
+        assert_eq!(bound.system_sections[0].text, "You are coder.");
+        assert!(bound.system_sections[0].stable);
+    }
+
+    #[test]
+    fn bind_with_unknown_named_template_errors() {
+        let err = named_def("missing")
+            .bind_with(Some(&TemplateRegistry::with_defaults()), &[])
+            .unwrap_err();
+        assert!(matches!(err, TemplateError::Unknown(_)));
+    }
+
+    #[test]
+    fn bind_with_missing_variable_errors() {
+        let templates = TemplateRegistry::with_defaults();
+        templates.register("with-var", "cwd={{cwd}}").unwrap();
+        let err = named_def("with-var")
+            .bind_with(Some(&templates), &[])
+            .unwrap_err();
+        assert!(matches!(err, TemplateError::UnknownVariable(_)));
+    }
+
+    #[test]
+    fn bind_panics_on_named_without_registry() {
+        let result = std::panic::catch_unwind(|| named_def("general").bind());
+        assert!(result.is_err(), "Named 模板无注册表绑定必须 panic");
+    }
+
+    #[test]
+    fn empty_named_template_is_omittable() {
+        let templates = TemplateRegistry::with_defaults();
+        templates.register("empty-slot", "").unwrap();
+        let bound = named_def("empty-slot")
+            .bind_with(Some(&templates), &[])
+            .unwrap();
+        assert!(bound.system_sections[0].omit_if_empty);
     }
 }

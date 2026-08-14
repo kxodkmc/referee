@@ -11,8 +11,10 @@
 
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 /// 超时配置 — 会话级双 deadline
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct TimeoutConfig {
     /// Thinking 状态超时（LLM 调用上限）
     ///

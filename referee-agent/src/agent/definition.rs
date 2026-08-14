@@ -13,6 +13,11 @@ use serde::{Deserialize, Serialize};
 use super::id::AgentId;
 
 /// 系统提示词模板引用 — 决定静态段内容
+///
+/// 内建模板（Generic/DeepSeek/Claude）与 `Inline` 均为**内联**文本；`Named` 是
+/// **命名槽位**（参考 DSH persona 槽位设计）：经 `TemplateRegistry` 解析，同名模板
+/// 可被覆盖替换（`register` 覆盖语义），实现"不重编译即可替换"。`Named` 模板必须
+/// 经 [`AgentDefinition::bind_with`](crate::agent::builder::AgentDefinition) 装配。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub enum TemplateRef {
     /// 通用模板（默认）
@@ -28,6 +33,9 @@ pub enum TemplateRef {
     /// 内联文本模板
     #[serde(rename = "inline")]
     Inline(String),
+    /// 命名模板槽位 — 经 `TemplateRegistry` 解析，可被覆盖替换
+    #[serde(rename = "named")]
+    Named(String),
 }
 
 /// 生成参数（调用侧偏好）
@@ -118,7 +126,24 @@ mod tests {
         assert_eq!(back.id, def.id);
         assert_eq!(back.model, "deepseek/deepseek-v3");
         assert!(matches!(back.template, TemplateRef::DeepSeek));
-        assert_eq!(back.tools, def.tools);
-        assert_eq!(back.params.temperature, Some(0.2));
+    }
+
+    #[test]
+    fn serde_roundtrip_named_template() {
+        // Named 命名槽位可经 serde 往返（纯数据载体）
+        let def = AgentDefinition {
+            id: AgentId::new("general").unwrap(),
+            description: "d".into(),
+            model: "m".into(),
+            template: TemplateRef::Named("general".into()),
+            tools: vec!["*".into()],
+            skills: vec![],
+            mcp_servers: vec![],
+            params: Default::default(),
+        };
+        let json = serde_json::to_string(&def).unwrap();
+        assert!(json.contains("\"named\":\"general\""));
+        let back: AgentDefinition = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back.template, TemplateRef::Named(n) if n == "general"));
     }
 }

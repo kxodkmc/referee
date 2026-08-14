@@ -6,11 +6,20 @@
 
 use crate::provider::Message;
 
-/// 日志容量超限（背压硬约束）
+#[cfg(feature = "persist")]
+use crate::session::SessionId;
+#[cfg(feature = "persist")]
+use std::sync::Arc;
+
+/// 日志错误
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum LogError {
+    /// 内存会话事实日志容量超限（背压硬约束，绝不静默丢弃）
     #[error("session event log full (max {max})")]
     CapacityExceeded { max: usize },
+    /// 落盘 sink 失败（仅 `persist` feature；显式报错，不静默丢弃）
+    #[error("session persist io error: {0}")]
+    Io(String),
 }
 
 /// 内存 append-only 会话事实日志
@@ -56,5 +65,113 @@ impl SessionLog {
 
     pub fn is_empty(&self) -> bool {
         self.facts.is_empty()
+    }
+}
+
+/// 会话事实落盘 sink — 可插拔，对齐 `WalSink` append 语义（同步追加）。
+///
+/// 实现需 `Send + Sync`，可在多任务间共享。失败**显式返回错误**，绝不静默丢弃。
+/// 同步签名的原因：会话状态机（`Session::push_history`）在无 `await` 的同步路径
+/// 写入，落盘为小字节 append（OS 缓冲、非每行 fsync），阻塞可忽略。
+#[cfg(feature = "persist")]
+pub trait SessionLogSink: Send + Sync {
+    /// 追加一条事实到后端（含会话标识，供按会话分文件落盘）
+    fn append(&self, session_id: &SessionId, msg: &Message) -> Result<(), LogError>;
+}
+
+/// 带落盘 sink 的会话事实日志 — 内存日志 + 可插拔落盘。
+///
+/// 追加路径：先写内存（容量超限拒绝，背压硬约束），再尽力落盘；落盘失败
+/// 显式 `tracing::error!` 记录（不吞异常、不静默丢弃），不阻塞内存会话。
+#[cfg(feature = "persist")]
+pub struct PersistedSessionLog {
+    inner: SessionLog,
+    sink: Arc<dyn SessionLogSink>,
+    session_id: SessionId,
+}
+
+#[cfg(feature = "persist")]
+impl PersistedSessionLog {
+    pub fn new(max_events: usize, session_id: SessionId, sink: Arc<dyn SessionLogSink>) -> Self {
+        Self {
+            inner: SessionLog::new(max_events),
+            sink,
+            session_id,
+        }
+    }
+
+    /// 追加并落盘；内存超限返回 `CapacityExceeded`；落盘失败记录但成功返回
+    pub fn append(&mut self, msg: Message) -> Result<usize, LogError> {
+        let idx = self.inner.append(msg.clone())?;
+        if let Err(e) = self.sink.append(&self.session_id, &msg) {
+            tracing::error!(
+                error = ?e,
+                session_id = %self.session_id,
+                "persist: session fact append to sink failed"
+            );
+        }
+        Ok(idx)
+    }
+
+    /// 全量事实视图
+    pub fn snapshot(&self) -> &[Message] {
+        self.inner.snapshot()
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+}
+
+#[cfg(all(test, feature = "persist"))]
+mod persist_tests {
+    use super::*;
+    use crate::provider::Message;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingSink {
+        count: std::sync::Arc<AtomicUsize>,
+    }
+
+    impl SessionLogSink for CountingSink {
+        fn append(&self, _session_id: &SessionId, _msg: &Message) -> Result<(), LogError> {
+            self.count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn persisted_log_append_forwards_to_sink() {
+        let count = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut log = PersistedSessionLog::new(
+            16,
+            SessionId::new_v4(),
+            std::sync::Arc::new(CountingSink { count: count.clone() }),
+        );
+        log.append(Message::user("hi")).unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn persisted_log_capacity_blocks_without_sink_call() {
+        let count = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut log = PersistedSessionLog::new(
+            1,
+            SessionId::new_v4(),
+            std::sync::Arc::new(CountingSink { count: count.clone() }),
+        );
+        log.append(Message::user("a")).unwrap();
+        // 容量满：拒绝第二行，落盘也应被阻断（不产生半落盘）
+        let err = log.append(Message::user("b")).unwrap_err();
+        assert_eq!(
+            err,
+            LogError::CapacityExceeded { max: 1 }
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 }

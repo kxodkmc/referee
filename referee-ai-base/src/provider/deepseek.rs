@@ -130,6 +130,7 @@ impl DeepSeekProvider {
                 streaming: true,
                 usage_reported: true,
                 max_output_tokens: MAX_OUTPUT_TOKENS,
+                multimodal: crate::provider::MultimodalCapabilities::NONE,
             },
         })
     }

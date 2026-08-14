@@ -15,6 +15,7 @@
 |----|------|
 | 业务层 | 基于 `referee-ai-base` 组装；base 提供最小闭环积木，本模块提供「如何把它们变成完整、可用、协作的 Agent」 |
 | Agent 定义/配置 | `agent` 模块：`AgentDefinition`（纯数据）+ `AgentBuilder` + `AgentRegistry` + `bind` → `BoundAgent`；能力白名单**封闭默认**（`["*"]`=全部、`["a"]`=白名单、`[]`=无该能力） |
+| 可替换模板 | `TemplateRef::Named` 命名槽位 + `TemplateRegistry`（覆盖语义、有界）：不重编译即可替换提示词；`bind_with(templates, vars)` 传递设计（参考 DSH persona 槽位） |
 | Extension 集成 | `AgentRuntime` 实现 `referee-core::Extension`，把 base 引擎接入内核消息路由（`Chat` / `Interrupt`） |
 | 业务能力 | 对等/子 Agent 协作（`AgentTool`，Agent as Tool）、ACL 工件存储（`artifact`）、成果板读取工具（`list_my_board` / `read_artifact`） |
 | 按需拓展 | MCP 2.0 stdio 客户端桥（`tool::mcp`）以 feature `mcp-stdio` 加载；Agent Skills 注入（`skill`）以 feature `skills` 加载，默认不编译，核心保持轻量 |
@@ -55,6 +56,7 @@ referee-agent = { path = "referee-agent", features = ["xiaomi", "deepseek", "mcp
 | 模块 | 职责 |
 |------|------|
 | [`agent`](src/agent/mod.rs) | **Agent 定义/配置**：`AgentId`（可调用、唯一、kebab-case 校验）、`AgentDefinition`（纯数据，可来自 JSON/TOML/builder）、`AgentBuilder`（链式）、`AgentRegistry`（以 `AgentId` 为 key，重复拒绝）、`AgentDefinition::bind` → `BoundAgent`（解析白名单 + 渲染模板为 `SystemSection`） |
+| [`agent::template`](src/agent/template.rs) | **可替换模板**（参考 DSH persona 槽位）：`TemplateRef::Named` 命名槽位 + `TemplateRegistry`（有界、`register` 覆盖替换语义）+ `interpolate`（`{{variable}}` 严格插值，未知/畸形 fail-loud） |
 | [`AgentRuntime`](src/lib.rs) | `Extension` 实现：接收 `Chat` / `Interrupt` 消息，委托 base `Engine` 驱动回合；观测（会话数 / token / 缓存）；转发会话管理（`remove_session` / `list_sessions` / `session_info`）；`chat_stream` 库级流式；`register_peer_tool` / `register_artifact_tools` |
 | [`tool::AgentTool`](src/tool/agent_tool.rs) | 对等/子 Agent 工具（Agent as Tool）：`Local` 分类不占 IO 槽位，同步 RPC 调用目标会话，大结果 ACL 落库；`peer_depth` 嵌套深度限制 |
 | [`tool::ArtifactReader`](src/tool/artifact_reader.rs) | 成果板读取工具：`list_my_board` 列本会话板内条目、`read_artifact` 按 ID 凭证读取成果正文（读取路径仍经 ArtifactStore ACL 校验） |
@@ -100,6 +102,33 @@ let bound = registry.get(&AgentId::new("coder")?)?.bind();
 
 `BoundAgent` 持有解析后的白名单与渲染后的系统片段（`SystemSection`），可对接
 base 的 `prompt::assemble` 分段编排与 `ToolRegistry::declarations_visible` 白名单过滤。
+
+### 可替换模板（参考 DSH persona 槽位）
+
+模板默认是**内联**的（`Generic` / `DeepSeek` / `Claude` / `Inline`）；如需"不重编译
+即替换提示词"，用**命名槽位** `TemplateRef::Named` + `TemplateRegistry`：
+
+```rust
+use referee_agent::{
+    TemplateRegistry, TemplateRef,
+};
+
+// 1. 注册表：内置通用智能的默认提示词作为可替换的命名槽位 `general`
+let templates = TemplateRegistry::with_builtins();
+
+// 2. 替换提示词（覆盖同名槽位，不重编译；支持 {{variable}} 严格插值）
+templates.register("general", "你是我的专属助手，工作目录：{{cwd}}")?;
+
+// 3. 装配（传递设计）：注册表 + 变量 → 解析 Named + 插值 → SystemSection
+let bound = def.bind_with(Some(&templates), &[("cwd", "/workspace")])?;
+//    bound.system_sections → base prompt::assemble → 模型请求
+```
+
+- `register` 为**覆盖**语义（同名替换、不新增），注册表有界（防 OOM）。
+- `{{variable}}` 插值对齐 DSH `renderPrompt`：未知 / 畸形引用 **fail-loud**（显式报错），
+  孤立的 `{{`（无闭合）保留为字面文本。
+- 内置通用智能 [`builtin::general`](src/agent/builtin.rs) 使用命名槽位 `general`，
+  其默认提示词引用 `{{cwd}}`（工作目录变量），装配时必须提供。
 
 ## 5. 快速上手
 

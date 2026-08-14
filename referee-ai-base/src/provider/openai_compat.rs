@@ -23,8 +23,9 @@ use serde_json::{json, Value};
 use tracing::debug;
 
 use crate::provider::{
-    ChatResponse, FinishReason, LlmError, Message, MessageContent, RetryPolicy, Role, StreamChunk,
-    TokenUsage, ToolCall, ToolCallDelta, ToolCallFunction, ToolCallFunctionDelta,
+    ChatResponse, ContentPart, FinishReason, LlmError, MediaResolution, MediaSource, Message,
+    MessageContent, RetryPolicy, Role, StreamChunk, TokenUsage, ToolCall, ToolCallDelta,
+    ToolCallFunction, ToolCallFunctionDelta,
 };
 
 // ───────────────────────────────────────────────
@@ -186,9 +187,10 @@ pub(crate) fn build_common_body(
     max_tokens: Option<usize>,
     model: &str,
 ) -> Value {
+    let messages_json: Vec<Value> = messages.iter().map(message_to_body_json).collect();
     let mut body = json!({
         "model": model,
-        "messages": messages,
+        "messages": messages_json,
     });
     if !tools.is_empty() {
         let tools_json: Vec<Value> = tools
@@ -218,6 +220,97 @@ pub(crate) fn build_common_body(
         body["max_completion_tokens"] = json!(m);
     }
     body
+}
+
+// ───────────────────────────────────────────────
+// 消息 → OpenAI 请求 body JSON（多模态序列化）
+// ───────────────────────────────────────────────
+
+/// 将 [`Message`] 序列化为 OpenAI 请求体中的消息对象
+///
+/// `content` 按 [`MessageContent`] 分派：`Text` → 字符串简写；`Multimodal` →
+/// 多模态数组。其余字段（reasoning_content / tool_calls / tool_call_id）按
+/// OpenAI 协议透传。
+fn message_to_body_json(m: &Message) -> Value {
+    let mut obj = json!({ "role": m.role });
+    match &m.content {
+        MessageContent::Text(s) => {
+            obj["content"] = json!(s);
+        }
+        MessageContent::Multimodal(parts) => {
+            let parts_json: Vec<Value> = parts.iter().map(content_part_to_json).collect();
+            obj["content"] = json!(parts_json);
+        }
+    }
+    if let Some(rc) = &m.reasoning_content {
+        obj["reasoning_content"] = json!(rc);
+    }
+    if !m.tool_calls.is_empty() {
+        let calls: Vec<Value> = m.tool_calls.iter().map(tool_call_to_json).collect();
+        obj["tool_calls"] = json!(calls);
+    }
+    if let Some(tool_call_id) = &m.tool_call_id {
+        obj["tool_call_id"] = json!(tool_call_id);
+    }
+    obj
+}
+
+/// 将 [`ContentPart`] 序列化为 OpenAI 多模态数组元素
+///
+/// 厂商差异（图片/音频/视频的 `type` 与字段名）在此归一，上层不写厂商分支。
+fn content_part_to_json(part: &ContentPart) -> Value {
+    match part {
+        ContentPart::Text { text } => json!({ "type": "text", "text": text }),
+        ContentPart::Image { source } => json!({
+            "type": "image_url",
+            "image_url": { "url": media_source_to_wire(source) }
+        }),
+        ContentPart::Audio { source } => json!({
+            "type": "input_audio",
+            "input_audio": { "data": media_source_to_wire(source) }
+        }),
+        ContentPart::Video { source, params } => {
+            let mut v = json!({
+                "type": "video_url",
+                "video_url": { "url": media_source_to_wire(source) }
+            });
+            if let Some(fps) = params.fps {
+                v["fps"] = json!(fps);
+            }
+            if let Some(res) = params.media_resolution {
+                v["media_resolution"] = json!(match res {
+                    MediaResolution::Default => "default",
+                    MediaResolution::Max => "max",
+                });
+            }
+            v
+        }
+    }
+}
+
+/// 将 [`MediaSource`] 映射为请求中的 `url`/`data` 值
+///
+/// - `Url` → 原样 URL
+/// - `Base64` → `data:{mime};base64,{data}`（OpenAI 多模态标准）
+/// - `FileId` → `ms://<id>`（Kimi 文件引用协议）
+fn media_source_to_wire(src: &MediaSource) -> Value {
+    match src {
+        MediaSource::Url { url } => json!(url),
+        MediaSource::Base64 { mime, data } => json!(format!("data:{mime};base64,{data}")),
+        MediaSource::FileId { file_id } => json!(format!("ms://{file_id}")),
+    }
+}
+
+/// 将 [`ToolCall`] 序列化为 OpenAI 工具调用对象
+fn tool_call_to_json(tc: &ToolCall) -> Value {
+    json!({
+        "id": tc.id,
+        "type": "function",
+        "function": {
+            "name": tc.function.name,
+            "arguments": tc.function.arguments,
+        }
+    })
 }
 
 // ───────────────────────────────────────────────
@@ -759,6 +852,65 @@ mod tests {
             .filter(|c| matches!(c, StreamChunk::Delta { .. }))
             .count();
         assert_eq!(deltas, 1);
+    }
+
+    #[test]
+    fn build_common_body_serializes_multimodal_content() {
+        use crate::provider::{ContentPart, MediaSource, Message, VideoParams};
+        let text_msg = Message::user("plain text");
+        let mm_msg = crate::provider::Message::user(MessageContent::multimodal(vec![
+            ContentPart::text("describe this image"),
+            ContentPart::image(MediaSource::Url {
+                url: "https://example.png".into(),
+            }),
+            ContentPart::image(MediaSource::Base64 {
+                mime: "image/png".into(),
+                data: "aGVsbG8=".into(),
+            }),
+            ContentPart::audio(MediaSource::Url {
+                url: "https://example.wav".into(),
+            }),
+            ContentPart::video(
+                MediaSource::Url {
+                    url: "https://example.mp4".into(),
+                },
+                VideoParams {
+                    fps: Some(2.0),
+                    media_resolution: Some(MediaResolution::Max),
+                },
+            ),
+        ]));
+        let body = build_common_body(
+            &[text_msg, mm_msg],
+            &[],
+            crate::provider::ToolChoice::Auto,
+            None,
+            None,
+            "m",
+        );
+        let msgs = body["messages"].as_array().unwrap();
+        // 纯文本消息 → 字符串简写
+        assert_eq!(msgs[0]["content"], json!("plain text"));
+        // 多模态消息 → 数组
+        let parts = msgs[1]["content"].as_array().unwrap();
+        assert_eq!(parts[0], json!({"type":"text","text":"describe this image"}));
+        assert_eq!(
+            parts[1],
+            json!({"type":"image_url","image_url":{"url":"https://example.png"}})
+        );
+        assert_eq!(
+            parts[2],
+            json!({"type":"image_url","image_url":{"url":"data:image/png;base64,aGVsbG8="}})
+        );
+        assert_eq!(
+            parts[3],
+            json!({"type":"input_audio","input_audio":{"data":"https://example.wav"}})
+        );
+        assert_eq!(
+            parts[4],
+            json!({"type":"video_url","video_url":{"url":"https://example.mp4"},
+                   "fps":2.0,"media_resolution":"max"})
+        );
     }
 
     #[test]

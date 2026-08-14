@@ -8,11 +8,15 @@
 //! （`ToolRegistry::declarations_visible`），实现"没启用的能力就不注入"。
 
 pub mod builder;
+pub mod builtin;
 pub mod definition;
 pub mod id;
 pub mod registry;
+pub mod template;
 
 pub use builder::{AgentBuilder, BoundAgent, BuilderError};
+pub use builtin::{general, GENERAL_ID};
 pub use definition::{AgentDefinition, ChatParams, TemplateRef};
 pub use id::{AgentId, AgentIdError};
 pub use registry::{AgentRegistry, RegistryConfig, RegistryError};
+pub use template::{interpolate, TemplateConfig, TemplateError, TemplateRegistry};

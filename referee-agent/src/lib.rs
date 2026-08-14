@@ -23,7 +23,8 @@ pub mod tool;
 pub mod skill;
 
 pub use agent::{
-    AgentBuilder, AgentDefinition, AgentId, AgentRegistry, BoundAgent, ChatParams, TemplateRef,
+    general, interpolate, AgentBuilder, AgentDefinition, AgentId, AgentRegistry, BoundAgent,
+    ChatParams, GENERAL_ID, TemplateConfig, TemplateError, TemplateRef, TemplateRegistry,
 };
 pub use artifact::{
     Artifact, ArtifactStore, BoardId, InMemoryArtifactStore, StoreConfig, StoreError,
@@ -125,6 +126,20 @@ impl AgentRuntime {
         payload: ChatPayload,
     ) -> Result<ChatHandle, EngineStartError> {
         self.engine.chat_stream(session_id, payload)
+    }
+
+    /// 中断指定会话的当前回合（幂等；有活动回合才返回 true）
+    pub fn interrupt(&self, session_id: SessionId) -> bool {
+        self.engine.interrupt(session_id)
+    }
+
+    /// 回放已确认的会话事实到指定会话历史（崩溃恢复用，不触发 LLM）
+    pub fn replay_history(
+        &self,
+        session_id: SessionId,
+        messages: Vec<referee_ai_base::provider::Message>,
+    ) -> Result<usize, String> {
+        self.engine.replay_history(session_id, messages)
     }
 
     /// 全局已消耗 Token 数（观测）

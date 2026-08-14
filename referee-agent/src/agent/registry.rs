@@ -58,6 +58,17 @@ impl AgentRegistry {
         Self::new(RegistryConfig::default())
     }
 
+    /// 预置内置通用智能（初始入口）的默认注册表
+    ///
+    /// 在 `with_defaults` 基础上注册 [`super::builtin::general`]，开箱即用：
+    /// 新注册表唯一，内置 id 不冲突，`expect` 为静态不变量。
+    pub fn with_builtin_general() -> Self {
+        let reg = Self::with_defaults();
+        reg.register(super::builtin::general())
+            .expect("builtin general id is unique in a fresh registry");
+        reg
+    }
+
     /// 注册 Agent；ID 重复或超限时返回错误，不覆盖已有项
     pub fn register(&self, def: AgentDefinition) -> Result<(), RegistryError> {
         if self.map.len() >= self.config.max_agents {
@@ -156,5 +167,22 @@ mod tests {
         assert!(reg.unregister(&id));
         assert!(!reg.unregister(&id));
         assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn with_builtin_general_seeds_entry() {
+        let reg = AgentRegistry::with_builtin_general();
+        assert_eq!(reg.len(), 1);
+        let general = reg
+            .get(&AgentId::new(crate::agent::GENERAL_ID).unwrap())
+            .unwrap();
+        assert_eq!(general.id.as_str(), crate::agent::GENERAL_ID);
+        assert_eq!(
+            general.tools,
+            vec![crate::agent::definition::WILDCARD_ALL]
+        );
+        // 内置注册后仍可注册其它 Agent，互不冲突
+        reg.register(def("coder")).unwrap();
+        assert_eq!(reg.len(), 2);
     }
 }
