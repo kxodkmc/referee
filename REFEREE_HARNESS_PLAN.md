@@ -1,4 +1,4 @@
-# Referee Server — 总体方案（架构 / 决策 / 差距 / 阶段规划）
+# Referee Harness — 总体方案（架构 / 决策 / 差距 / 阶段规划）
 
 > 目标：把 referee（Rust 智能体库）做成**可被 TUI / Web / CLI 调用的智能体服务**，
 > 支持**多个独立实例并行运行与管理、非正常中断可恢复**。
@@ -9,8 +9,8 @@
 
 | 文档 | 职责 | 读者 |
 |---|---|---|
-| [REFEREE_SERVER_PLAN.md](REFEREE_SERVER_PLAN.md)（本文档） | **总体方案**：目标架构、决策记录（G1/G2）、现状盘点、差距清单、阶段规划、待确认项 | 评审 / 决策 |
-| [REFEREE_SERVER_IMPL.md](REFEREE_SERVER_IMPL.md) | **Phase 1 执行实现**：文件结构、类型签名、内部流程、集成测试、验收标准 | 开发执行 |
+| [REFEREE_HARNESS_PLAN.md](REFEREE_HARNESS_PLAN.md)（本文档） | **总体方案**：目标架构、决策记录（G1/G2）、现状盘点、差距清单、阶段规划、待确认项 | 评审 / 决策 |
+| [REFEREE_HARNESS_IMPL.md](REFEREE_HARNESS_IMPL.md) | **Phase 1 执行实现**：文件结构、类型签名、内部流程、集成测试、验收标准 | 开发执行 |
 
 职责边界：**本文档回答"做什么、为什么、分几个阶段"；实现文档回答"每个文件怎么落地"**。
 
@@ -22,7 +22,7 @@
                  └───────┬───────────────┬───────────┘
                          │   HTTP + SSE（待定） / TCP JSON-RPC
               ┌──────────▼───────────────▼──────────┐
-              │   referee-server（入口/网关层，新 crate）        │
+              │   referee-harness（入口/宿主层，新 crate）       │
               │   · protocol：serde 协议类型（Chat/Stream/Info）  │
               │   · instance：InstanceManager —— N 个实例并行管理  │
               │   · persist：实例/会话 JSONL 持久化 + 崩溃恢复     │
@@ -43,7 +43,7 @@
 ## 2. 决策记录（G1/G2 已收敛）
 
 ### G1 — 入口层
-- 进程形态：**常驻 daemon**（`referee-server`），CLI 为其一次性客户端（会话状态在内存，必须常驻）。
+- 进程形态：**常驻 daemon**（`referee-harness`），CLI 为其一次性客户端（会话状态在内存，必须常驻）。
 - P1 传输：**TCP + JSON-RPC 2.0 over NDJSON**（tokio `TcpListener` + serde_json，零新增依赖）。
 - P2 传输：HTTP + SSE（axum，feature 门控，依赖决策待定）；与 P1 共用同一 `protocol` 层。
 - `protocol`（serde 载荷）与传输解耦，后续接入第二传输不重写业务层。
@@ -92,7 +92,7 @@
 
 | # | 差距 | 状态 | 影响 |
 |---|---|---|---|
-| G1 | **无任何入口层** | ✅ 已定（§2）：常驻 daemon + TCP/JSON-RPC 2.0 | 待建 `referee-server` |
+| G1 | **无任何入口层** | ✅ 已定（§2）：常驻 daemon + TCP/JSON-RPC 2.0 | 待建 `referee-harness` |
 | G2 | **无"实例"抽象与多实例管理** | ✅ 已定（§2）：InstanceManager + 崩溃恢复 | 待建 `instance.rs` / `persist` |
 | G3 | **无实例配置装载** | 无"一份实例配置 → 可运行实例"的组合入口 | 无法声明式创建实例 |
 | G4 | **无流式传输帧** | `StreamChunk` 非 serde，无跨进程帧定义 | 流式对话无法跨传输层 |
@@ -104,15 +104,15 @@
 
 ## 5. 阶段规划
 
-### Phase 1 — `referee-server` 核心（零新依赖）
+### Phase 1 — `referee-harness` 核心（零新依赖）
 
-落地 G1/G2/G3/G4/G6/G7/G8：新建 `referee-server` crate，含 `protocol` / `instance` /
+落地 G1/G2/G3/G4/G6/G7/G8：新建 `referee-harness` crate，含 `protocol` / `instance` /
 `persist`（JSONL 崩溃恢复）/ `transport`（TCP JSON-RPC 2.0）/ daemon 二进制，以及
-base 的 `persist` feature 会话落盘 sink。**详细执行见 [REFEREE_SERVER_IMPL.md](REFEREE_SERVER_IMPL.md)。**
+base 的 `persist` feature 会话落盘 sink。**详细执行见 [REFEREE_HARNESS_IMPL.md](REFEREE_HARNESS_IMPL.md)。**
 
 - 验收要点：多实例并行各自独立；实例列表含指标；stop/remove 干净回收；
   TCP 客户端单轮 + 流式往返；kill -9 后重启可恢复实例与已确认会话事实；
-  `cargo test -p referee-server` + `cargo clippy` 零告警；base 既有测试不回归。
+  `cargo test -p referee-harness` + `cargo clippy` 零告警；base 既有测试不回归。
 
 ### Phase 2 — HTTP + SSE（G9）
 
@@ -142,5 +142,5 @@ base 的 `persist` feature 会话落盘 sink。**详细执行见 [REFEREE_SERVER
 ## 7. 结论
 
 引擎与业务能力已完备，**缺的是入口层与"多实例"这个抽象**（G1/G2 为关键路径）。
-Phase 1 以零新依赖把 `referee-server` 核心落地，即可验收"多实例并行 + 管理 +
+Phase 1 以零新依赖把 `referee-harness` 核心落地，即可验收"多实例并行 + 管理 +
 非正常中断可恢复"；HTTP/SSE 与 Web/TUI 在 Phase 2 接入。

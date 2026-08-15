@@ -1,13 +1,13 @@
-# Referee Server — Phase 1 执行实现规划（referee-server 核心）
+# Referee Harness — Phase 1 执行实现规划（referee-harness 核心）
 
-> 本文档是 [REFEREE_SERVER_PLAN.md](REFEREE_SERVER_PLAN.md) 的 Phase 1 落地细化，
+> 本文档是 [REFEREE_HARNESS_PLAN.md](REFEREE_HARNESS_PLAN.md) 的 Phase 1 落地细化，
 > **只回答"每个文件怎么落地"**，不重复架构与决策（见 PLAN §2 决策记录）。
 
 ## 1. 范围与职责
 
 | 项 | 归属 | 说明 |
 |---|---|---|
-| 新建 crate | `referee-server`（workspace 第 4 个成员） | 依赖 agent/base/core，职责=入口/网关层 |
+| 新建 crate | `referee-harness`（workspace 第 4 个成员） | 依赖 agent/base/core，职责=入口/宿主层 |
 | 落地差距 | G1 / G2 / G3 / G4 / G6 / G7 / G8 | G9 留 P2、G5 留 P3 |
 | 配套改动 | `referee-ai-base` 新增 `persist` feature | 会话落盘 sink（默认关，零依赖） |
 | 硬约束 | 零新增依赖；不吞异常；背压有界 | 对齐项目内核哲学 |
@@ -15,7 +15,7 @@
 ## 2. 文件结构
 
 ```
-referee-server/
+referee-harness/
 ├── Cargo.toml
 ├── src/
 │   ├── lib.rs                # 库入口：重导出 protocol / instance / persist / transport
@@ -24,11 +24,11 @@ referee-server/
 │   ├── persist.rs            # §6 JSONL 持久化 + 崩溃恢复
 │   ├── transport.rs          # §7 TCP JSON-RPC 2.0（feature "tcp"）
 │   └── bin/
-│       └── referee-server.rs # §8 daemon 二进制入口
+│       └── referee-harness.rs # §8 daemon 二进制入口
 ├── referee-ai-base/（配套改动）
 │   └── src/session/log.rs    # §9 SessionLogSink + PersistedSessionLog（feature "persist"）
 └── tests/
-    └── server_test.rs        # §10 集成测试
+    └── harness_test.rs        # §10 集成测试
 ```
 
 模块职责边界：
@@ -42,10 +42,10 @@ referee-server/
 
 ```toml
 [package]
-name = "referee-server"
+name = "referee-harness"
 version = "0.1.0"
 edition = "2021"
-description = "Referee 智能体入口/网关层：常驻 daemon，多实例并行管理 + 崩溃恢复 + TCP JSON-RPC 2.0"
+description = "Referee Harness — 智能体入口/宿主层：常驻 daemon，多实例并行管理 + 崩溃恢复 + TCP JSON-RPC 2.0"
 
 [features]
 default = ["tcp", "deepseek"]
@@ -432,7 +432,7 @@ async fn dispatch(instances: &InstanceManager, persist: &Option<PersistStore>,
 **职责**：参数解析 + 装配 + 生命周期（启动/优雅关闭）。不含业务逻辑。
 
 ```rust
-// referee-server（daemon）
+// referee-harness（daemon）
 #[tokio::main]
 async fn main() {
     // 参数：--state-dir <dir>（默认 ~/.referee/state）、--bind <addr>（默认 127.0.0.1:7100）
@@ -479,7 +479,7 @@ impl PersistedSessionLog {
 未配置时走原有内存路径。`Instance::create`（§5）在配置 persist 时把 `PersistStore`
 适配为 `SessionLogSink` 注入。
 
-## 10. 集成测试（tests/server_test.rs）
+## 10. 集成测试（tests/harness_test.rs）
 
 | # | 用例 | 断言 |
 |---|---|---|
@@ -501,7 +501,7 @@ impl PersistedSessionLog {
 
 | 步骤 | 依赖 | 输出 |
 |---|---|---|
-| Step 1 | — | `referee-server/Cargo.toml` + `lib.rs` 骨架 |
+| Step 1 | — | `referee-harness/Cargo.toml` + `lib.rs` 骨架 |
 | Step 2 | — | `protocol.rs` 全部 serde 类型 + 单测 |
 | Step 3 | Step 2 | `instance.rs`：Instance + InstanceManager（MockProvider 直连） |
 | Step 4 | Step 3 | `persist.rs`：JSONL 持久化 + 恢复 |
@@ -514,11 +514,11 @@ impl PersistedSessionLog {
 
 ## 12. 验收标准
 
-1. `cargo build -p referee-server` 通过
-2. `cargo test -p referee-server` 13+ 集成测试通过
+1. `cargo build -p referee-harness` 通过
+2. `cargo test -p referee-harness` 13+ 集成测试通过
 3. `cargo test -p referee-ai-base` 既有测试不回归
-4. `cargo clippy -p referee-server --all-targets` 零告警
+4. `cargo clippy -p referee-harness --all-targets` 零告警
 5. `cargo clippy -p referee-ai-base --all-targets` 零新增告警
-6. 手动：`cargo run --bin referee-server -- --state-dir /tmp/test-state` 启动后，
+6. 手动：`cargo run --bin referee-harness -- --state-dir /tmp/test-state` 启动后，
    用 `nc`/`socat` 发 JSON-RPC 请求得到响应
 7. 手动：kill -9 后重启 → 实例恢复、历史对话可查

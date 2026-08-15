@@ -1,8 +1,8 @@
-# Referee Server — Phase 2 执行实现规划（HTTP + SSE）
+# Referee Harness — Phase 2 执行实现规划（HTTP + SSE）
 
-> 本文档是 [REFEREE_SERVER_PLAN.md](REFEREE_SERVER_PLAN.md) 的 **Phase 2 落地细化**，
+> 本文档是 [REFEREE_HARNESS_PLAN.md](REFEREE_HARNESS_PLAN.md) 的 **Phase 2 落地细化**，
 > 只回答"每个文件怎么落地"，不重复架构与决策（见 PLAN §2 决策记录、§5 Phase 2）。
-> 与 [REFEREE_SERVER_IMPL.md](REFEREE_SERVER_IMPL.md)（Phase 1）同风格，供开发执行。
+> 与 [REFEREE_HARNESS_IMPL.md](REFEREE_HARNESS_IMPL.md)（Phase 1）同风格，供开发执行。
 
 ## 1. 范围与职责
 
@@ -24,7 +24,7 @@
   `InstanceManager` 方法；HTTP 暴露 **REST 语义**（方法/路径/状态码），不复用
   JSON-RPC 的 `{method,params,id}` 帧。
 - **流式**：SSE，`POST /v1/instances/{id}/chat/stream`，事件 `data` 为
-  [`StreamFrame`](REFEREE_SERVER_IMPL.md#4-protocolrs--serde-协议类型)（Delta/Finish/Error）。
+  [`StreamFrame`](REFEREE_HARNESS_IMPL.md#4-protocolrs--serde-协议类型)（Delta/Finish/Error）。
 - **错误映射**：`ServerError.code` → HTTP 状态码（见 §6），响应体为统一 JSON 错误。
 - **daemon 装配**：`http` feature 开启时，daemon **同时**起 TCP + HTTP 两个监听器
   （同一 `InstanceManager` 实例），`--http-bind` 默认 `127.0.0.1:7101`。
@@ -33,7 +33,7 @@
 ## 3. 文件结构
 
 ```
-referee-server/
+referee-harness/
 ├── Cargo.toml                     # 新增 feature "http"（axum）
 ├── src/
 │   ├── lib.rs                     # #[cfg(feature="http")] pub mod http;
@@ -47,9 +47,9 @@ referee-server/
 │   │   ├── sse.rs                 # SSE 流式输出（chat/stream）
 │   │   └── handlers.rs           # 各路由处理器（只做编解码 + 委托）
 │   └── bin/
-│       └── referee-server.rs     # 装配：http feature 时追加 HTTP 监听
+│       └── referee-harness.rs     # 装配：http feature 时追加 HTTP 监听
 └── tests/
-    ├── server_test.rs             # 既有（不回归）
+    ├── harness_test.rs             # 既有（不回归）
     └── http_test.rs               # §9 HTTP/SSE 集成测试
 ```
 
@@ -241,7 +241,7 @@ async fn chat_stream(
   建议提取为 `protocol`/`instance` 的公共助手，TCP 与 HTTP 复用（避免双份实现）。
 - 中断 / 会话列表 / 管理类处理器直接委托 `InstanceManager`，无额外业务。
 
-## 9. daemon 装配（bin/referee-server.rs）
+## 9. daemon 装配（bin/referee-harness.rs）
 
 `http` feature 开启时，在 TCP 监听之外追加 HTTP 监听（同一 `InstanceManager` 实例与
 同一 `shutdown` 通道）：
@@ -309,11 +309,11 @@ TCP 客户端与 Web/TUI。
 
 ## 12. 验收标准
 
-1. `cargo build -p referee-server`（默认 feature）通过，且**不含 axum**（核心零依赖）。
-2. `cargo build -p referee-server --features http` 通过。
-3. `cargo test -p referee-server --features http`：Phase 1 既有用例 + Phase 2 新用例全绿。
-4. `cargo test -p referee-server`（无 http feature）：P1 用例不回归、可独立编译。
-5. `cargo clippy -p referee-server --all-targets --features http` 零告警。
-6. 手动：`referee-server --http-bind 127.0.0.1:7101` 后，`curl` 建实例、`curl -N` 流式
+1. `cargo build -p referee-harness`（默认 feature）通过，且**不含 axum**（核心零依赖）。
+2. `cargo build -p referee-harness --features http` 通过。
+3. `cargo test -p referee-harness --features http`：Phase 1 既有用例 + Phase 2 新用例全绿。
+4. `cargo test -p referee-harness`（无 http feature）：P1 用例不回归、可独立编译。
+5. `cargo clippy -p referee-harness --all-targets --features http` 零告警。
+6. 手动：`referee-harness --http-bind 127.0.0.1:7101` 后，`curl` 建实例、`curl -N` 流式
    对话、POST interrupt、GET sessions 均得预期响应。
 7. 手动：同一 daemon 同时开 TCP + HTTP，跨传输可见同一实例（SSE 流式 + JSON-RPC 单轮）。

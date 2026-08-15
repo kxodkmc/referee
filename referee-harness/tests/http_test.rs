@@ -1,6 +1,6 @@
-//! referee-server HTTP + SSE 集成测试（feature `http`）
+//! referee-harness HTTP + SSE 集成测试（feature `http`）
 //!
-//! 覆盖 REFEREE_SERVER_IMPL_P2.md §10 的 9 个用例。对话类用例用 MockProvider
+//! 覆盖 REFEREE_HARNESS_IMPL_P2.md §10 的 9 个用例。对话类用例用 MockProvider
 //! 直连（不触网）；管理类用例用真实 DeepSeek 构造（build_provider 不发起网络请求）。
 #![cfg(feature = "http")]
 
@@ -17,10 +17,10 @@ use referee_ai_base::provider::{
     ChatRequest, ChatResponse, FinishReason, LLMProvider, LlmError, Message, ProviderCapabilities,
     ProviderId, StreamChunk, TokenUsage,
 };
-use referee_server::http::serve_http;
-use referee_server::instance::{InstanceManager, InstanceManagerConfig};
-use referee_server::protocol::{InstanceSpec, InstanceTools, ProviderConfig};
-use referee_server::transport::serve_tcp;
+use referee_harness::http::serve_http;
+use referee_harness::instance::{InstanceManager, InstanceManagerConfig};
+use referee_harness::protocol::{InstanceSpec, InstanceTools, ProviderConfig};
+use referee_harness::transport::serve_tcp;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -163,7 +163,7 @@ async fn start_http(manager: InstanceManager) -> (SocketAddr, tokio::sync::watch
     (addr, tx)
 }
 
-/// TCP JSON-RPC 请求 → 响应帧列表（对齐 server_test 的 send_rpc）
+/// TCP JSON-RPC 请求 → 响应帧列表（对齐 harness_test 的 send_rpc）
 async fn send_rpc(addr: SocketAddr, method: &str, params: Value) -> Vec<Value> {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let (r, mut w) = stream.split();

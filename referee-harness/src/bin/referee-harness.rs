@@ -1,4 +1,4 @@
-//! referee-server 常驻 daemon 入口
+//! referee-harness 常驻 daemon 入口
 //!
 //! 职责：参数解析 + 装配（manager / persist / transport）+ 生命周期（启动/优雅关闭）。
 //! 不含业务逻辑。参数：
@@ -13,12 +13,12 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use referee_server::instance::{InstanceManager, InstanceManagerConfig};
-use referee_server::persist::PersistStore;
-use referee_server::protocol::{ServerError, ERR_INTERNAL};
-use referee_server::transport::serve_tcp;
+use referee_harness::instance::{InstanceManager, InstanceManagerConfig};
+use referee_harness::persist::PersistStore;
+use referee_harness::protocol::{ServerError, ERR_INTERNAL};
+use referee_harness::transport::serve_tcp;
 #[cfg(feature = "http")]
-use referee_server::http::serve_http;
+use referee_harness::http::serve_http;
 
 /// HTTP 监听缺省地址
 const DEFAULT_HTTP_BIND: &str = "127.0.0.1:7101";

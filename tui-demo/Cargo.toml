@@ -1,0 +1,9 @@
+[package]
+name = "tui-demo"
+version = "0.1.0"
+edition = "2021"
+description = "A simple Ratatui teaching page: learn TUI development in the terminal"
+
+[dependencies]
+ratatui   = "0.30"
+crossterm = "0.29"

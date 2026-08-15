@@ -1,4 +1,4 @@
-//! # Referee Server — 智能体入口 / 网关层（常驻 daemon）
+//! # Referee Harness — 智能体入口 / 宿主层（常驻 daemon）
 //!
 //! 把 referee（Rust 智能体库）做成可被 TUI / Web / CLI 调用的智能体服务，
 //! 支持**多个独立实例并行运行与管理、非正常中断可恢复**。
@@ -10,6 +10,7 @@
 //! - [`chat`]：对话公共助手（载荷构造 / 流收敛 / 帧映射，TCP 与 HTTP 复用）。
 //! - [`transport`]（feature `tcp`）：TCP JSON-RPC 2.0 网络 IO（仅调用 instance/persist）。
 //! - [`http`]（feature `http`）：HTTP + SSE 网络 IO（仅调用 instance/chat）。
+//! - [`tui`]（feature `tui`）：官方 TUI 客户端（JSON-RPC 客户端，连接 daemon）。
 //!
 //! 硬约束（继承 referee 内核哲学）：零新增依赖；不吞异常；背压有界。
 
@@ -21,6 +22,8 @@ pub mod protocol;
 pub mod transport;
 #[cfg(feature = "http")]
 pub mod http;
+#[cfg(feature = "tui")]
+pub mod tui;
 
 pub use instance::{Instance, InstanceManager, InstanceManagerConfig, InstanceStatus};
 pub use persist::{BrokenEntry, PersistError, PersistStore, RecoveryResult};
