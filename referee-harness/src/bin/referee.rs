@@ -1,42 +1,45 @@
-//! referee-harness 常驻 daemon 入口
+//! referee — 一条命令启动后端 + TUI（feature `tui`）
 //!
-//! 职责：参数解析 + 装配（`server::Server`）+ 生命周期（启动/优雅关闭）。
-//! 只启动后端监听器，不承载任何前端；前端（TUI / Web）经 TCP/HTTP 连接。
-//! 参数：
-//! - `--state-dir <dir>` 持久化目录（默认 `~/.referee/state`）
-//! - `--bind <addr>` TCP 监听地址（默认 `127.0.0.1:7100`）
-//! - `--http-bind [<addr>]` HTTP 监听地址（feature `http`；缺省 `127.0.0.1:7101`，
-//!   不传则禁用 HTTP）
-//! - `--max-instances <N>` 最大实例数（默认 64）
-//! - `--max-sessions <N>` 每实例最大会话数（默认 100）
+//! 职责：在当前目录启动后端监听器，并打开 TUI 前端连接该后端；自动把
+//! **当前目录**设为 TUI 创建实例的「工作区根」。
+//!
+//! 前后端分离：TUI 经 TCP 连接本进程内启动的后端（`server::Server`），
+//! 与 `referee-harness` 共用同一 JSON-RPC 协议；TUI 退出即优雅关闭后端。
+//! 纯常驻后端（供 Web 等其它 UI 连接）仍由 `referee-harness` 提供。
+//!
+//! 参数（与 referee-harness 一致，另加 `--no-root`）：
+//! - `--state-dir <dir>` / `--bind <addr>` / `--http-bind [<addr>]`
+//! - `--max-instances <N>` / `--max-sessions <N>`
+//! - `--no-root` 不自动注入当前目录为工作区根
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use referee_harness::server::{Server, ServerConfig};
 
 /// HTTP 监听缺省地址
 const DEFAULT_HTTP_BIND: &str = "127.0.0.1:7101";
 
-/// 已解析的 daemon 参数
+/// 已解析参数
 struct Args {
     state_dir: PathBuf,
     bind: SocketAddr,
     http_bind: Option<SocketAddr>,
     max_instances: usize,
     max_sessions: usize,
+    /// 是否注入当前目录为默认工作区根
+    use_root: bool,
 }
 
-fn main() {
+fn main() -> std::io::Result<()> {
     let args = parse_args();
     tracing_subscriber_env();
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    rt.block_on(async_main(args));
+    rt.block_on(async_main(args))
 }
 
-async fn async_main(args: Args) {
+async fn async_main(args: Args) -> std::io::Result<()> {
     // 1. 装配后端（manager + persist + 崩溃恢复）
     let server = Server::build(ServerConfig {
         state_dir: args.state_dir,
@@ -46,37 +49,34 @@ async fn async_main(args: Args) {
     })
     .await;
 
-    // 2. 优雅关闭信号
+    // 2. 后端生命周期：TUI 退出 → shutdown → 后端优雅关闭
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let shutdown_tx = Arc::new(shutdown_tx);
-    spawn_shutdown_handler(shutdown_tx.clone());
 
-    // 3. 并行启动监听器（同一 server 与同一 shutdown 通道）
+    // 3. 启动监听器（同一 server 与同一 shutdown 通道）
     let tcp_task = server.spawn_tcp(args.bind, shutdown_rx.clone());
 
-    // HTTP（P2，feature 门控）：--http-bind 指定则启用
     #[cfg(feature = "http")]
     let http_task = args.http_bind.map(|addr| server.spawn_http(addr, shutdown_rx));
 
-    // 4. 等待监听器退出（shutdown 触发优雅关闭）
-    let tcp_result = match tcp_task.await {
-        Ok(r) => r,
-        Err(e) => Err(referee_harness::protocol::ServerError::new(
-            referee_harness::protocol::ERR_INTERNAL,
-            format!("tcp task join: {e}"),
-        )),
+    // 4. 前台打开 TUI（连接本进程内后端），默认根 = 当前目录
+    let default_root = if args.use_root {
+        std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    } else {
+        None
     };
+    let tui_result = referee_harness::tui::run(args.bind, default_root).await;
 
+    // 5. TUI 退出 → 触发后端优雅关闭
+    let _ = shutdown_tx.send(true);
+    let _ = tcp_task.await;
     #[cfg(feature = "http")]
     if let Some(task) = http_task {
         let _ = task.await;
     }
 
-    if let Err(e) = tcp_result {
-        tracing::error!(error = %e, "server exited with error");
-        std::process::exit(1);
-    }
-    tracing::info!("server shut down gracefully");
+    tui_result
 }
 
 /// 参数解析（零依赖，手工扫描）
@@ -87,6 +87,7 @@ fn parse_args() -> Args {
     let mut http_bind: Option<SocketAddr> = None;
     let mut max_instances: usize = 64;
     let mut max_sessions: usize = 100;
+    let mut use_root = true;
 
     let mut i = 0;
     while i < args.len() {
@@ -100,7 +101,6 @@ fn parse_args() -> Args {
                 bind = args.get(i).and_then(|s| s.parse().ok());
             }
             "--http-bind" => {
-                // 可选值：紧跟可解析地址则消费之，否则用缺省地址
                 let next = args.get(i + 1).and_then(|s| s.parse::<SocketAddr>().ok());
                 if next.is_some() {
                     i += 1;
@@ -119,6 +119,7 @@ fn parse_args() -> Args {
                     max_sessions = n;
                 }
             }
+            "--no-root" => use_root = false,
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -138,27 +139,8 @@ fn parse_args() -> Args {
         http_bind,
         max_instances,
         max_sessions,
+        use_root,
     }
-}
-
-/// 信号处理：SIGINT / SIGTERM → 触发优雅关闭
-fn spawn_shutdown_handler(shutdown_tx: Arc<tokio::sync::watch::Sender<bool>>) {
-    tokio::spawn(async move {
-        #[cfg(unix)]
-        {
-            let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("install sigterm handler");
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = sigterm.recv() => {}
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
-        }
-        let _ = shutdown_tx.send(true);
-    });
 }
 
 /// 用户主目录（零依赖）
@@ -181,6 +163,6 @@ fn tracing_subscriber_env() {
 
 fn print_usage() {
     eprintln!(
-        "USAGE: referee-harness [--state-dir <dir>] [--bind <addr>] [--http-bind [<addr>]] [--max-instances <N>] [--max-sessions <N>]"
+        "USAGE: referee [--state-dir <dir>] [--bind <addr>] [--http-bind [<addr>]] [--max-instances <N>] [--max-sessions <N>] [--no-root]"
     );
 }

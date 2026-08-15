@@ -88,7 +88,11 @@ impl RpcClient {
 /// 流式聊天事件（后台任务经 mpsc 推给 UI）
 #[derive(Debug)]
 pub enum ChatEvent {
-    Delta { content: String },
+    /// 增量文本；`reasoning` 为思考内容（reasoning_content，可空）
+    Delta {
+        content: String,
+        reasoning: String,
+    },
     Finish { reason: String },
     Error { message: String },
 }
@@ -145,9 +149,15 @@ pub async fn open_chat_stream(
                 Err(_) => continue,
             };
             let done = match frame {
-                StreamFrame::Delta { content, .. } => {
+                StreamFrame::Delta {
+                    content,
+                    reasoning_content,
+                } => {
                     let _ = tx
-                        .send(ChatEvent::Delta { content: content.unwrap_or_default() })
+                        .send(ChatEvent::Delta {
+                            content: content.unwrap_or_default(),
+                            reasoning: reasoning_content.unwrap_or_default(),
+                        })
                         .await;
                     false
                 }

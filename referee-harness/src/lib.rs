@@ -18,6 +18,7 @@ pub mod chat;
 pub mod instance;
 pub mod persist;
 pub mod protocol;
+pub mod server;
 #[cfg(feature = "tcp")]
 pub mod transport;
 #[cfg(feature = "http")]

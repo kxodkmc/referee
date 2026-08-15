@@ -15,7 +15,7 @@ fn main() -> std::io::Result<()> {
         .enable_all()
         .build()
         .map_err(std::io::Error::other)?;
-    rt.block_on(referee_harness::tui::run(daemon))
+    rt.block_on(referee_harness::tui::run(daemon, None))
 }
 
 /// 解析 `--daemon <addr>`，缺省 `127.0.0.1:7100`。
