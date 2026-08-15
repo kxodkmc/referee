@@ -273,6 +273,7 @@ impl StreamAccumulator {
             reasoning_content,
             tool_calls,
             tool_call_id: None,
+            usage: self.usage.clone(),
         };
         Some((
             message,

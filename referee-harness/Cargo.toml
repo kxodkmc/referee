@@ -1,0 +1,58 @@
+[package]
+name = "referee-harness"
+version = "0.1.0"
+edition = "2021"
+description = "Referee Harness — 智能体入口/宿主层：常驻 daemon，多实例并行管理 + 崩溃恢复 + TCP JSON-RPC 2.0"
+license = "MIT"
+
+[features]
+default = ["tcp", "deepseek"]
+# 传输层：TCP JSON-RPC 2.0 over NDJSON（默认开）
+tcp = []
+# HTTP + SSE（默认关、核心零依赖；对齐 mcp-stdio 按需拓展模式）
+http = ["dep:axum"]
+# 官方 TUI 客户端（默认关、按需拓展；对齐 http / mcp-stdio 模式）
+tui = ["dep:ratatui", "dep:unicode-width"]
+# 厂商适配器（转发到 agent/base）
+deepseek = ["referee-agent/deepseek"]
+xiaomi   = ["referee-agent/xiaomi"]
+openai   = ["referee-agent/openai"]
+
+[dependencies]
+referee-core    = { path = "../referee-core" }
+referee-ai-base = { path = "../referee-ai-base", features = ["persist"] }
+referee-agent   = { path = "../referee-agent", default-features = false }
+# 仅 feature "http" 时编译；核心（无 http feature）不含 axum 及其传递依赖
+axum = { version = "0.8", optional = true }
+# 仅 feature "tui" 时编译；默认构建不含 ratatui（crossterm 经 ratatui 再导出）
+ratatui = { version = "0.30", optional = true }
+# TUI 手动换行（CJK 宽度计算）；仅 feature "tui" 时编译
+unicode-width = { version = "0.2", optional = true }
+tokio           = { version = "1", features = ["full"] }
+serde           = { version = "1", features = ["derive"] }
+serde_json      = "1"
+thiserror       = "1"
+tracing         = "0.1"
+dashmap         = "6"
+uuid            = { version = "1", features = ["v4", "serde"] }
+futures         = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tracing-subscriber = "0.3"
+async-trait = "0.1"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+[[bin]]
+name = "referee-harness"
+path = "src/bin/referee-harness.rs"
+
+[[bin]]
+name = "referee-tui"
+path = "src/bin/referee-tui.rs"
+required-features = ["tui"]
+
+[[bin]]
+name = "referee"
+path = "src/bin/referee.rs"
+required-features = ["tui"]

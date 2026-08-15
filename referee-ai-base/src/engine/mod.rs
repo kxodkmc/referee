@@ -26,6 +26,7 @@ use std::time::Duration;
 use dashmap::DashMap;
 use futures::stream::BoxStream;
 use futures::FutureExt;
+use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tracing::Instrument;
 
@@ -45,7 +46,7 @@ pub mod stream;
 pub use session_mgmt::{ReaperHandle, SessionPhase, SessionSnapshot};
 
 /// 引擎配置
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
     /// 会话级配置模板（每个新 Session 继承）
     pub session: SessionConfig,
@@ -260,6 +261,30 @@ impl Engine {
         session_mgmt::list_sessions(&self.sessions)
     }
 
+    /// 回放已确认的会话事实到指定会话历史（崩溃恢复用）
+    ///
+    /// 自动创建会话（受 `max_sessions` 有界约束）；逐条 `push_history`，
+    /// 返回成功追加条数。用于恢复到已确认前缀（不触发 LLM，忠实重建上下文）。
+    pub fn replay_history(
+        &self,
+        session_id: SessionId,
+        messages: Vec<crate::provider::Message>,
+    ) -> Result<usize, String> {
+        if !self.ensure_session(session_id) {
+            return Err("max sessions reached, cannot restore session".into());
+        }
+        let mut n = 0usize;
+        if let Some(mut s) = self.sessions.get_mut(&session_id) {
+            for m in messages {
+                match s.push_history(m) {
+                    Ok(()) => n += 1,
+                    Err(_) => break, // 容量满：停止，保留已恢复前缀
+                }
+            }
+        }
+        Ok(n)
+    }
+
     /// 查询单个会话的运行快照（不存在返回 None）
     pub fn session_info(&self, session_id: SessionId) -> Option<SessionSnapshot> {
         self.sessions
@@ -396,7 +421,7 @@ impl Engine {
         }
         self.sessions
             .entry(session_id)
-            .or_insert_with(|| Session::new(self.config.session.clone()));
+            .or_insert_with(|| Session::new(self.config.session.clone()).with_session_id(session_id));
         true
     }
 

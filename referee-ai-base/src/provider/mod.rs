@@ -16,15 +16,18 @@
 //! ## 可拓展性
 //! - 新增 OpenAI 兼容厂商 = 新增 `provider/<vendor>.rs` 配置 [`crate::provider::openai_compat::OpenAiCompatClient`]
 //! - 新增非兼容厂商（Anthropic / Responses）= 新增独立 HTTP/JSON 映射实现
-//! - 多模态：[`MessageContent`] 当前仅 `Text` 变体；后续 Phase 增加 `Multimodal(Vec<ContentPart>)`
-//!   变体即可，不破坏既有调用方（[`MessageContent::as_text`] 优雅降级）
+//! - 多模态：[`MessageContent`] 的 `Multimodal(Vec<ContentPart>)` 变体承载图片/
+//!   音频/视频，既有调用方经 [`MessageContent::as_text`] 优雅降级（返回 None）
 
+pub mod content;
 pub mod openai_compat;
 
 #[cfg(feature = "deepseek")]
 pub mod deepseek;
 #[cfg(feature = "xiaomi")]
 pub mod xiaomi;
+
+pub use content::{ContentPart, MediaResolution, MediaSource, VideoParams};
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -84,6 +87,39 @@ pub struct ProviderCapabilities {
     pub usage_reported: bool,
     /// 单次响应最大输出 token 数
     pub max_output_tokens: usize,
+    /// 多模态能力声明（图片/音频/视频/文件上传）— 上层据此降级
+    pub multimodal: MultimodalCapabilities,
+}
+
+/// 多模态能力声明 — 驱动上层自动降级（如厂商不支持视频 → 组装时拒绝或降级为文本）
+///
+/// 默认全部关闭（`MultimodalCapabilities::NONE`），零成本，不改变既有厂商行为。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MultimodalCapabilities {
+    /// 是否支持图片输入
+    pub image: bool,
+    /// 是否支持音频输入
+    pub audio: bool,
+    /// 是否支持视频输入
+    pub video: bool,
+    /// 是否需要先上传文件、再以文件 ID 引用（Kimi 视频）而非 URL/base64 直传
+    pub file_upload: bool,
+}
+
+impl Default for MultimodalCapabilities {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+impl MultimodalCapabilities {
+    /// 全部关闭（const，可在 `static`/`const` 上下文中使用）
+    pub const NONE: Self = Self {
+        image: false,
+        audio: false,
+        video: false,
+        file_upload: false,
+    };
 }
 
 // ───────────────────────────────────────────────
@@ -100,17 +136,20 @@ pub enum Role {
     Tool,
 }
 
-/// 消息内容 — 当前仅文本；多模态在后续 Phase 通过新增变体扩展
+/// 消息内容 — 纯文本或由多个多模态片段组成的数组
 ///
 /// 序列化规则：`Text` → JSON 字符串（OpenAI 简写形式）；
-/// 未来 `Multimodal` → JSON 数组形式（OpenAI 多模态标准）。
+/// `Multimodal` → JSON 数组形式（OpenAI 多模态标准，见 [`ContentPart`]）。
 /// 既有调用方通过 [`MessageContent::as_text`] 优雅处理新增变体。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// 含多模态片段（内含浮点 `fps`），故仅实现 `PartialEq`（不实现 `Eq`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MessageContent {
     /// 纯文本（OpenAI `content: "..."` 简写形式）
     Text(String),
-    // 预留：Multimodal(Vec<ContentPart>) — 后续 Phase 启用图像/音频/视频
+    /// 多模态内容（OpenAI `content: [...]` 数组形式，含图片/音频/视频/文本）
+    Multimodal(Vec<ContentPart>),
 }
 
 impl MessageContent {
@@ -118,11 +157,16 @@ impl MessageContent {
         Self::Text(s.into())
     }
 
+    /// 多模态内容（图片/音频/视频/文本片段组合）
+    pub fn multimodal(parts: Vec<ContentPart>) -> Self {
+        Self::Multimodal(parts)
+    }
+
     /// 取文本内容；非文本变体返回 None（多模态扩展后仍向后兼容）
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Self::Text(s) => Some(s),
-            // 后续变体在此匹配返回 None，保证既有调用方不破坏
+            Self::Multimodal(_) => None,
         }
     }
 }
@@ -144,7 +188,9 @@ impl From<&str> for MessageContent {
 /// `reasoning_content` 字段对深度思考厂商（MiMo / DeepSeek）必需：
 /// 多轮对话中带工具调用时，回传的 assistant 消息必须完整保留
 /// `reasoning_content`，否则 API 返回 400。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// 含多模态内容（浮点 `fps`），故仅实现 `PartialEq`（不实现 `Eq`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: MessageContent,
@@ -157,6 +203,9 @@ pub struct Message {
     /// 工具结果消息对应的工具调用 ID（role=Tool 时必需）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// 本轮用量（消息元数据，供 observe / 审计）；回传请求时自动省略
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TokenUsage>,
 }
 
 impl Message {
@@ -167,6 +216,7 @@ impl Message {
             reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
+            usage: None,
         }
     }
 
@@ -177,6 +227,7 @@ impl Message {
             reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
+            usage: None,
         }
     }
 
@@ -187,6 +238,7 @@ impl Message {
             reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
+            usage: None,
         }
     }
 }
@@ -318,6 +370,12 @@ pub struct TokenUsage {
     /// 输入缓存未命中 token 数（DeepSeek）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_cache_miss_tokens: Option<usize>,
+    /// 输入缓存命中 token 数（归一化视角：read；DeepSeek hit→read）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<usize>,
+    /// 输入缓存写入 token 数（归一化视角：write；DeepSeek miss→write）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<usize>,
 }
 
 /// 一次性（非流式）响应

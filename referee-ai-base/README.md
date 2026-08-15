@@ -1,20 +1,20 @@
 # Referee AI Base — Agent 核心支撑层（地基）
 
 业务无关的**基础 AI 设施**积木，提供「接 LLM → 组装 prompt → 调工具 → 管预算 →
-回复」的最小闭环，并在此基础上提供**流式输出**与**会话生命周期管理**（快照 / 枚举 /
-删除 / 空闲回收）。不预置记忆、MCP、Skills 等业务策略；业务化、开箱即用的完整 Agent
-封装在 `referee-agent`。
+回复」的最小闭环，并在此基础上提供**流式输出**、**会话生命周期管理**（快照 / 枚举 /
+删除 / 空闲回收）、**提示词分段编排**与**用量/缓存命中计量**。不预置记忆、MCP、Skills
+等业务策略；业务化、开箱即用的完整 Agent 封装在 `referee-agent`。
 
 ## 模块
 
 | 模块 | 职责 |
 |------|------|
-| `provider` | 厂商唯一 I/O 边界：`LLMProvider` trait、纯数据模型、错误归一与重试、能力声明、OpenAI 兼容底座 + 厂商适配器 |
+| `provider` | 厂商唯一 I/O 边界：`LLMProvider` trait、纯数据模型、错误归一与重试、能力声明、OpenAI 兼容底座 + 厂商适配器；`TokenUsage` 含输入/输出/推理/**缓存命中计量**（`cache_read/write_tokens`） |
 | `session` | 会话状态机（Idle/Thinking/AwaitingCalls）、超时、终态自管（`run_turn`） |
-| `tool` | 工具抽象 `Tool` + 有界注册表 + 并行/截断/panic 隔离/超时执行器 + 同步/异步派发（`wait` 分流） |
+| `tool` | 工具抽象 `Tool` + 有界注册表 + 并行/截断/panic 隔离/超时执行器 + 同步/异步派发（`wait` 分流）+ **白名单过滤**（`declarations_visible`） |
 | `store` | 通用有界 KV 存储抽象（成果/大结果落库），后端可替换 |
 | `budget` | Token 预算治理（Session 级 + 全局共享计数器） |
-| `prompt` | 提示词组装与优先级截断（杜绝 Prompt 爆炸），`PromptParts` 统一参数封装 |
+| `prompt` | **提示词分段编排**：`SystemSection`（稳定/易变 + 空则省略）+ `assemble`（条件省略 → 稳定排前 → 预算截断）；`build_prompt` 兼容保留 |
 | `cache` | LRU + TTL 语义缓存，流式一致性合成 |
 | `observe` | 可观测门面（tracing span、metrics、计时、LLM 重试计数） |
 | `engine` | 会话引擎：最小闭环收敛到单任务顺序异步流程；流式输出（`chat_stream`）与会话生命周期管理（快照/枚举/删除/空闲回收） |
@@ -42,6 +42,46 @@ if let referee_ai_base::EngineReply::Streaming(mut chunks) = handle.wait().await
     }
 }
 ```
+
+## 提示词分段编排
+
+`prompt::assemble` 是提示词组装的核心入口，把系统提示词拆成多个 **`SystemSection`**，
+按"稳定内容在前、易变内容靠后"编排（这是 DeepSeek 前缀单元与 Anthropic 前缀缓存
+共同命中的根本前提），并做**条件省略**与**预算截断**：
+
+```rust
+use referee_ai_base::prompt::{assemble, AssembleParts, SystemSection};
+
+let req = assemble(AssembleParts {
+    sections: vec![
+        // 稳定段（进缓存前缀，排前）
+        SystemSection::stable("你是助手。"),
+        // 易变段（每轮变化，排后；空则省略 → "没启用的能力就不注入"）
+        SystemSection { stable: false, text: skill_text, omit_if_empty: true },
+    ],
+    tools, history, temperature, max_tokens, thinking, prompt_budget,
+});
+```
+
+- **条件省略**：`omit_if_empty` 为真且文本为空 → 整段丢弃。工具 / 技能 / MCP 等能力
+  段据此实现"没启用就不注入"。
+- **预算截断**：与 `build_prompt` 共享同一套流程（System 按字符兜底、Tools 整段、
+  History 滑动窗口），保证截断后总量恒 ≤ 预算。
+- **兼容**：`build_prompt(PromptParts)` 保留，内部委托同一截断逻辑。
+
+## 用量与缓存命中计量
+
+- **`TokenUsage`**：除输入/输出/总 token 外，记录推理 token 与缓存命中。
+  DeepSeek 的 `prompt_cache_hit_tokens`（命中）归一化为 `cache_read_tokens`、
+  `prompt_cache_miss_tokens`（未命中）归一化为 `cache_write_tokens`。
+- **`Message::usage`**：每条消息携带本轮用量（供 observe / 审计），随会话历史留存；
+  回传请求时自动省略，不污染厂商协议。
+
+## 工具白名单过滤
+
+`ToolRegistry::declarations_visible(allowed, depth, max_depth)` 在导出工具声明时
+按**白名单** + **子 Agent 深度**复合过滤：`allowed=None` 继承全部，`Some(集合)`
+仅导出命中者。用于 per-Agent 能力白名单（"没启用的工具不进提示词"）。
 
 ## 流式与会话生命周期
 
@@ -78,6 +118,7 @@ if let referee_ai_base::EngineReply::Streaming(mut chunks) = handle.wait().await
 ## 验证
 
 ```bash
-cargo test -p referee-ai-base
+cargo test -p referee-ai-base            # 121 条
+cargo test -p referee-ai-base prompt     # 提示词分段编排（assemble / 截断 / 稳定性排序）
 cargo clippy -p referee-ai-base --all-targets -- -D warnings
 ```

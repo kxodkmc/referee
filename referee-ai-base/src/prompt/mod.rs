@@ -148,7 +148,36 @@ impl PromptFragment {
     }
 }
 
-/// 提示词组装参数 — 碎片参数统一封装，新增参数不破坏既有调用方
+/// 系统提示词片段 — 一个可独立省略、并参与缓存排序的 system 片段
+///
+/// 分段组装的核心：**稳定内容排前、易变内容靠后**，是 DeepSeek 前缀单元与
+/// Anthropic 前缀缓存共同命中的根本前提。`omit_if_empty = true` 时，空片段
+/// 整体省略（实现"没启用的能力就不注入"）。
+#[derive(Debug, Clone)]
+pub struct SystemSection {
+    /// 稳定片段（进缓存前缀，排前）；false = 每轮易变（排后，破缓存）
+    pub stable: bool,
+    pub text: String,
+    /// 空则整体省略
+    pub omit_if_empty: bool,
+}
+
+impl SystemSection {
+    pub fn new(stable: bool, text: impl Into<String>) -> Self {
+        Self {
+            stable,
+            text: text.into(),
+            omit_if_empty: false,
+        }
+    }
+
+    /// 空则省略的稳定片段
+    pub fn stable(text: impl Into<String>) -> Self {
+        Self::new(true, text)
+    }
+}
+
+/// 提示词组装参数（legacy）— 碎片参数统一封装，新增参数不破坏既有调用方
 pub struct PromptParts {
     /// 系统提示词（最高优先级，最后保留）
     pub system: Option<Message>,
@@ -163,10 +192,79 @@ pub struct PromptParts {
     pub prompt_budget: usize,
 }
 
-/// 组装并截断 Prompt，生成最终 `ChatRequest`
+/// 分段组装参数 — 编排器入口
+pub struct AssembleParts {
+    /// 系统片段（已由上层按能力准备；编排器按稳定性精排 + 空则省略）
+    pub sections: Vec<SystemSection>,
+    pub tools: Vec<ToolDeclaration>,
+    pub history: Vec<Message>,
+    pub temperature: Option<f32>,
+    pub max_tokens: Option<usize>,
+    pub thinking: ThinkingConfig,
+    /// 上下文 Token 预算上限（0 = 不截断）
+    pub prompt_budget: usize,
+}
+
+/// 分段编排：条件省略 → 稳定性排序（稳定在前）→ 预算截断 → `ChatRequest`
 ///
 /// 返回的 `ChatRequest` 保证：片段总估算 ≤ `prompt_budget`（System 按字符
 /// 截断兜底，其余按优先级丢弃）。
+pub fn assemble(parts: AssembleParts) -> ChatRequest {
+    let AssembleParts {
+        sections,
+        tools,
+        history,
+        temperature,
+        max_tokens,
+        thinking,
+        prompt_budget,
+    } = parts;
+
+    // 1. 条件省略：空片段丢弃
+    let kept: Vec<SystemSection> = sections
+        .into_iter()
+        .filter(|s| !(s.omit_if_empty && s.text.trim().is_empty()))
+        .collect();
+
+    // 2. 稳定性排序：稳定片段在前（保持各自相对顺序），易变片段在后
+    let mut stable: Vec<String> = Vec::new();
+    let mut volatile: Vec<String> = Vec::new();
+    for s in kept {
+        if s.stable {
+            stable.push(s.text);
+        } else {
+            volatile.push(s.text);
+        }
+    }
+    let mut system_text = String::new();
+    for part in stable.into_iter().chain(volatile) {
+        if !system_text.is_empty() {
+            system_text.push('\n');
+        }
+        system_text.push_str(&part);
+    }
+    let system = if system_text.is_empty() {
+        None
+    } else {
+        Some(Message::system(system_text))
+    };
+
+    finalize(
+        system,
+        tools,
+        history,
+        Vec::new(),
+        Vec::new(),
+        temperature,
+        max_tokens,
+        thinking,
+        prompt_budget,
+    )
+}
+
+/// 组装并截断 Prompt，生成最终 `ChatRequest`（legacy 入口）
+///
+/// 委托 [`finalize`]，与 [`assemble`] 共享同一套截断逻辑。
 pub fn build_prompt(parts: PromptParts) -> ChatRequest {
     let PromptParts {
         system,
@@ -180,6 +278,34 @@ pub fn build_prompt(parts: PromptParts) -> ChatRequest {
         prompt_budget,
     } = parts;
 
+    finalize(
+        system,
+        tools,
+        history,
+        memory,
+        artifacts,
+        temperature,
+        max_tokens,
+        thinking,
+        prompt_budget,
+    )
+}
+
+/// 统一截断与组装 — 按优先级截断，生成 `ChatRequest`
+///
+/// 返回的 `ChatRequest` 保证：片段总估算 ≤ `prompt_budget`（System 按字符
+/// 截断兜底，其余按优先级丢弃）。
+fn finalize(
+    system: Option<Message>,
+    tools: Vec<ToolDeclaration>,
+    history: Vec<Message>,
+    memory: Vec<Message>,
+    artifacts: Vec<Message>,
+    temperature: Option<f32>,
+    max_tokens: Option<usize>,
+    thinking: ThinkingConfig,
+    prompt_budget: usize,
+) -> ChatRequest {
     // 预算 0 = 不截断
     if prompt_budget == 0 {
         let mut messages = Vec::with_capacity(history.len() + memory.len() + artifacts.len());
@@ -290,6 +416,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
+            usage: None,
         }
     }
 
@@ -501,5 +628,93 @@ mod tests {
         );
         assert_eq!(req.temperature, Some(0.7));
         assert_eq!(req.max_tokens, Some(256));
+    }
+
+    // ── assemble：分段编排器 ─────────────────────────
+
+    fn assemble_one(sections: Vec<SystemSection>, budget: usize) -> ChatRequest {
+        assemble(AssembleParts {
+            sections,
+            tools: vec![],
+            history: vec![msg(Role::User, "hi")],
+            temperature: None,
+            max_tokens: None,
+            thinking: ThinkingConfig::default(),
+            prompt_budget: budget,
+        })
+    }
+
+    #[test]
+    fn assemble_omits_empty_sections() {
+        // omit_if_empty + 空文本 → 整段省略；非空段保留
+        let req = assemble_one(
+            vec![
+                SystemSection::stable("identity"),
+                SystemSection {
+                    stable: true,
+                    text: "   ".into(),
+                    omit_if_empty: true,
+                },
+                SystemSection {
+                    stable: false,
+                    text: "volatile".into(),
+                    omit_if_empty: false,
+                },
+            ],
+            0,
+        );
+        let sys = &req.messages[0];
+        let text = sys.content.as_text().unwrap();
+        assert!(text.contains("identity"));
+        assert!(text.contains("volatile"));
+        assert!(!text.contains("   \n"));
+    }
+
+    #[test]
+    fn assemble_orders_stable_first() {
+        // 易变片段即便先传入，也排在稳定片段之后（缓存前缀铁律）
+        let req = assemble_one(
+            vec![
+                SystemSection {
+                    stable: false,
+                    text: "volatile".into(),
+                    omit_if_empty: false,
+                },
+                SystemSection::stable("stable-a"),
+                SystemSection::stable("stable-b"),
+            ],
+            0,
+        );
+        let text = req.messages[0].content.as_text().unwrap();
+        let stable_a = text.find("stable-a").unwrap();
+        let stable_b = text.find("stable-b").unwrap();
+        let volatile = text.find("volatile").unwrap();
+        assert!(stable_a < volatile, "stable-a must precede volatile");
+        assert!(stable_b < volatile, "stable-b must precede volatile");
+        assert!(stable_a < stable_b, "stable-a before stable-b (stable order kept)");
+    }
+
+    #[test]
+    fn assemble_empty_system_means_no_system_message() {
+        // 全空且 omit → system 为 None，仅 history
+        let req = assemble_one(
+            vec![SystemSection {
+                stable: true,
+                text: String::new(),
+                omit_if_empty: true,
+            }],
+            0,
+        );
+        assert!(req.messages.iter().all(|m| m.role != Role::System));
+        assert_eq!(req.messages.len(), 1, "only history remains");
+    }
+
+    #[test]
+    fn assemble_respects_budget() {
+        // 稳定段超预算 → 按字符截断兜底（System 绝不整段丢弃）
+        let req = assemble_one(vec![SystemSection::stable(&text_of_tokens(500))], 100);
+        let sys = req.messages[0].content.as_text().unwrap();
+        assert!(sys.ends_with("[Truncated]"));
+        assert!(TokenEstimator::estimate(sys) <= 100);
     }
 }

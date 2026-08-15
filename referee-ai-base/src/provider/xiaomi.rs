@@ -171,6 +171,17 @@ impl XiaomiProvider {
                 streaming: true,
                 usage_reported: true,
                 max_output_tokens: MAX_OUTPUT_TOKENS,
+                multimodal: match model {
+                    // `mimo-v2.5-pro`：纯文本 + 深度思考 + 工具调用，无多模态
+                    XiaomiModel::MimoV25Pro => crate::provider::MultimodalCapabilities::NONE,
+                    // `mimo-v2.5`：pro 能力 + 全模态（图片/音频/视频，URL 直传）
+                    XiaomiModel::MimoV25 => crate::provider::MultimodalCapabilities {
+                        image: true,
+                        audio: true,
+                        video: true,
+                        file_upload: false,
+                    },
+                },
             },
             provider_id,
         })

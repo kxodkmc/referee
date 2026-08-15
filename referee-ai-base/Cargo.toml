@@ -15,6 +15,8 @@ deepseek  = []
 openai    = []
 anthropic = []
 responses = []
+# 会话事实落盘 sink（可插拔，零新增依赖；默认关，不改变既有行为）
+persist   = []
 
 [dependencies]
 referee-core = { path = "../referee-core" }

@@ -4,10 +4,18 @@
 
 pub mod agent_tool;
 pub mod artifact_reader;
+pub mod edit;
+pub mod fs_common;
+pub mod read;
+pub mod write;
 #[cfg(feature = "mcp-stdio")]
 pub mod mcp;
 
 pub use agent_tool::AgentTool;
 pub use artifact_reader::{ArtifactReader, ListMyBoard};
+pub use edit::EditTool;
+pub use fs_common::FsConfig;
+pub use read::{ReadTool, ReadToolConfig};
+pub use write::WriteTool;
 #[cfg(feature = "mcp-stdio")]
 pub use mcp::{McpClient, McpError, McpServer, McpServerConfig, McpToolClient, MrtrStrategy};

@@ -44,6 +44,7 @@ fn caps() -> &'static ProviderCapabilities {
         streaming: false,
         usage_reported: true,
         max_output_tokens: 1024,
+        multimodal: crate::provider::MultimodalCapabilities::NONE,
     };
     &C
 }
@@ -59,6 +60,7 @@ fn resp(text: &str, tool_calls: Vec<crate::provider::ToolCall>) -> ChatResponse 
             reasoning_content: None,
             tool_calls,
             tool_call_id: None,
+            usage: None,
         },
         finish_reason: if has_tools {
             FinishReason::ToolCalls
@@ -877,6 +879,7 @@ fn caps_streaming() -> &'static ProviderCapabilities {
         streaming: true,
         usage_reported: true,
         max_output_tokens: 1024,
+        multimodal: crate::provider::MultimodalCapabilities::NONE,
     };
     &C
 }
@@ -1057,6 +1060,7 @@ fn caps_serial() -> &'static ProviderCapabilities {
         streaming: false,
         usage_reported: true,
         max_output_tokens: 1024,
+        multimodal: crate::provider::MultimodalCapabilities::NONE,
     };
     &C
 }

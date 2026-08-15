@@ -40,11 +40,15 @@
 //! - **busy 拒绝显式可见**（第 4 条）：返回 `Busy` 回信，不静默 `Err`
 //! - **handle 内零阻塞**（第 8 条）：handle 只做状态转移 + spawn
 
+pub mod log;
 pub mod message;
 pub mod task;
 pub mod timeout;
 
 // 便捷重导出
+pub use log::{LogError, SessionLog};
+#[cfg(feature = "persist")]
+pub use log::{PersistedSessionLog, SessionLogSink};
 pub use message::{ChatOptions, ChatPayload, SessionId, SessionMessage, SessionReply};
 pub use task::{run_turn, TurnOutcome};
 pub use timeout::TimeoutConfig;
@@ -55,7 +59,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
+
+use serde::{Deserialize, Serialize};
 
 use crate::budget::tokens_from_response;
 use crate::provider::{ChatRequest, ChatResponse, Message, ToolCall};
@@ -115,10 +121,12 @@ pub enum ToolCallAction {
 }
 
 /// 会话配置 — 每会话独立（从 AgentConfig 模板派生）
-#[derive(Debug, Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SessionConfig {
     /// history 最大消息数（有界，FIFO 淘汰最旧）
     pub max_history: usize,
+    /// 会话事实日志上限（同时受 `max_history` 窗口约束，超限返回 `CapacityExceeded`）
+    pub max_events: usize,
     /// 超时配置
     pub timeout: TimeoutConfig,
     /// 默认采样温度
@@ -131,18 +139,42 @@ pub struct SessionConfig {
     pub default_system_prompt: Option<String>,
     /// 会话空闲超时（None = 永不超时，默认）。超时后由空闲回收任务移除 Idle 会话。
     pub idle_timeout: Option<Duration>,
+    /// 【persist】可插拔会话事实落盘 sink（默认 None；运行时注入，不参与序列化）
+    #[cfg(feature = "persist")]
+    #[serde(skip)]
+    pub log_sink: Option<Arc<dyn SessionLogSink>>,
+}
+
+impl std::fmt::Debug for SessionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("SessionConfig");
+        d.field("max_history", &self.max_history)
+            .field("max_events", &self.max_events)
+            .field("timeout", &self.timeout)
+            .field("default_temperature", &self.default_temperature)
+            .field("default_max_tokens", &self.default_max_tokens)
+            .field("prompt_budget_tokens", &self.prompt_budget_tokens)
+            .field("default_system_prompt", &self.default_system_prompt)
+            .field("idle_timeout", &self.idle_timeout);
+        #[cfg(feature = "persist")]
+        d.field("has_log_sink", &self.log_sink.is_some());
+        d.finish()
+    }
 }
 
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             max_history: 50,
+            max_events: 4096,
             timeout: TimeoutConfig::default(),
             default_temperature: None,
             default_max_tokens: None,
             prompt_budget_tokens: 8000,
             default_system_prompt: None,
             idle_timeout: None,
+            #[cfg(feature = "persist")]
+            log_sink: None,
         }
     }
 }
@@ -164,7 +196,10 @@ pub struct RoundStart {
 /// I/O（LLM 调用、reply）由 `AgentRuntime` 在派生任务中执行。
 pub struct Session {
     pub state: SessionState,
-    history: VecDeque<Message>,
+    /// 会话事实源（append-only，有界，超限返回 CapacityExceeded，绝不静默丢弃）
+    log: SessionLog,
+    /// 本会话标识（persist 落盘按会话分文件用；默认 nil，经 `with_session_id` 注入）
+    session_id: SessionId,
     turn_id: u64,
     config: SessionConfig,
     /// 回合级取消标志（回合内持续有效，`start_round` 时重置）。
@@ -201,7 +236,7 @@ impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Session")
             .field("state", &self.state)
-            .field("history_len", &self.history.len())
+            .field("history_len", &self.history_len())
             .field("turn_id", &self.turn_id)
             .field("has_pending_reply", &self.pending_reply.is_some())
             .field("consumed_tokens", &self.consumed_tokens)
@@ -212,10 +247,10 @@ impl std::fmt::Debug for Session {
 impl Session {
     /// 创建新会话
     pub fn new(config: SessionConfig) -> Self {
-        let cap = config.max_history.min(64);
         Self {
             state: SessionState::Idle,
-            history: VecDeque::with_capacity(cap),
+            log: SessionLog::new(config.max_events),
+            session_id: SessionId::nil(),
             turn_id: 0,
             config,
             interrupt: Arc::new(AtomicBool::new(false)),
@@ -228,6 +263,12 @@ impl Session {
         }
     }
 
+    /// 注入会话标识（persist 落盘按会话分文件用；引擎在创建时调用）
+    pub fn with_session_id(mut self, id: SessionId) -> Self {
+        self.session_id = id;
+        self
+    }
+
     /// 当前轮次 ID（单调递增）
     pub fn turn_id(&self) -> u64 {
         self.turn_id
@@ -238,9 +279,9 @@ impl Session {
         !matches!(self.state, SessionState::Idle)
     }
 
-    /// 当前 history 长度
+    /// 当前模型可见历史长度（`min(事实数, max_history)`，与窗口语义一致）
     pub fn history_len(&self) -> usize {
-        self.history.len()
+        self.log.tail(self.config.max_history).len()
     }
 
     /// 本会话的子智能体嵌套深度（0 = 主调用；经子 Agent 工具调用时递增）
@@ -318,6 +359,11 @@ impl Session {
         if self.is_busy() {
             return None;
         }
+        // 事实源写入放在状态变更之前：容量耗尽时拒绝本轮，不污染状态机
+        if let Err(e) = self.push_history(message) {
+            warn!(error = ?e, "start_round: session fact log full, round rejected");
+            return None;
+        }
         // 新回合：清零上一回合遗留的中断标志
         self.interrupt.store(false, Ordering::Relaxed);
         self.last_active = Instant::now();
@@ -328,7 +374,6 @@ impl Session {
             turn_id,
             cancel: Some(cancel_tx),
         };
-        self.push_history(message);
         self.last_chat_options = options.clone();
         // 记录本轮子智能体嵌套深度（框架内部字段，回合内 resume 保持不变）
         self.peer_depth = peer_depth;
@@ -404,7 +449,10 @@ impl Session {
                     self.consumed_tokens += tokens_from_response(&resp);
                 }
                 let has_tool_calls = !resp.message.tool_calls.is_empty();
-                self.push_history(resp.message.clone());
+                if let Err(e) = self.push_history(resp.message.clone()) {
+                    // 容量耗尽：助手消息仍经 FinishAction 回传调用方，仅记录错误而非静默覆盖
+                    error!(error = ?e, turn_id = current_turn, "finish_thinking: session fact log full, assistant message not persisted");
+                }
                 if has_tool_calls {
                     let tool_calls = resp.message.tool_calls.clone();
                     FinishAction::AwaitingCalls {
@@ -475,11 +523,13 @@ impl Session {
         self.pending_injections.push_back(content);
     }
 
-    /// 把已完成的异步工具结果作为 user 消息追加到 history（仅非空时）
+    /// 把已完成的异步工具结果作为 user 消息追加到事实源（仅非空时）
     fn flush_injections(&mut self) {
         let pending: Vec<String> = self.pending_injections.drain(..).collect();
         for content in pending {
-            self.push_history(Message::user(content));
+            if let Err(e) = self.push_history(Message::user(content)) {
+                warn!(error = ?e, "flush_injections: session fact log full, injection rejected");
+            }
         }
     }
 
@@ -549,13 +599,16 @@ impl Session {
         };
 
         for (tool_call_id, content) in &results {
-            self.push_history(Message {
+            if let Err(e) = self.push_history(Message {
                 role: crate::provider::Role::Tool,
                 content: crate::provider::MessageContent::text(content.clone()),
                 reasoning_content: None,
                 tool_calls: Vec::new(),
                 tool_call_id: Some(tool_call_id.clone()),
-            });
+                usage: None,
+            }) {
+                warn!(error = ?e, tool_call_id, "append_tool_results: session fact log full, tool result rejected");
+            }
         }
     }
 
@@ -574,24 +627,35 @@ impl Session {
     }
 
     // ─────────────────────────────────────────────
-    // History 管理（有界）
+    // 事实管理（append-only，有界）
     // ─────────────────────────────────────────────
 
-    /// 追加消息到 history（有界，FIFO 淘汰最旧）
-    pub fn push_history(&mut self, msg: Message) {
-        if self.history.len() >= self.config.max_history {
-            self.history.pop_front();
+    /// 追加一条事实到会话日志（事实只增不减；满则返回 `CapacityExceeded`，不静默丢弃）
+    ///
+    /// 配置了落盘 sink 时，内存写入成功后尽力落盘；落盘失败显式 `error!` 记录
+    /// （不吞异常、不阻塞内存会话），内存事实源仍为权威。
+    pub fn push_history(&mut self, msg: Message) -> Result<(), LogError> {
+        self.log.append(msg.clone()).map(|_| ())?;
+        #[cfg(feature = "persist")]
+        if let Some(sink) = &self.config.log_sink {
+            if let Err(e) = sink.append(&self.session_id, &msg) {
+                error!(
+                    error = ?e,
+                    session_id = %self.session_id,
+                    "push_history: persist sink append failed"
+                );
+            }
         }
-        self.history.push_back(msg);
+        Ok(())
     }
 
-    /// 构建 ChatRequest（从 history + 可选参数 + 预算截断）
+    /// 构建 ChatRequest（从模型可见窗口 + 可选参数 + 预算截断）
     ///
-    /// 调用时机：`start_thinking` 之后（history 已含最新 user 消息）。
+    /// 调用时机：`start_thinking` 之后（窗口已含最新 user 消息）。
     /// 经 [`crate::prompt::build_prompt`] 统一组装并按 `prompt_budget_tokens`
     /// 预算截断（P5：杜绝 Prompt 爆炸）。
     pub fn build_chat_request(&self, options: &ChatOptions) -> ChatRequest {
-        let history: Vec<Message> = self.history.iter().cloned().collect();
+        let history: Vec<Message> = self.log.tail(self.config.max_history).to_vec();
         let temperature = options.temperature.or(self.config.default_temperature);
         let max_tokens = options.max_tokens.or(self.config.default_max_tokens);
         let system = options

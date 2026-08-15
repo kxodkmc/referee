@@ -15,16 +15,23 @@
 //! base 提供「接 LLM → 组装 prompt → 调工具 → 管预算 → 回复」的地基；
 //! 本模块提供「如何把地基变成一个完整、可用、协作的 Agent」。
 
+pub mod agent;
 pub mod artifact;
 pub mod tool;
 // Agent Skills 开放标准（SKILL.md）注入，按需拓展，启用 `skills` feature 后加载
 #[cfg(feature = "skills")]
 pub mod skill;
 
+pub use agent::{
+    general, interpolate, AgentBuilder, AgentDefinition, AgentId, AgentRegistry, BoundAgent,
+    ChatParams, GENERAL_ID, TemplateConfig, TemplateError, TemplateRef, TemplateRegistry,
+};
 pub use artifact::{
     Artifact, ArtifactStore, BoardId, InMemoryArtifactStore, StoreConfig, StoreError,
 };
-pub use tool::{AgentTool, ArtifactReader, ListMyBoard};
+pub use tool::{
+    AgentTool, ArtifactReader, EditTool, FsConfig, ListMyBoard, ReadTool, ReadToolConfig, WriteTool,
+};
 #[cfg(feature = "skills")]
 pub use skill::{
     render_skill_context, KeywordRouter, RegistryConfig as SkillRegistryConfig, RegistryError as SkillRegistryError,
@@ -121,6 +128,20 @@ impl AgentRuntime {
         self.engine.chat_stream(session_id, payload)
     }
 
+    /// 中断指定会话的当前回合（幂等；有活动回合才返回 true）
+    pub fn interrupt(&self, session_id: SessionId) -> bool {
+        self.engine.interrupt(session_id)
+    }
+
+    /// 回放已确认的会话事实到指定会话历史（崩溃恢复用，不触发 LLM）
+    pub fn replay_history(
+        &self,
+        session_id: SessionId,
+        messages: Vec<referee_ai_base::provider::Message>,
+    ) -> Result<usize, String> {
+        self.engine.replay_history(session_id, messages)
+    }
+
     /// 全局已消耗 Token 数（观测）
     pub fn total_consumed_tokens(&self) -> u64 {
         self.engine.total_consumed_tokens()
@@ -166,6 +187,32 @@ impl AgentRuntime {
             .register_tool(Arc::new(ListMyBoard::new(store.clone())))?;
         self.engine
             .register_tool(Arc::new(ArtifactReader::new(store)))?;
+        Ok(())
+    }
+
+    /// 注册本地文本读取工具（`read`）
+    ///
+    /// 需引擎已 `with_tools`。`config` 可指定根目录约束与容量上限。
+    pub fn register_read_tool(
+        &self,
+        config: tool::read::ReadToolConfig,
+    ) -> Result<(), referee_ai_base::tool::RegistryError> {
+        self.engine
+            .register_tool(Arc::new(tool::read::ReadTool::new(config)))
+    }
+
+    /// 注册文件写工具（`write` / `edit`）
+    ///
+    /// 需引擎已 `with_tools`。`config` 为共享文件约束（上限 + 可选 root），
+    /// 与 `read` 的 root 约束应保持一致，保证 read/write/edit 视图统一。
+    pub fn register_fs_write_tools(
+        &self,
+        config: tool::fs_common::FsConfig,
+    ) -> Result<(), referee_ai_base::tool::RegistryError> {
+        self.engine
+            .register_tool(Arc::new(tool::write::WriteTool::new(config.clone())))?;
+        self.engine
+            .register_tool(Arc::new(tool::edit::EditTool::new(config)))?;
         Ok(())
     }
 
