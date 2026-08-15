@@ -8,11 +8,12 @@ pub mod supervisor;
 pub mod wal;
 
 pub use monitor::{GlobalState, Monitor};
-pub use router::{ExtensionState, Router};
+pub use router::{ExtensionInfo, ExtensionState, Router};
 pub use shutdown::{ShutdownRx, ShutdownTx};
 pub use supervisor::SupervisionPolicy;
 pub use wal::{InMemoryWal, WalSink};
 
+use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,6 +51,34 @@ pub struct Kernel {
     shutdown_tx: ShutdownTx,
 }
 
+/// 扩展注册配置 — 集中收敛注册参数，按需拓展不破坏既有签名
+#[derive(Debug, Clone)]
+pub struct RegisterOptions {
+    /// 每个优先级桶的缓冲上限（背压硬约束）
+    pub queue_size: usize,
+    /// 崩溃 / 超时后的监督策略（重启决策）
+    pub policy: SupervisionPolicy,
+    /// 单条消息处理时限（挂起治理）：超时切断视为一次崩溃走监督策略，
+    /// 被切断的消息不重试。`None` 表示不限时（仅 Panic 熔断）。
+    pub handle_timeout: Option<Duration>,
+}
+
+impl RegisterOptions {
+    pub fn new(queue_size: usize, policy: SupervisionPolicy) -> Self {
+        Self {
+            queue_size,
+            policy,
+            handle_timeout: None,
+        }
+    }
+
+    /// 启用挂起治理：设定单条消息处理时限
+    pub fn with_handle_timeout(mut self, timeout: Duration) -> Self {
+        self.handle_timeout = Some(timeout);
+        self
+    }
+}
+
 impl Kernel {
     /// 默认实现：内存环形死信队列（容量 1024），无 WAL
     pub fn new() -> Self {
@@ -85,31 +114,63 @@ impl Kernel {
         }
     }
 
-    /// 注册扩展：优先级有界通道 → 写入路由表 → 派生监督运行时
+    /// 注册扩展（便捷入口）：默认不启用 handle 超时（仅 Panic 熔断）
     ///
     /// `queue_size` 为每个优先级桶的缓冲上限；`policy` 决定崩溃后的重启策略。
-    /// 运行时注入路由视图（受限上下文）与 WAL（处理成功 ACK），并携带
-    /// 注册代际（防旧任务退出时误改同 id 新条目）。
     pub async fn register(
         &self,
         ext: Box<dyn Extension>,
         queue_size: usize,
         policy: SupervisionPolicy,
     ) -> KernelResult<()> {
+        self.register_with(ext, RegisterOptions::new(queue_size, policy))
+            .await
+    }
+
+    /// 注册扩展（完整配置）：支持挂起治理（`handle_timeout`）等参数
+    ///
+    /// 优先级有界通道 → 写入路由表 → 派生监督运行时。运行时注入路由视图
+    /// （受限上下文）与 WAL（处理成功 ACK），并携带注册代际（防旧任务
+    /// 退出时误改同 id 新条目）。
+    pub async fn register_with(
+        &self,
+        ext: Box<dyn Extension>,
+        opts: RegisterOptions,
+    ) -> KernelResult<()> {
         let id = ext.id();
-        let (tx, rx) = PrioritySender::new(queue_size, id);
+        let (tx, rx) = PrioritySender::new(opts.queue_size, id);
         let gen = self.view.router.next_generation();
+        // 重启计数：路由条目（快照可读）与监督运行时（崩溃后写入）共享
+        let restarts = Arc::new(AtomicU32::new(0));
         // 状态与路由同条目原子写入（register 完成即对 dispatch 可见）
-        self.view
-            .router
-            .insert(id, tx, ExtensionState::Running, gen);
-        let runtime = ExtensionRuntime::new(ext, policy, self.view.clone(), gen);
+        self.view.router.insert(
+            id,
+            tx,
+            ExtensionState::Running,
+            gen,
+            restarts.clone(),
+        );
+        let runtime = ExtensionRuntime::new(
+            ext,
+            opts.policy,
+            self.view.clone(),
+            gen,
+            opts.handle_timeout,
+            restarts,
+        );
         self.tasks.lock().spawn(runtime.run_supervised(
             rx,
             self.view.router.clone(),
             self.shutdown_tx.subscribe(),
         ));
         Ok(())
+    }
+
+    /// 扩展自省快照 — 路由表全量条目（id / 状态 / 队列深度 / 重启计数）
+    ///
+    /// 只读视图，供运维展示与监控；跨条目不保证同一瞬时（见 `Router::snapshot`）
+    pub fn extensions(&self) -> Vec<ExtensionInfo> {
+        self.view.router.snapshot()
     }
 
     /// 注销扩展：移除路由（含状态）→ Sender drop → 通道关闭 → 监督循环自然退出

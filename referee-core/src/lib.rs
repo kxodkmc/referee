@@ -11,4 +11,6 @@ pub use common::{Envelope, KernelError, KernelResult};
 pub use extension::dlq::{DlqSink, InMemoryDlq};
 pub use extension::{CapabilityId, Extension, KernelContext, MessageContext};
 pub use kernel::wal::{InMemoryWal, WalSink};
-pub use kernel::{Kernel, SupervisionPolicy};
+pub use kernel::{
+    ExtensionInfo, ExtensionState, Kernel, RegisterOptions, SupervisionPolicy,
+};

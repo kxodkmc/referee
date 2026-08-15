@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use bytes::Bytes;
 use uuid::Uuid;
 
 /// 所有跨扩展消息的统一数据格式
@@ -18,10 +19,15 @@ pub struct Envelope {
     pub queued_at: Instant,
     pub priority: u8,
     pub metadata: HashMap<String, String>,
+    /// 内联消息载荷 — 引用计数共享（含 WAL / DLQ 转储路径的克隆均零拷贝）。
+    ///
+    /// `None` 表示纯控制消息或载荷走外部存储；大工件应存外部传引用
+    /// （metadata 放引用 ID），防信封膨胀破坏有界内存约束。
+    pub payload: Option<Bytes>,
 }
 
 impl Envelope {
-    /// 构造一个全新随机 ID 的信封
+    /// 构造一个全新随机 ID 的空载荷信封
     pub fn new() -> Self {
         Self {
             context_id: Uuid::new_v4(),
@@ -32,7 +38,15 @@ impl Envelope {
             queued_at: Instant::now(),
             priority: 0,
             metadata: HashMap::new(),
+            payload: None,
         }
+    }
+
+    /// 构造携带载荷的信封（`Vec<u8>` / `String` / `&[u8]` / `Bytes` 均可直接转入）
+    pub fn with_payload(payload: impl Into<Bytes>) -> Self {
+        let mut env = Self::new();
+        env.payload = Some(payload.into());
+        env
     }
 }
 
