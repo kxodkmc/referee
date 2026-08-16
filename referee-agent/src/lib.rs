@@ -1,10 +1,10 @@
 //! # Referee Agent — 开箱即用的完整 Agent 业务封装
 //!
-//! 建立在 `referee-ai-base`（地基）之上的**业务层**：
-//! 将 base 的积木（厂商抽象、会话引擎、工具执行、预算、缓存）组装为可直接使用的
+//! 建立在 `referee-ai`（地基）之上的**业务层**：
+//! 将 referee-ai 的积木（厂商抽象、会话引擎、工具执行、预算、缓存）组装为可直接使用的
 //! Agent 运行时，并提供业务能力：
 //!
-//! - [`AgentRuntime`]：实现 `referee-core::Extension`，把 base 引擎接入内核消息
+//! - [`AgentRuntime`]：实现 `referee-core::Extension`，把 referee-ai 引擎接入内核消息
 //!   路由（`Chat` / `Interrupt`）。
 //! - [`tool::AgentTool`]：对等/子 Agent 协作（Agent as Tool）。
 //! - [`tool::mcp`]：MCP 2.0 stdio 客户端桥（远程 MCP 工具接入 `Tool` 抽象；
@@ -12,7 +12,7 @@
 //! - [`artifact`]：带 ACL 的工件存储（业务层对等成果共享的安全能力）。
 //!
 //! ## 定位
-//! base 提供「接 LLM → 组装 prompt → 调工具 → 管预算 → 回复」的地基；
+//! referee-ai 提供「接 LLM → 组装 prompt → 调工具 → 管预算 → 回复」的地基；
 //! 本模块提供「如何把地基变成一个完整、可用、协作的 Agent」。
 
 pub mod agent;
@@ -40,8 +40,8 @@ pub use skill::{
 
 use std::sync::Arc;
 
-use referee_ai_base::engine::{ChatHandle, Engine, EngineReply, EngineStartError, SessionSnapshot};
-use referee_ai_base::session::{ChatPayload, SessionId, SessionMessage, SessionReply};
+use referee_ai::engine::{ChatHandle, Engine, EngineReply, EngineStartError, SessionSnapshot};
+use referee_ai::session::{ChatPayload, SessionId, SessionMessage, SessionReply};
 use referee_core::extension::{CapabilityId, Extension, KernelContext};
 use referee_core::Envelope;
 use tracing::info_span;
@@ -137,7 +137,7 @@ impl AgentRuntime {
     pub fn replay_history(
         &self,
         session_id: SessionId,
-        messages: Vec<referee_ai_base::provider::Message>,
+        messages: Vec<referee_ai::provider::Message>,
     ) -> Result<usize, String> {
         self.engine.replay_history(session_id, messages)
     }
@@ -167,7 +167,7 @@ impl AgentRuntime {
         description: impl Into<String>,
         target_runtime_id: CapabilityId,
         target_session_id: SessionId,
-    ) -> Result<(), referee_ai_base::tool::RegistryError> {
+    ) -> Result<(), referee_ai::tool::RegistryError> {
         let mut tool = AgentTool::new(name, description, target_runtime_id, target_session_id);
         if let Some(store) = &self.artifact_store {
             tool = tool.with_artifact_store(store.clone());
@@ -178,11 +178,11 @@ impl AgentRuntime {
     /// 注册成果板读取工具（`list_my_board` / `read_artifact`）
     ///
     /// 需已 `with_artifact_store` 且引擎已 `with_tools`。
-    pub fn register_artifact_tools(&self) -> Result<(), referee_ai_base::tool::RegistryError> {
+    pub fn register_artifact_tools(&self) -> Result<(), referee_ai::tool::RegistryError> {
         let store = self
             .artifact_store
             .clone()
-            .ok_or(referee_ai_base::tool::RegistryError::NotEnabled)?;
+            .ok_or(referee_ai::tool::RegistryError::NotEnabled)?;
         self.engine
             .register_tool(Arc::new(ListMyBoard::new(store.clone())))?;
         self.engine
@@ -196,7 +196,7 @@ impl AgentRuntime {
     pub fn register_read_tool(
         &self,
         config: tool::read::ReadToolConfig,
-    ) -> Result<(), referee_ai_base::tool::RegistryError> {
+    ) -> Result<(), referee_ai::tool::RegistryError> {
         self.engine
             .register_tool(Arc::new(tool::read::ReadTool::new(config)))
     }
@@ -208,7 +208,7 @@ impl AgentRuntime {
     pub fn register_fs_write_tools(
         &self,
         config: tool::fs_common::FsConfig,
-    ) -> Result<(), referee_ai_base::tool::RegistryError> {
+    ) -> Result<(), referee_ai::tool::RegistryError> {
         self.engine
             .register_tool(Arc::new(tool::write::WriteTool::new(config.clone())))?;
         self.engine
@@ -290,7 +290,7 @@ impl Extension for AgentRuntime {
                     payload,
                 } => self.handle_chat(ctx, session_id, payload),
                 SessionMessage::Interrupt { session_id } => self.handle_interrupt(ctx, session_id),
-                // base 引擎采用内部回合循环，不再产生/消费 ToolResult / Resume
+                // referee-ai 引擎采用内部回合循环，不再产生/消费 ToolResult / Resume
                 // （旧协议消息出于兼容性显式拒绝，避免静默丢弃）。
                 SessionMessage::ToolResult { .. } | SessionMessage::Resume { .. } => {
                     let _ = ctx.reply(

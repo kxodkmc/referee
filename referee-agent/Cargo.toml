@@ -2,16 +2,16 @@
 name = "referee-agent"
 version = "0.1.0"
 edition = "2021"
-description = "开箱即用的完整 Agent 业务封装：基于 referee-ai-base 地基，提供 Extension 集成、对等协作（Agent as Tool）与编排。"
+description = "开箱即用的完整 Agent 业务封装：基于 referee-ai 地基，提供 Extension 集成、对等协作（Agent as Tool）与编排。"
 license = "MIT"
 
 [features]
 default = ["xiaomi", "deepseek"]
-xiaomi    = ["referee-ai-base/xiaomi"]
-deepseek  = ["referee-ai-base/deepseek"]
-openai    = ["referee-ai-base/openai"]
-anthropic = ["referee-ai-base/anthropic"]
-responses = ["referee-ai-base/responses"]
+xiaomi    = ["referee-ai/xiaomi"]
+deepseek  = ["referee-ai/deepseek"]
+openai    = ["referee-ai/openai"]
+anthropic = ["referee-ai/anthropic"]
+responses = ["referee-ai/responses"]
 # MCP 2.0 stdio 客户端桥（按需拓展，默认不加载；stdio 桥零新增依赖）
 mcp-stdio = []
 # Agent Skills 开放标准（SKILL.md）注入（按需拓展，默认不加载；零新增依赖）
@@ -19,7 +19,7 @@ skills = []
 
 [dependencies]
 referee-core  = { path = "../referee-core" }
-referee-ai-base = { path = "../referee-ai-base" }
+referee-ai = { path = "../referee-ai" }
 tokio       = { version = "1", features = ["full"] }
 futures     = "0.3"
 async-trait = "0.1"

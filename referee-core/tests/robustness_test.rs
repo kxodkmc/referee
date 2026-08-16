@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use referee_core::kernel::priority::PrioritySender;
 use referee_core::{
     CapabilityId, Envelope, Extension, InMemoryWal, Kernel, KernelContext, KernelError,
@@ -368,4 +369,76 @@ impl Extension for PanicExtension {
     async fn handle(&self, _ctx: KernelContext, _env: Envelope) -> KernelResult<()> {
         panic!("simulated panic for wal ack test");
     }
+}
+
+// ───────────────────────────────────────────────
+// 测试夹具：捕获收到的载荷字节（验证 Bytes 载荷经队列 / WAL 克隆路径原样到达）
+// ───────────────────────────────────────────────
+struct PayloadSinkExtension {
+    id: CapabilityId,
+    received: Arc<Mutex<Vec<u8>>>,
+}
+
+#[async_trait]
+impl Extension for PayloadSinkExtension {
+    fn id(&self) -> CapabilityId {
+        self.id
+    }
+
+    async fn handle(&self, _ctx: KernelContext, env: Envelope) -> KernelResult<()> {
+        let mut buf = self.received.lock();
+        match env.payload {
+            Some(bytes) => buf.extend_from_slice(&bytes),
+            // 空载荷控制消息记一个占位符，区分「未收到」与「收到空载荷」
+            None => buf.push(b'-'),
+        }
+        Ok(())
+    }
+}
+
+// ───────────────────────────────────────────────
+// 用例 9：Envelope 载荷 — 经 dispatch / WAL append 克隆 / 优先级队列后原样到达
+// ───────────────────────────────────────────────
+#[tokio::test]
+async fn envelope_payload_round_trips_through_kernel() {
+    let wal = Arc::new(InMemoryWal::new());
+    let kernel = Kernel::with_wal(wal);
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let ext = PayloadSinkExtension {
+        id: CapabilityId::new(),
+        received: received.clone(),
+    };
+    let ext_id = ext.id();
+    kernel
+        .register(Box::new(ext), 8, SupervisionPolicy::Transient)
+        .await
+        .unwrap();
+
+    // 二进制载荷（含非 UTF-8 字节）与文本载荷各一条，再发一条空载荷控制消息
+    kernel
+        .emit(ext_id, Envelope::with_payload(vec![0x00, 0xFF, 0x10, 0x7F]))
+        .await
+        .expect("binary payload emit ok");
+    kernel
+        .emit(ext_id, Envelope::with_payload("text-payload".to_string()))
+        .await
+        .expect("text payload emit ok");
+    kernel
+        .emit(ext_id, Envelope::new())
+        .await
+        .expect("empty payload emit ok");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let expected: Vec<u8> = [0x00, 0xFF, 0x10, 0x7F]
+        .iter()
+        .copied()
+        .chain(b"text-payload".iter().copied())
+        .chain(std::iter::once(b'-'))
+        .collect();
+    assert_eq!(
+        received.lock().as_slice(),
+        expected.as_slice(),
+        "payload bytes must arrive intact through kernel routing and WAL clone"
+    );
 }

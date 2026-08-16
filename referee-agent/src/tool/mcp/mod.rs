@@ -35,7 +35,7 @@ pub use transport::{StdioTransport, TransportConfig};
 
 use std::sync::Arc;
 
-use referee_ai_base::tool::Tool;
+use referee_ai::tool::Tool;
 use thiserror::Error;
 
 /// MCP 客户端错误

@@ -8,8 +8,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use referee_core::{
-    CapabilityId, Envelope, Extension, InMemoryDlq, Kernel, KernelContext, KernelError,
-    KernelResult, SupervisionPolicy,
+    CapabilityId, Envelope, Extension, ExtensionState, InMemoryDlq, Kernel, KernelContext,
+    KernelError, KernelResult, SupervisionPolicy,
 };
 
 // ───────────────────────────────────────────────
@@ -278,4 +278,82 @@ async fn dlq_captures_rejected_envelope() {
     assert_eq!(drained.len(), 1);
     assert_eq!(drained[0].0.context_id, context_id);
     assert_eq!(drained[0].1, KernelError::ExtensionCrashed);
+}
+
+// ───────────────────────────────────────────────
+// 测试 6：自省快照 — 状态 / 队列深度 / 重启计数对外可见
+// ───────────────────────────────────────────────
+#[tokio::test]
+async fn introspection_snapshot_reports_state_depth_and_restarts() {
+    let kernel = Kernel::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let flaky = FlakyExtension {
+        id: CapabilityId::new(),
+        calls: calls.clone(),
+    };
+    let flaky_id = flaky.id();
+    let panicky = PanicExtension {
+        id: CapabilityId::new(),
+    };
+    let panicky_id = panicky.id();
+    let slow = SlowConsumerExtension {
+        id: CapabilityId::new(),
+        count: Arc::new(AtomicUsize::new(0)),
+    };
+    let slow_id = slow.id();
+    kernel
+        .register(
+            Box::new(flaky),
+            8,
+            SupervisionPolicy::OneForOne {
+                max_restarts: 3,
+                window_secs: 30,
+            },
+        )
+        .await
+        .unwrap();
+    kernel
+        .register(Box::new(panicky), 8, SupervisionPolicy::Transient)
+        .await
+        .unwrap();
+    kernel
+        .register(Box::new(slow), 16, SupervisionPolicy::Transient)
+        .await
+        .unwrap();
+
+    // 初始快照：三者 Running、零重启
+    let snap = kernel.extensions();
+    assert_eq!(snap.len(), 3);
+    for info in &snap {
+        assert_eq!(info.state, ExtensionState::Running);
+        assert_eq!(info.restarts, 0);
+    }
+
+    // 慢消费者积压可见：入队后立即快照，depth 必然大于 0
+    for _ in 0..4 {
+        kernel.emit(slow_id, Envelope::new()).await.expect("emit ok");
+    }
+    let info = kernel
+        .extensions()
+        .into_iter()
+        .find(|i| i.id == slow_id)
+        .expect("slow ext in snapshot");
+    assert!(info.queue_depth > 0, "queued messages must be visible in depth");
+
+    // 触发 flaky 一次 Panic（退避 200ms 后自愈）与 panicky 熔断
+    kernel.emit(flaky_id, Envelope::new()).await.expect("emit ok");
+    kernel.emit(panicky_id, Envelope::new()).await.expect("emit ok");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let snap = kernel.extensions();
+    let flaky_info = snap.iter().find(|i| i.id == flaky_id).expect("flaky info");
+    let panicky_info = snap
+        .iter()
+        .find(|i| i.id == panicky_id)
+        .expect("panicky info");
+    // 自愈后恢复 Running 且重启计数为 1；熔断者标记 Crashed 且从不重启
+    assert_eq!(flaky_info.state, ExtensionState::Running);
+    assert_eq!(flaky_info.restarts, 1);
+    assert_eq!(panicky_info.state, ExtensionState::Crashed);
+    assert_eq!(panicky_info.restarts, 0);
 }

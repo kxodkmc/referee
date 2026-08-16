@@ -20,7 +20,7 @@ openai   = ["referee-agent/openai"]
 
 [dependencies]
 referee-core    = { path = "../referee-core" }
-referee-ai-base = { path = "../referee-ai-base", features = ["persist"] }
+referee-ai = { path = "../referee-ai", features = ["persist"] }
 referee-agent   = { path = "../referee-agent", default-features = false }
 # 仅 feature "http" 时编译；核心（无 http feature）不含 axum 及其传递依赖
 axum = { version = "0.8", optional = true }

@@ -1,4 +1,4 @@
-//! # Referee AI Base — Agent 核心支撑层（地基）
+//! # Referee AI — Agent 核心支撑层（地基）
 //!
 //! 在 `referee-core`（微内核）之上，提供一套**基础、底层、易维护、易拓展**的
 //! AI 能力积木。定位为业务无关的基础设施：只提供「接 LLM → 组装 prompt →
@@ -25,7 +25,7 @@
 //! ```text
 //!   referee-core（内核，零改动）
 //!        │
-//!   referee-ai-base（本 crate：地基积木 + 会话引擎）
+//!   referee-ai（本 crate：地基积木 + 会话引擎）
 //!        │
 //!   referee-agent（业务封装：Extension 集成、对等协作，开箱即用）
 //! ```

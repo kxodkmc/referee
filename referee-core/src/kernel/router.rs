@@ -4,7 +4,7 @@
 //! `dispatch` 通过 `get` 在读锁内一次性完成状态校验与路由投递，
 //! 消除「路由已移除但状态仍为 Running」的盲区窗口（消息静默丢失）。
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -24,11 +24,24 @@ pub enum ExtensionState {
     Stopped,
 }
 
+/// 扩展运行时信息快照 — 自省 / 运维观测（`Kernel::extensions`）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtensionInfo {
+    pub id: CapabilityId,
+    pub state: ExtensionState,
+    /// 在途消息数（三优先级桶合计）
+    pub queue_depth: usize,
+    /// 当前重启窗口内的累计重启次数
+    pub restarts: u32,
+}
+
 struct RouteEntry {
     sender: PrioritySender,
     state: ExtensionState,
     /// 注册代际：同 id 重注册后旧监督任务的退出收敛不覆盖新条目
     gen: u64,
+    /// 重启计数 — 与监督运行时共享（运行时写入，快照读取）
+    restarts: Arc<AtomicU32>,
 }
 
 struct RouterInner {
@@ -60,17 +73,25 @@ impl Router {
         self.inner.next_gen.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// 注册路由条目（初始状态由调用方给定，通常为 `Running`）
+    /// 注册路由条目（初始状态由调用方给定，通常为 `Running`）；
+    /// `restarts` 为与监督运行时共享的重启计数器（初始 0）
     pub fn insert(
         &self,
         id: CapabilityId,
         sender: PrioritySender,
         state: ExtensionState,
         gen: u64,
+        restarts: Arc<AtomicU32>,
     ) {
-        self.inner
-            .routes
-            .insert(id, RouteEntry { sender, state, gen });
+        self.inner.routes.insert(
+            id,
+            RouteEntry {
+                sender,
+                state,
+                gen,
+                restarts,
+            },
+        );
     }
 
     /// 移除路由条目（同时丢弃 Sender，触发通道关闭）
@@ -80,6 +101,23 @@ impl Router {
 
     pub fn contains(&self, id: &CapabilityId) -> bool {
         self.inner.routes.contains_key(id)
+    }
+
+    /// 全量路由快照 — id / 状态 / 队列深度 / 重启计数的一次性只读视图
+    ///
+    /// 逐条目读取：单条目内各字段取自同一路由条目（状态与深度一致），
+    /// 跨条目不保证同一瞬时；仅供运维观测，不作决策依据。
+    pub fn snapshot(&self) -> Vec<ExtensionInfo> {
+        self.inner
+            .routes
+            .iter()
+            .map(|e| ExtensionInfo {
+                id: *e.key(),
+                state: e.value().state,
+                queue_depth: e.value().sender.depth(),
+                restarts: e.value().restarts.load(Ordering::Relaxed),
+            })
+            .collect()
     }
 
     /// 当前条目是否属于指定注册代际（防旧任务误改新条目）

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use tokio::io::AsyncWriteExt;
 
-use referee_ai_base::tool::ToolError;
+use referee_ai::tool::ToolError;
 
 /// 单文件读写字节默认上限（16 MiB）
 pub const DEFAULT_MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;

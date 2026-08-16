@@ -1,22 +1,22 @@
 # Referee Agent — 开箱即用的完整 Agent 业务封装
 
-> 建立在 `referee-ai-base`（地基）之上的**业务层**：把 base 的积木（厂商抽象、
+> 建立在 `referee-ai`（地基）之上的**业务层**：把 referee-ai 的积木（厂商抽象、
 > 会话引擎、工具执行、预算、缓存）组装为可直接使用的 Agent 运行时，并提供业务能力：
 > **Agent 定义/配置**（`agent`）、Extension 集成、对等协作（Agent as Tool）、带 ACL 的
 > 工件存储与成果板读取工具，以及 MCP 2.0 stdio 客户端桥（按需 feature `mcp-stdio`）
 > 与 Agent Skills 注入（按需 feature `skills`）。
 >
-> **分层**：`referee-core`（内核，通信与治理）→ `referee-ai-base`（核心支撑积木）
+> **分层**：`referee-core`（内核，通信与治理）→ `referee-ai`（核心支撑积木）
 > → `referee-agent`（本模块，业务封装，开箱即用）。
 
 ## 1. 定位
 
 | 项 | 说明 |
 |----|------|
-| 业务层 | 基于 `referee-ai-base` 组装；base 提供最小闭环积木，本模块提供「如何把它们变成完整、可用、协作的 Agent」 |
+| 业务层 | 基于 `referee-ai` 组装；referee-ai 提供最小闭环积木，本模块提供「如何把它们变成完整、可用、协作的 Agent」 |
 | Agent 定义/配置 | `agent` 模块：`AgentDefinition`（纯数据）+ `AgentBuilder` + `AgentRegistry` + `bind` → `BoundAgent`；能力白名单**封闭默认**（`["*"]`=全部、`["a"]`=白名单、`[]`=无该能力） |
 | 可替换模板 | `TemplateRef::Named` 命名槽位 + `TemplateRegistry`（覆盖语义、有界）：不重编译即可替换提示词；`bind_with(templates, vars)` 传递设计（参考 DSH persona 槽位） |
-| Extension 集成 | `AgentRuntime` 实现 `referee-core::Extension`，把 base 引擎接入内核消息路由（`Chat` / `Interrupt`） |
+| Extension 集成 | `AgentRuntime` 实现 `referee-core::Extension`，把 referee-ai 引擎接入内核消息路由（`Chat` / `Interrupt`） |
 | 业务能力 | 对等/子 Agent 协作（`AgentTool`，Agent as Tool）、ACL 工件存储（`artifact`）、成果板读取工具（`list_my_board` / `read_artifact`） |
 | 按需拓展 | MCP 2.0 stdio 客户端桥（`tool::mcp`）以 feature `mcp-stdio` 加载；Agent Skills 注入（`skill`）以 feature `skills` 加载，默认不编译，核心保持轻量 |
 | 不预置 | 记忆等业务策略由使用者/二次封装搭建 |
@@ -29,7 +29,7 @@ referee-agent = { path = "referee-agent", features = ["xiaomi", "deepseek", "mcp
 ```
 
 `xiaomi` / `deepseek` / `openai` / `anthropic` / `responses` 通过 `referee-agent` 转发到
-`referee-ai-base` 裁剪厂商适配器；`mcp-stdio` / `skills` 为协议与技能注入（默认关闭）。
+`referee-ai` 裁剪厂商适配器；`mcp-stdio` / `skills` 为协议与技能注入（默认关闭）。
 
 ## 2. 架构
 
@@ -40,13 +40,13 @@ referee-agent = { path = "referee-agent", features = ["xiaomi", "deepseek", "mcp
                                 │ Envelope (Chat / Interrupt)
 ┌───────────────────────────────▼──────────────────────────────┐
 │  referee-agent：AgentRuntime (implements Extension)            │
-│    · handle_chat / handle_interrupt → 转译 base 引擎调用        │
+│    · handle_chat / handle_interrupt → 转译 referee-ai 引擎调用        │
 │    · agent：AgentDefinition / AgentBuilder / AgentRegistry     │
 │    · register_peer_tool / with_artifact_store（业务能力）       │
 │    · register_artifact_tools（list_my_board / read_artifact）   │
 │    · chat_stream / remove_session / list_sessions / session_info│
 ├──────────────────────────────────────────────────────────────┤
-│  referee-ai-base：Engine（会话引擎，最小闭环）                   │
+│  referee-ai：Engine（会话引擎，最小闭环）                   │
 │    provider │ session │ tool │ store │ budget │ prompt │ cache│
 └──────────────────────────────────────────────────────────────┘
 ```
@@ -134,9 +134,9 @@ let bound = def.bind_with(Some(&templates), &[("cwd", "/workspace")])?;
 
 ```rust
 use std::sync::Arc;
-use referee_ai_base::engine::{Engine, EngineConfig};
-use referee_ai_base::provider::deepseek::{DeepSeekConfig, DeepSeekModel, DeepSeekProvider};
-use referee_ai_base::tool::{ExecutorConfig, ToolExecutor};
+use referee_ai::engine::{Engine, EngineConfig};
+use referee_ai::provider::deepseek::{DeepSeekConfig, DeepSeekModel, DeepSeekProvider};
+use referee_ai::tool::{ExecutorConfig, ToolExecutor};
 use referee_agent::AgentRuntime;
 use referee_core::{Kernel, SupervisionPolicy};
 use uuid::Uuid;
@@ -152,7 +152,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let executor = ToolExecutor::with_defaults().with_kernel(kernel.clone());
     let engine = Engine::new(provider, EngineConfig::default())
         .with_tools(
-            referee_ai_base::tool::ToolRegistry::with_defaults(),
+            referee_ai::tool::ToolRegistry::with_defaults(),
             executor,
         );
 
@@ -164,7 +164,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     // 3. 发起对话（invoke：请求-响应）
-    use referee_ai_base::session::{ChatPayload, Message, SessionMessage};
+    use referee_ai::session::{ChatPayload, Message, SessionMessage};
     let msg = SessionMessage::Chat {
         session_id: Uuid::new_v4(),
         payload: ChatPayload {
@@ -173,7 +173,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
     };
     let resp_env = kernel.invoke(rid, msg.to_envelope(), 30_000).await?;
-    let reply = referee_ai_base::session::SessionReply::from_envelope(&resp_env)?;
+    let reply = referee_ai::session::SessionReply::from_envelope(&resp_env)?;
     println!("{reply:?}");
     Ok(())
 }
@@ -189,7 +189,7 @@ use std::path::Path;
 use std::sync::Arc;
 use referee_agent::skill::{load_root, SkillConfig, SkillRegistry,
                            KeywordRouter, render_skill_context};
-use referee_ai_base::session::ChatOptions;
+use referee_ai::session::ChatOptions;
 
 // 启动时装载一次（有界：单资源/总字节/条数均有上限）
 let registry = SkillRegistry::with_defaults();
@@ -230,6 +230,6 @@ cargo clippy -p referee-agent --all-targets -- -D warnings
 | 文档 | 说明 |
 |------|------|
 | [`../README.md`](../README.md) | 仓库总览 |
-| [`../referee-ai-base/README.md`](../referee-ai-base/README.md) | 地基模块（核心支撑能力，含提示词分段编排与用量计量） |
+| [`../referee-ai/README.md`](../referee-ai/README.md) | 地基模块（核心支撑能力，含提示词分段编排与用量计量） |
 | [`../referee-core/README.md`](../referee-core/README.md) | 内核模块 |
 | [`../REFACTOR_PLAN.md`](../REFACTOR_PLAN.md) | 重构执行规划（分层边界与验收口径） |

@@ -129,6 +129,11 @@ impl PrioritySender {
         self.notify.notify_one();
         Ok(())
     }
+
+    /// 当前在途消息数（三桶合计）— 只读快照，供自省接口观测
+    pub fn depth(&self) -> usize {
+        self.depth.load(Ordering::Relaxed)
+    }
 }
 
 impl Drop for PrioritySender {

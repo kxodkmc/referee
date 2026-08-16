@@ -9,6 +9,11 @@ pub enum KernelError {
     TargetUnreachable,
     #[error("extension crashed")]
     ExtensionCrashed,
+    /// 扩展终态退出（熔断 / 重启超限 / 停机）时未消费积压的转储原因。
+    /// 与 `ExtensionCrashed`（投递时刻状态拦截）区分：此类消息在扩展
+    /// 重新注册后适合重放。
+    #[error("extension stopped: backlog drained to DLQ")]
+    ExtensionStopped,
     #[error("resource exhausted: channel buffer full (backpressure triggered)")]
     ResourceExhausted,
     #[error("operation timed out")]

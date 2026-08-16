@@ -10,7 +10,7 @@ use axum::response::sse::{Event, Sse};
 use futures::stream::{BoxStream, Stream};
 use futures::StreamExt;
 
-use referee_ai_base::provider::{LlmError, StreamChunk};
+use referee_ai::provider::{LlmError, StreamChunk};
 
 use crate::chat;
 use crate::protocol::StreamFrame;

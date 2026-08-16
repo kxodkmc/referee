@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use referee_ai_base::engine::EngineConfig;
+use referee_ai::engine::EngineConfig;
 use referee_agent::AgentDefinition;
 use referee_agent::AgentId;
 
@@ -223,8 +223,8 @@ pub struct TokenUsageData {
     pub total_tokens: u64,
 }
 
-impl From<&referee_ai_base::provider::TokenUsage> for TokenUsageData {
-    fn from(u: &referee_ai_base::provider::TokenUsage) -> Self {
+impl From<&referee_ai::provider::TokenUsage> for TokenUsageData {
+    fn from(u: &referee_ai::provider::TokenUsage) -> Self {
         Self {
             prompt_tokens: u.prompt_tokens as u64,
             completion_tokens: u.completion_tokens as u64,
@@ -320,7 +320,7 @@ mod tests {
 
     #[test]
     fn token_usage_data_from_base() {
-        let u = referee_ai_base::provider::TokenUsage {
+        let u = referee_ai::provider::TokenUsage {
             prompt_tokens: 1,
             completion_tokens: 2,
             total_tokens: 3,

@@ -7,7 +7,7 @@
 //!   并对二进制嗅探，杜绝损坏文件。
 
 use async_trait::async_trait;
-use referee_ai_base::tool::{Tool, ToolCategory, ToolContext, ToolError, ToolOutput};
+use referee_ai::tool::{Tool, ToolCategory, ToolContext, ToolError, ToolOutput};
 use serde_json::{json, Value};
 
 use super::fs_common::{atomic_write, looks_binary, read_bounded, resolve_path, FsConfig};

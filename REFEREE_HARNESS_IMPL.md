@@ -9,7 +9,7 @@
 |---|---|---|
 | 新建 crate | `referee-harness`（workspace 第 4 个成员） | 依赖 agent/base/core，职责=入口/宿主层 |
 | 落地差距 | G1 / G2 / G3 / G4 / G6 / G7 / G8 | G9 留 P2、G5 留 P3 |
-| 配套改动 | `referee-ai-base` 新增 `persist` feature | 会话落盘 sink（默认关，零依赖） |
+| 配套改动 | `referee-ai` 新增 `persist` feature | 会话落盘 sink（默认关，零依赖） |
 | 硬约束 | 零新增依赖；不吞异常；背压有界 | 对齐项目内核哲学 |
 
 ## 2. 文件结构
@@ -25,7 +25,7 @@ referee-harness/
 │   ├── transport.rs          # §7 TCP JSON-RPC 2.0（feature "tcp"）
 │   └── bin/
 │       └── referee-harness.rs # §8 daemon 二进制入口
-├── referee-ai-base/（配套改动）
+├── referee-ai/（配套改动）
 │   └── src/session/log.rs    # §9 SessionLogSink + PersistedSessionLog（feature "persist"）
 └── tests/
     └── harness_test.rs        # §10 集成测试
@@ -58,7 +58,7 @@ openai     = ["referee-agent/openai"]
 
 [dependencies]
 referee-core    = { path = "../referee-core" }
-referee-ai-base = { path = "../referee-ai-base", features = ["persist"] }
+referee-ai = { path = "../referee-ai", features = ["persist"] }
 referee-agent   = { path = "../referee-agent" }
 tokio           = { version = "1", features = ["full"] }
 serde           = { version = "1", features = ["derive"] }
@@ -75,7 +75,7 @@ bytes           = "1"
 tracing-subscriber = "0.3"
 ```
 
-**base 配套改动**：`referee-ai-base/Cargo.toml` 新增 `persist = []`（默认关，零依赖）。
+**base 配套改动**：`referee-ai/Cargo.toml` 新增 `persist = []`（默认关，零依赖）。
 
 ## 4. protocol.rs — serde 协议类型
 
@@ -216,8 +216,8 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use dashmap::DashMap;
 use tokio::sync::RwLock;
-use referee_ai_base::engine::{ChatHandle, Engine, EngineConfig, EngineReply, EngineStartError};
-use referee_ai_base::session::{ChatPayload, SessionId};
+use referee_ai::engine::{ChatHandle, Engine, EngineConfig, EngineReply, EngineStartError};
+use referee_ai::session::{ChatPayload, SessionId};
 use referee_agent::AgentRuntime;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -446,9 +446,9 @@ async fn main() {
 
 ## 9. 配套 base 改动 — 会话落盘 sink
 
-**职责**：在 `referee-ai-base` 提供可插拔的会话事实落盘能力；**默认关闭、零行为变化**。
+**职责**：在 `referee-ai` 提供可插拔的会话事实落盘能力；**默认关闭、零行为变化**。
 
-改动文件：`referee-ai-base/src/session/log.rs`（`#[cfg(feature = "persist")]` 门控）。
+改动文件：`referee-ai/src/session/log.rs`（`#[cfg(feature = "persist")]` 门控）。
 
 ```rust
 /// 会话事实落盘 sink trait（可插拔，对齐 WalSink append 语义）
@@ -516,9 +516,9 @@ impl PersistedSessionLog {
 
 1. `cargo build -p referee-harness` 通过
 2. `cargo test -p referee-harness` 13+ 集成测试通过
-3. `cargo test -p referee-ai-base` 既有测试不回归
+3. `cargo test -p referee-ai` 既有测试不回归
 4. `cargo clippy -p referee-harness --all-targets` 零告警
-5. `cargo clippy -p referee-ai-base --all-targets` 零新增告警
+5. `cargo clippy -p referee-ai --all-targets` 零新增告警
 6. 手动：`cargo run --bin referee-harness -- --state-dir /tmp/test-state` 启动后，
    用 `nc`/`socat` 发 JSON-RPC 请求得到响应
 7. 手动：kill -9 后重启 → 实例恢复、历史对话可查

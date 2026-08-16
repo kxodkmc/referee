@@ -46,4 +46,9 @@ impl ShutdownRx {
         }
         let _ = rx.changed().await;
     }
+
+    /// 停机信号是否已触发（同步探测，供监督循环决定是否放弃自愈）
+    pub fn is_triggered(&self) -> bool {
+        *self.rx.borrow()
+    }
 }

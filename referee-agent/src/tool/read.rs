@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use referee_ai_base::tool::{Tool, ToolCategory, ToolContext, ToolError, ToolOutput};
+use referee_ai::tool::{Tool, ToolCategory, ToolContext, ToolError, ToolOutput};
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -210,7 +210,7 @@ fn back_to_boundary(chars: &[char], start: usize, raw_end: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use referee_ai_base::tool::ToolError;
+    use referee_ai::tool::ToolError;
     use uuid::Uuid;
 
     fn ctx() -> ToolContext {

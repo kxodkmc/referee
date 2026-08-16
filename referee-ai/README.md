@@ -1,4 +1,4 @@
-# Referee AI Base — Agent 核心支撑层（地基）
+# Referee AI — Agent 核心支撑层（地基）
 
 业务无关的**基础 AI 设施**积木，提供「接 LLM → 组装 prompt → 调工具 → 管预算 →
 回复」的最小闭环，并在此基础上提供**流式输出**、**会话生命周期管理**（快照 / 枚举 /
@@ -22,7 +22,7 @@
 ## 快速上手
 
 ```rust
-use referee_ai_base::{Engine, EngineConfig, LLMProvider, ...};
+use referee_ai::{Engine, EngineConfig, LLMProvider, ...};
 
 // provider 由适配器构造（如 XiaomiProvider / DeepSeekProvider / 自实现）
 let engine = Engine::new(provider, EngineConfig::default());
@@ -36,7 +36,7 @@ handle.cancel();
 
 // 流式发起一轮会话：句柄 wait() 得到 EngineReply::Streaming，逐 chunk 消费
 let handle = engine.chat_stream(session_id, ChatPayload::default())?;
-if let referee_ai_base::EngineReply::Streaming(mut chunks) = handle.wait().await? {
+if let referee_ai::EngineReply::Streaming(mut chunks) = handle.wait().await? {
     while let Some(chunk) = chunks.next().await {
         // chunk: Result<StreamChunk, LlmError> —— 边生成边消费
     }
@@ -50,7 +50,7 @@ if let referee_ai_base::EngineReply::Streaming(mut chunks) = handle.wait().await
 共同命中的根本前提），并做**条件省略**与**预算截断**：
 
 ```rust
-use referee_ai_base::prompt::{assemble, AssembleParts, SystemSection};
+use referee_ai::prompt::{assemble, AssembleParts, SystemSection};
 
 let req = assemble(AssembleParts {
     sections: vec![
@@ -118,7 +118,7 @@ let req = assemble(AssembleParts {
 ## 验证
 
 ```bash
-cargo test -p referee-ai-base            # 121 条
-cargo test -p referee-ai-base prompt     # 提示词分段编排（assemble / 截断 / 稳定性排序）
-cargo clippy -p referee-ai-base --all-targets -- -D warnings
+cargo test -p referee-ai            # 121 条
+cargo test -p referee-ai prompt     # 提示词分段编排（assemble / 截断 / 稳定性排序）
+cargo clippy -p referee-ai --all-targets -- -D warnings
 ```

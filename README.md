@@ -1,7 +1,7 @@
 # Referee — 轻量微内核 + 智能体三层架构
 
 > 工业级防护能力的轻量引擎仓库。内核只做**通信与治理**；AI 能力分为**地基层**与
-> **业务封装层**：`referee-ai-base` 提供业务无关的核心支撑积木，`referee-agent`
+> **业务封装层**：`referee-ai` 提供业务无关的核心支撑积木，`referee-agent`
 > 提供开箱即用的完整 Agent 封装。
 
 ```
@@ -11,7 +11,7 @@
 │   对等协作 AgentTool · ACL 工件存储 · 成果板读取工具           │
 │   MCP stdio（mcp-stdio）· Skills（skills）                   │
 ├─────────────────────────────────────────────────────────────┤
-│ referee-ai-base（核心支撑，地基积木）                          │
+│ referee-ai（核心支撑，地基积木）                          │
 │   provider · session · tool · store · budget · prompt ·     │
 │   cache · observe · engine（最小闭环 + 流式 + 会话生命周期）    │
 │   （prompt 分段编排 · 消息用量元数据 · 缓存命中计量）            │
@@ -25,23 +25,23 @@
 
 | 模块 | 定位 | 测试 |
 |------|------|------|
-| [`referee-core`](referee-core/) | **微内核**：路由 / 原语 / 治理（背压、熔断、监督、停机、DLQ、WAL） | 25 条 |
-| [`referee-ai-base`](referee-ai-base/) | **核心支撑（地基）**：厂商抽象、会话引擎（最小闭环 + 流式 + 会话生命周期）、工具执行（同步/异步派发 + 白名单过滤）、通用 KV、预算、**提示词分段编排**、缓存、可观测、**用量/缓存命中计量** | 121 条 |
+| [`referee-core`](referee-core/) | **微内核**：路由 / 原语 / 治理（背压、熔断、挂起治理、监督、停机、DLQ、WAL） | 34 条 |
+| [`referee-ai`](referee-ai/) | **核心支撑（地基）**：厂商抽象、会话引擎（最小闭环 + 流式 + 会话生命周期）、工具执行（同步/异步派发 + 白名单过滤）、通用 KV、预算、**提示词分段编排**、缓存、可观测、**用量/缓存命中计量** | 121 条 |
 | [`referee-agent`](referee-agent/) | **业务封装（开箱即用）**：Extension 集成、Agent 定义/配置（`agent`）、对等协作、ACL 工件存储、成果板读取工具；MCP stdio（`mcp-stdio`）与 Skills（`skills`）按需 feature | 31 条（25 库 + 6 对等集成，默认） |
 
-合计 **177 条测试全绿**（`cargo test --workspace`，默认 feature；启用 `skills` / `mcp-stdio` 后更多）。
+合计 **186 条测试全绿**（`cargo test --workspace`，默认 feature；启用 `skills` / `mcp-stdio` 后更多）。
 
 ## 组合使用
 
 ```toml
 [dependencies]
 referee-core    = { path = "referee-core" }                # 通信与治理
-referee-ai-base = { path = "referee-ai-base" }             # 核心支撑积木
+referee-ai = { path = "referee-ai" }             # 核心支撑积木
 referee-agent   = { path = "referee-agent" }               # 开箱即用 Agent（可选，按需引入）
 ```
 
 1. 用 `referee-core` 的 `Kernel` 注册扩展，获得有界通道、Panic 熔断、优雅停机等治理能力。
-2. 用 `referee-ai-base` 的 `Engine` 直接驱动「接 LLM → 组装 prompt → 调工具 → 管预算 →
+2. 用 `referee-ai` 的 `Engine` 直接驱动「接 LLM → 组装 prompt → 调工具 → 管预算 →
    回复」的最小闭环；也可自由组合其积木搭建定制能力。`prompt::assemble` 提供**分段编排**
    （稳定段在前、空能力段省略），`Message::usage` 携带单条消息的用量与缓存命中数据。
 3. 需要完整/协作者 Agent 时，用 `referee-agent` 的 `AgentRuntime`（实现 `Extension` trait）
@@ -56,7 +56,7 @@ referee-agent   = { path = "referee-agent" }               # 开箱即用 Agent�
 | 文档 | 说明 |
 |------|------|
 | [`referee-core/README.md`](referee-core/README.md) | 内核模块：设计原则、核心能力、错误模型、安全契约 |
-| [`referee-ai-base/README.md`](referee-ai-base/README.md) | 地基层：核心支撑积木（provider/session/tool/store/budget/prompt/cache/observe/engine） |
+| [`referee-ai/README.md`](referee-ai/README.md) | 地基层：核心支撑积木（provider/session/tool/store/budget/prompt/cache/observe/engine） |
 | [`referee-agent/README.md`](referee-agent/README.md) | 业务封装层：Extension 集成、Agent 定义/配置、对等协作、开箱即用 Agent |
 | [`AGENT_RUNTIME_PLAN.md`](AGENT_RUNTIME_PLAN.md) | Agent 运行时落地计划（历史规划，P0 ~ P7 阶段验收标准） |
 | [`REFACTOR_PLAN.md`](REFACTOR_PLAN.md) | 重构执行规划（两层拆分边界与验收口径） |
@@ -66,7 +66,7 @@ referee-agent   = { path = "referee-agent" }               # 开箱即用 Agent�
 ## 验证
 
 ```bash
-cargo test --workspace                      # 全量回归（core 25 + base 121 + agent 31 = 177 条）
+cargo test --workspace                      # 全量回归（core 34 + base 121 + agent 31 = 186 条）
 cargo test --workspace --features "skills mcp-stdio"   # 含业务扩展（MCP 协议 / Skills 注入）
 cargo clippy --workspace --all-targets -- -D warnings  # 零警告
 cargo fmt --check                           # 格式整洁
@@ -76,9 +76,9 @@ cargo fmt --check                           # 格式整洁
 
 ### referee-core（微内核）— 全部完成
 
-Phase 1 骨架与背压 → Phase 2 invoke 原语 → Phase 3 容错与隔离 → Phase 4 治理与生命周期 → Phase 5 可观测 → Phase 6 并发安全与 WAL。
+Phase 1 骨架与背压 → Phase 2 invoke 原语 → Phase 3 容错与隔离 → Phase 4 治理与生命周期 → Phase 5 可观测 → Phase 6 并发安全与 WAL → 监督治理加固（挂起治理 / 积压转储 / 停机消息守恒）。
 
-### referee-ai-base（核心支撑地基）— 全部完成
+### referee-ai（核心支撑地基）— 全部完成
 
 - **厂商抽象**：`LLMProvider` trait、纯数据模型、错误归一与重试、能力声明、OpenAI 兼容底座 + 适配器（DeepSeek / MiMo）。`TokenUsage` 记录输入/输出/推理/缓存命中（命中 → 未命中，含归一化 `cache_read/write_tokens`）。
 - **会话引擎**：`Engine` 最小闭环，流式输出（`chat_stream`）与会话生命周期（快照 / 枚举 / 删除 / 空闲回收）。
