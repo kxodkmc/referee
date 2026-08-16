@@ -1,7 +1,7 @@
 //! `write` 工具 — 创建 / 完全替换文件（原子写，防半写）
 
 use async_trait::async_trait;
-use referee_ai_base::tool::{Tool, ToolCategory, ToolContext, ToolError, ToolOutput};
+use referee_ai::tool::{Tool, ToolCategory, ToolContext, ToolError, ToolOutput};
 use serde_json::{json, Value};
 
 use super::fs_common::{atomic_write, resolve_path, FsConfig};

@@ -12,8 +12,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
 use futures::StreamExt;
-use referee_ai_base::engine::EngineConfig;
-use referee_ai_base::provider::{
+use referee_ai::engine::EngineConfig;
+use referee_ai::provider::{
     ChatRequest, ChatResponse, FinishReason, LLMProvider, LlmError, Message, ProviderCapabilities,
     ProviderId, StreamChunk, TokenUsage,
 };
@@ -57,7 +57,7 @@ fn caps() -> &'static ProviderCapabilities {
         streaming: true,
         usage_reported: true,
         max_output_tokens: 4096,
-        multimodal: referee_ai_base::provider::MultimodalCapabilities::NONE,
+        multimodal: referee_ai::provider::MultimodalCapabilities::NONE,
     };
     &C
 }
@@ -101,7 +101,7 @@ impl LLMProvider for MockProvider {
                 content: Some(reply),
                 reasoning_content: None,
                 tool_calls: vec![],
-                role: Some(referee_ai_base::provider::Role::Assistant),
+                role: Some(referee_ai::provider::Role::Assistant),
             })
         })
         .chain(stream::once(async move {

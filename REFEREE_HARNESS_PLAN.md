@@ -30,7 +30,7 @@
               └──────────┬─────────────────────────┘
                          │ 实例 = AgentRuntime（Engine + 工具 + 模板注册表）
               ┌──────────▼─────────────────────────┐
-              │   referee-agent ｜ referee-ai-base ｜ referee-core    │
+              │   referee-agent ｜ referee-ai ｜ referee-core    │
               └─────────────────────────────────────┘
 ```
 
@@ -77,11 +77,11 @@
 | 层 | 已有 | 代码位置 |
 |---|---|---|
 | 内核 | Kernel 路由 / 治理 / 背压 / WAL；`Extension` | `referee-core` |
-| provider | `LLMProvider` trait、`ChatRequest/Response`、`StreamChunk{Delta,Finish}`、DeepSeek / 小米 / OpenAI 兼容适配器 | `referee-ai-base/src/provider` |
-| 引擎 | `Engine`：`chat` / `chat_stream` / `interrupt` / 会话生命周期 / 预算 / 缓存 / Token 计量；`EngineConfig` | `referee-ai-base/src/engine` |
-| 会话 | `SessionId`、`ChatPayload`、`ChatOptions`、`SessionReply`、`SessionSnapshot`、`SessionConfig` | `referee-ai-base/src/session` |
-| 工具 | `ToolExecutor` / `ToolRegistry`（有界、等待/派发分流、截断/panic 隔离/超时） | `referee-ai-base/src/tool` |
-| 观测 | metrics 计数器 + tracing spans | `referee-ai-base/src/observe` |
+| provider | `LLMProvider` trait、`ChatRequest/Response`、`StreamChunk{Delta,Finish}`、DeepSeek / 小米 / OpenAI 兼容适配器 | `referee-ai/src/provider` |
+| 引擎 | `Engine`：`chat` / `chat_stream` / `interrupt` / 会话生命周期 / 预算 / 缓存 / Token 计量；`EngineConfig` | `referee-ai/src/engine` |
+| 会话 | `SessionId`、`ChatPayload`、`ChatOptions`、`SessionReply`、`SessionSnapshot`、`SessionConfig` | `referee-ai/src/session` |
+| 工具 | `ToolExecutor` / `ToolRegistry`（有界、等待/派发分流、截断/panic 隔离/超时） | `referee-ai/src/tool` |
+| 观测 | metrics 计数器 + tracing spans | `referee-ai/src/observe` |
 | 业务封装 | `AgentRuntime`（Extension + 库 API）：`chat_stream` / 会话 / 用量 / 工具注入 | `referee-agent/src/lib.rs` |
 | Agent 定义 | `AgentDefinition`（JSON）、`AgentBuilder`、`AgentRegistry`、`BoundAgent.bind_with` | `referee-agent/src/agent` |
 | 可替换模板 | `TemplateRef::Named` + `TemplateRegistry`（覆盖替换、`{{var}}` 严格插值） | `referee-agent/src/agent/template.rs` |

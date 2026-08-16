@@ -1,7 +1,7 @@
 //! 对等智能体工具 — 将一个 Session 暴露为 Local 工具（Agent as Tool）
 //!
 //! 业务层能力：把一个 Agent 会话封装为另一个 Agent 可调用的工具，实现
-//! 子 Agent / 多 Agent 协作。基于 `referee-ai-base` 的统一 `Tool` 抽象接入。
+//! 子 Agent / 多 Agent 协作。基于 `referee-ai` 的统一 `Tool` 抽象接入。
 //!
 //! ## 设计要点
 //! - **Local 分类**：`category() = Local`，不占用 `ToolExecutor` 外部 IO 槽位，
@@ -18,9 +18,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use referee_ai_base::provider::Message;
-use referee_ai_base::session::{ChatOptions, ChatPayload, SessionMessage, SessionReply};
-use referee_ai_base::tool::{Tool, ToolCategory, ToolContext, ToolError, ToolOutput};
+use referee_ai::provider::Message;
+use referee_ai::session::{ChatOptions, ChatPayload, SessionMessage, SessionReply};
+use referee_ai::tool::{Tool, ToolCategory, ToolContext, ToolError, ToolOutput};
 use serde_json::{json, Value};
 
 use crate::artifact::{Artifact, ArtifactStore, StoreError};

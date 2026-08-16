@@ -16,8 +16,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use referee_ai_base::provider::Message;
-use referee_ai_base::session::{LogError, SessionId, SessionLogSink};
+use referee_ai::provider::Message;
+use referee_ai::session::{LogError, SessionId, SessionLogSink};
 
 use crate::protocol::{InstanceId, InstanceSpec};
 

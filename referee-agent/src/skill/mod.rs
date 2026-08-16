@@ -162,8 +162,8 @@ pub struct SkillDeclaration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use referee_ai_base::prompt::{build_prompt, PromptParts};
-    use referee_ai_base::provider::{Message, ThinkingConfig};
+    use referee_ai::prompt::{build_prompt, PromptParts};
+    use referee_ai::provider::{Message, ThinkingConfig};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -275,7 +275,7 @@ mod tests {
         let sys_text = req
             .messages
             .iter()
-            .find(|m| m.role == referee_ai_base::Role::System)
+            .find(|m| m.role == referee_ai::Role::System)
             .expect("system message present")
             .content
             .as_text()

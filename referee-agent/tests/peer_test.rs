@@ -18,13 +18,13 @@ use futures::stream::BoxStream;
 use referee_agent::artifact::{ArtifactStore, InMemoryArtifactStore};
 use referee_agent::tool::AgentTool;
 use referee_agent::AgentRuntime;
-use referee_ai_base::engine::{Engine, EngineConfig};
-use referee_ai_base::provider::{
+use referee_ai::engine::{Engine, EngineConfig};
+use referee_ai::provider::{
     ChatRequest, ChatResponse, FinishReason, LLMProvider, LlmError, Message, ProviderCapabilities,
     ProviderId, StreamChunk, TokenUsage, ToolCall, ToolCallFunction,
 };
-use referee_ai_base::session::{ChatOptions, ChatPayload, SessionId, SessionMessage, SessionReply};
-use referee_ai_base::tool::{ExecutorConfig, Tool, ToolContext, ToolRegistry};
+use referee_ai::session::{ChatOptions, ChatPayload, SessionId, SessionMessage, SessionReply};
+use referee_ai::tool::{ExecutorConfig, Tool, ToolContext, ToolRegistry};
 use referee_core::{CapabilityId, Kernel, SupervisionPolicy};
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -89,7 +89,7 @@ fn caps() -> &'static ProviderCapabilities {
         streaming: false,
         usage_reported: true,
         max_output_tokens: 4096,
-        multimodal: referee_ai_base::provider::MultimodalCapabilities::NONE,
+        multimodal: referee_ai::provider::MultimodalCapabilities::NONE,
     };
     &CAPS
 }
@@ -117,7 +117,7 @@ impl LLMProvider for PeerMockProvider {
                     .messages
                     .iter()
                     .rev()
-                    .find(|m| m.role == referee_ai_base::Role::Tool);
+                    .find(|m| m.role == referee_ai::Role::Tool);
                 let content = last_tool
                     .and_then(|m| m.content.as_text())
                     .unwrap_or(fallback);
@@ -125,7 +125,7 @@ impl LLMProvider for PeerMockProvider {
             }
             Behavior::EchoAsyncInjection(fallback) => {
                 let injected = req.messages.iter().rev().any(|m| {
-                    m.role == referee_ai_base::Role::User
+                    m.role == referee_ai::Role::User
                         && m.content
                             .as_text()
                             .map(|t| t.contains("artifact_id"))
@@ -166,9 +166,9 @@ impl Tool for HttpSlowTool {
         &self,
         _ctx: ToolContext,
         _args: Value,
-    ) -> Result<referee_ai_base::tool::ToolOutput, referee_ai_base::tool::ToolError> {
+    ) -> Result<referee_ai::tool::ToolOutput, referee_ai::tool::ToolError> {
         tokio::time::sleep(Duration::from_millis(300)).await;
-        Ok(referee_ai_base::tool::ToolOutput::text("http_ok"))
+        Ok(referee_ai::tool::ToolOutput::text("http_ok"))
     }
 }
 
@@ -228,7 +228,7 @@ async fn setup_runtime(
     kernel: &Kernel,
     provider: Arc<PeerMockProvider>,
     tools: Vec<Arc<dyn Tool>>,
-    executor: referee_ai_base::tool::ToolExecutor,
+    executor: referee_ai::tool::ToolExecutor,
     store: Option<Arc<dyn ArtifactStore>>,
 ) -> CapabilityId {
     let registry = ToolRegistry::with_defaults();
@@ -257,7 +257,7 @@ async fn setup_runtime(
 async fn resource_pool_deadlock_fixed() {
     let kernel = Kernel::new();
     let store: Arc<dyn ArtifactStore> = Arc::new(InMemoryArtifactStore::with_defaults());
-    let executor = referee_ai_base::tool::ToolExecutor::new(ExecutorConfig {
+    let executor = referee_ai::tool::ToolExecutor::new(ExecutorConfig {
         max_per_turn: 10,
         tool_timeout: Duration::from_secs(2),
         max_concurrency: 2,
@@ -387,7 +387,7 @@ async fn cyclic_call_rejected() {
     )
     .with_tools(
         ToolRegistry::with_defaults(),
-        referee_ai_base::tool::ToolExecutor::with_defaults().with_kernel(kernel.clone()),
+        referee_ai::tool::ToolExecutor::with_defaults().with_kernel(kernel.clone()),
     );
     let engine_b = Engine::new(
         Arc::new(PeerMockProvider::new(vec![
@@ -405,7 +405,7 @@ async fn cyclic_call_rejected() {
     )
     .with_tools(
         ToolRegistry::with_defaults(),
-        referee_ai_base::tool::ToolExecutor::with_defaults().with_kernel(kernel.clone()),
+        referee_ai::tool::ToolExecutor::with_defaults().with_kernel(kernel.clone()),
     );
 
     let runtime_a = AgentRuntime::new(engine_a);
@@ -469,7 +469,7 @@ async fn artifact_board_end_to_end() {
             &long_text,
         ))])),
         vec![],
-        referee_ai_base::tool::ToolExecutor::with_defaults(),
+        referee_ai::tool::ToolExecutor::with_defaults(),
         Some(store.clone()),
     )
     .await;
@@ -520,7 +520,7 @@ async fn artifact_board_end_to_end() {
 #[tokio::test]
 async fn peer_registration_parallel() {
     let kernel = Kernel::new();
-    let executor = referee_ai_base::tool::ToolExecutor::with_defaults();
+    let executor = referee_ai::tool::ToolExecutor::with_defaults();
 
     let sid_x = Uuid::new_v4();
     let sid_y = Uuid::new_v4();
@@ -594,7 +594,7 @@ async fn peer_registration_parallel() {
 async fn async_dispatch_peer_result_injected_next_turn() {
     let kernel = Kernel::new();
     let store = Arc::new(InMemoryArtifactStore::with_defaults());
-    let executor = referee_ai_base::tool::ToolExecutor::with_defaults();
+    let executor = referee_ai::tool::ToolExecutor::with_defaults();
 
     // 目标 Agent B：收到任务后延迟回复（模拟耗时子任务）
     let sid_b = Uuid::new_v4();
@@ -672,7 +672,7 @@ async fn async_dispatch_peer_result_injected_next_turn() {
 #[tokio::test]
 async fn subagent_nesting_depth_limit_chain() {
     let kernel = Kernel::new();
-    let executor = referee_ai_base::tool::ToolExecutor::with_defaults();
+    let executor = referee_ai::tool::ToolExecutor::with_defaults();
 
     // D：叶子 runtime（C 深度 2 无法触达，仅作为 agent_d 目标占位）
     let sid_d = Uuid::new_v4();

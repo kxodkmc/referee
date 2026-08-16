@@ -16,10 +16,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use dashmap::DashMap;
 use tokio::sync::RwLock;
 
-use referee_ai_base::engine::{ChatHandle, Engine, EngineStartError};
-use referee_ai_base::provider::Message;
-use referee_ai_base::session::{ChatPayload, SessionId};
-use referee_ai_base::tool::{ToolExecutor, ToolRegistry};
+use referee_ai::engine::{ChatHandle, Engine, EngineStartError};
+use referee_ai::provider::Message;
+use referee_ai::session::{ChatPayload, SessionId};
+use referee_ai::tool::{ToolExecutor, ToolRegistry};
 use referee_agent::tool::fs_common::FsConfig;
 use referee_agent::tool::read::ReadToolConfig;
 use referee_agent::{AgentRuntime, InMemoryArtifactStore};
@@ -76,8 +76,8 @@ impl Instance {
     pub fn create(
         spec: InstanceSpec,
         id: InstanceId,
-        provider: Arc<dyn referee_ai_base::provider::LLMProvider>,
-        log_sink: Option<Arc<dyn referee_ai_base::session::SessionLogSink>>,
+        provider: Arc<dyn referee_ai::provider::LLMProvider>,
+        log_sink: Option<Arc<dyn referee_ai::session::SessionLogSink>>,
         global_budget: Arc<AtomicU64>,
     ) -> Result<Self, ServerError> {
         // 1. AgentDefinition → 绑定模板 → 系统提示词
@@ -160,7 +160,7 @@ impl Instance {
 
     /// 会话列表（instance.sessions）
     pub fn session_infos(&self) -> Vec<crate::protocol::SessionInfo> {
-        use referee_ai_base::engine::SessionPhase;
+        use referee_ai::engine::SessionPhase;
         self.runtime
             .list_sessions()
             .into_iter()
@@ -285,7 +285,7 @@ impl InstanceManager {
     pub fn create_with_provider(
         &self,
         spec: InstanceSpec,
-        provider: Option<Arc<dyn referee_ai_base::provider::LLMProvider>>,
+        provider: Option<Arc<dyn referee_ai::provider::LLMProvider>>,
     ) -> Result<InstanceId, ServerError> {
         let id = match &spec.id {
             Some(s) => {
@@ -424,7 +424,7 @@ impl InstanceManager {
 /// 按厂商配置构造 LLM 提供者（feature 门控；未启用或不可用 → 显式 ERR_INVALID_SPEC）
 fn build_provider(
     cfg: &ProviderConfig,
-) -> Result<Arc<dyn referee_ai_base::provider::LLMProvider>, ServerError> {
+) -> Result<Arc<dyn referee_ai::provider::LLMProvider>, ServerError> {
     match cfg {
         #[cfg(feature = "deepseek")]
         ProviderConfig::DeepSeek {
@@ -432,7 +432,7 @@ fn build_provider(
             base_url,
             model,
         } => {
-            use referee_ai_base::provider::deepseek::{DeepSeekConfig, DeepSeekModel, DeepSeekProvider};
+            use referee_ai::provider::deepseek::{DeepSeekConfig, DeepSeekModel, DeepSeekProvider};
             let m = match model.as_deref() {
                 Some(s) if s.contains("pro") => DeepSeekModel::V4Pro,
                 _ => DeepSeekModel::V4Flash,
@@ -442,18 +442,18 @@ fn build_provider(
                 c = c.with_base_url(url.clone());
             }
             DeepSeekProvider::new(m, c)
-                .map(|p| Arc::new(p) as Arc<dyn referee_ai_base::provider::LLMProvider>)
+                .map(|p| Arc::new(p) as Arc<dyn referee_ai::provider::LLMProvider>)
                 .map_err(|e| ServerError::new(ErrorCode::ERR_INVALID_SPEC, e.to_string()))
         }
         #[cfg(feature = "xiaomi")]
         ProviderConfig::XiaoMi { api_key, base_url } => {
-            use referee_ai_base::provider::xiaomi::{XiaomiConfig, XiaomiModel, XiaomiProvider};
+            use referee_ai::provider::xiaomi::{XiaomiConfig, XiaomiModel, XiaomiProvider};
             let mut c = XiaomiConfig::new(api_key.clone());
             if let Some(url) = base_url {
                 c = c.with_base_url(url.clone());
             }
             XiaomiProvider::new(XiaomiModel::MimoV25Pro, c)
-                .map(|p| Arc::new(p) as Arc<dyn referee_ai_base::provider::LLMProvider>)
+                .map(|p| Arc::new(p) as Arc<dyn referee_ai::provider::LLMProvider>)
                 .map_err(|e| ServerError::new(ErrorCode::ERR_INVALID_SPEC, e.to_string()))
         }
         #[cfg(not(feature = "deepseek"))]

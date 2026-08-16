@@ -11,9 +11,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use referee_ai_base::provider::ToolDeclaration;
-use referee_ai_base::prompt::SystemSection;
-use referee_ai_base::tool::ToolRegistry;
+use referee_ai::provider::ToolDeclaration;
+use referee_ai::prompt::SystemSection;
+use referee_ai::tool::ToolRegistry;
 
 use super::definition::{whitelist_to_set, AgentDefinition, ChatParams, TemplateRef};
 use super::id::AgentId;

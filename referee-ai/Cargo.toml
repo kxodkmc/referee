@@ -1,5 +1,5 @@
 [package]
-name = "referee-ai-base"
+name = "referee-ai"
 version = "0.1.0"
 edition = "2021"
 description = "Agent 核心支撑层（地基）：LLM 厂商抽象、会话状态机、工具执行、预算治理、提示词组装、缓存与可观测。"

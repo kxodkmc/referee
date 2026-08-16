@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
-use referee_ai_base::tool::{Tool, ToolCategory, ToolContext, ToolError, ToolOutput};
+use referee_ai::tool::{Tool, ToolCategory, ToolContext, ToolError, ToolOutput};
 use serde_json::{json, Value};
 
 use crate::artifact::ArtifactStore;

@@ -7,8 +7,8 @@
 use futures::stream::BoxStream;
 use futures::StreamExt;
 
-use referee_ai_base::provider::{ChatResponse, FinishReason, LlmError, Message, StreamChunk, TokenUsage};
-use referee_ai_base::session::{ChatOptions, ChatPayload, SessionId};
+use referee_ai::provider::{ChatResponse, FinishReason, LlmError, Message, StreamChunk, TokenUsage};
+use referee_ai::session::{ChatOptions, ChatPayload, SessionId};
 
 use crate::protocol::{ChatReply, ServerError, StreamFrame, TokenUsageData, ERR_INTERNAL};
 

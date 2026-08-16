@@ -7,8 +7,8 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use referee_ai_base::engine::EngineReply;
-use referee_ai_base::session::SessionId;
+use referee_ai::engine::EngineReply;
+use referee_ai::session::SessionId;
 
 use crate::chat;
 use crate::instance::{err, InstanceManager};

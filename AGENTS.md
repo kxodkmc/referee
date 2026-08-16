@@ -24,7 +24,7 @@
 
 - **Phase 1 ~ 6（referee-core）**：✅ 全部完成——骨架与背压 → invoke 原语 → 容错与隔离 →
   治理闭环 → 可观测层 → 并发安全与 WAL。
-- **referee-ai-base（地基积木）**：✅ 已完成——厂商抽象、会话状态机、工具执行（同步/异步
+- **referee-ai（地基积木）**：✅ 已完成——厂商抽象、会话状态机、工具执行（同步/异步
   派发）、通用 KV、预算、提示词、缓存、可观测、会话引擎（最小闭环 + 流式 + 会话生命周期）。
 - **referee-agent（业务封装）**：✅ 已完成核心——Extension 集成、对等协作（Agent as Tool）、
   ACL 工件存储、成果板读取工具；MCP 2.0 stdio 客户端桥 / Agent Skills（SKILL.md）注入以
@@ -33,9 +33,9 @@
 
 ## 工作约束
 
-- 遵循三层目录结构（`referee-core` 内核 / `referee-ai-base` 地基 / `referee-agent` 业务封装），职责不越界。
+- 遵循三层目录结构（`referee-core` 内核 / `referee-ai` 地基 / `referee-agent` 业务封装），职责不越界。
 - 改动后运行对应测试（core：`tests/backpressure_test.rs`、`tests/isolation_test.rs`；base/agent：对应模块测试）与 `cargo check`。
 - 依赖仅使用规范清单内的库，不擅自引入新依赖：
   - `referee-core`：tokio、dashmap、parking_lot、serde、bytes、thiserror、async-trait、uuid、futures、tracing、metrics、tracing-subscriber[dev]
-  - `referee-ai-base` / `referee-agent`：上列 + `serde_json`、`reqwest`（base 专用）
+  - `referee-ai` / `referee-agent`：上列 + `serde_json`、`reqwest`（referee-ai 专用）
 - 提交前自查：是否引入无界分配？是否破坏 Panic 隔离？是否违反数据/行为分离？

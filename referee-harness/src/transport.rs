@@ -19,8 +19,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Semaphore};
 
-use referee_ai_base::engine::EngineReply;
-use referee_ai_base::session::SessionId;
+use referee_ai::engine::EngineReply;
+use referee_ai::session::SessionId;
 
 use crate::chat;
 use crate::instance::{err as ERR, InstanceManager};
