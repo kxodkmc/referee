@@ -1,3 +1,3 @@
 [workspace]
-members = ["referee-core", "referee-ai", "referee-agent", "referee-harness"]
+members = ["referee-core", "referee-ai", "referee-agent", "referee-aura"]
 resolver = "2"

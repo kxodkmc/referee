@@ -90,7 +90,7 @@ pub async fn serve_tcp(
     let listener = TcpListener::bind(bind_addr)
         .await
         .map_err(|e| ServerError::new(ERR::ERR_INTERNAL, format!("bind {bind_addr}: {e}")))?;
-    tracing::info!(addr = %bind_addr, "referee-harness listening on tcp");
+    tracing::info!(addr = %bind_addr, "referee-aura listening on tcp");
     loop {
         tokio::select! {
             _ = shutdown.changed() => {

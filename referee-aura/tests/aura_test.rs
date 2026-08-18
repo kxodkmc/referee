@@ -1,6 +1,6 @@
-//! referee-harness 集成测试 — 多实例管理 / 对话往返 / 崩溃恢复 / TCP 传输
+//! referee-aura 集成测试 — 多实例管理 / 对话往返 / 崩溃恢复 / TCP 传输
 //!
-//! 覆盖 REFEREE_HARNESS_IMPL.md §10 的 13 个用例。全部使用 MockProvider 直连，
+//! 覆盖 REFEREE_AURA_IMPL.md §10 的 13 个用例。全部使用 MockProvider 直连，
 //! 不触网；TCP 用例用随机端口 + 进程内 daemon。
 
 use std::collections::HashMap;
@@ -18,13 +18,13 @@ use referee_ai::provider::{
     ProviderId, StreamChunk, TokenUsage,
 };
 use referee_ai::session::{ChatOptions, ChatPayload, SessionId};
-use referee_harness::instance::{InstanceManager, InstanceManagerConfig};
-use referee_harness::persist::PersistStore;
-use referee_harness::protocol::{
+use referee_aura::instance::{InstanceManager, InstanceManagerConfig};
+use referee_aura::persist::PersistStore;
+use referee_aura::protocol::{
     InstanceId, InstanceSpec, InstanceTools, ProviderConfig, ERR_INSTANCE_FULL,
     ERR_INSTANCE_NOT_FOUND, ERR_INVALID_SPEC,
 };
-use referee_harness::transport::serve_tcp;
+use referee_aura::transport::serve_tcp;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -159,7 +159,7 @@ fn chat_payload(msg: &str) -> ChatPayload {
 }
 
 fn temp_dir(tag: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("referee_harness_test_{tag}_{}", uuid::Uuid::new_v4()))
+    std::env::temp_dir().join(format!("referee_aura_test_{tag}_{}", uuid::Uuid::new_v4()))
 }
 
 // ───────────────────────────────────────────────

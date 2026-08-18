@@ -1,4 +1,4 @@
-//! # Referee Harness — 智能体入口 / 宿主层（常驻 daemon）
+//! # Referee Aura — 智能体运行气场（常驻 daemon）
 //!
 //! 把 referee（Rust 智能体库）做成可被 TUI / Web / CLI 调用的智能体服务，
 //! 支持**多个独立实例并行运行与管理、非正常中断可恢复**。

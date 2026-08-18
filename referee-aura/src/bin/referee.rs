@@ -4,10 +4,10 @@
 //! **当前目录**设为 TUI 创建实例的「工作区根」。
 //!
 //! 前后端分离：TUI 经 TCP 连接本进程内启动的后端（`server::Server`），
-//! 与 `referee-harness` 共用同一 JSON-RPC 协议；TUI 退出即优雅关闭后端。
-//! 纯常驻后端（供 Web 等其它 UI 连接）仍由 `referee-harness` 提供。
+//! 与 `referee-aura` 共用同一 JSON-RPC 协议；TUI 退出即优雅关闭后端。
+//! 纯常驻后端（供 Web 等其它 UI 连接）仍由 `referee-aura` 提供。
 //!
-//! 参数（与 referee-harness 一致，另加 `--no-root`）：
+//! 参数（与 referee-aura 一致，另加 `--no-root`）：
 //! - `--state-dir <dir>` / `--bind <addr>` / `--http-bind [<addr>]`
 //! - `--max-instances <N>` / `--max-sessions <N>`
 //! - `--no-root` 不自动注入当前目录为工作区根
@@ -15,7 +15,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use referee_harness::server::{Server, ServerConfig};
+use referee_aura::server::{Server, ServerConfig};
 
 /// HTTP 监听缺省地址
 const DEFAULT_HTTP_BIND: &str = "127.0.0.1:7101";
@@ -66,7 +66,7 @@ async fn async_main(args: Args) -> std::io::Result<()> {
     } else {
         None
     };
-    let tui_result = referee_harness::tui::run(args.bind, default_root).await;
+    let tui_result = referee_aura::tui::run(args.bind, default_root).await;
 
     // 5. TUI 退出 → 触发后端优雅关闭
     let _ = shutdown_tx.send(true);
