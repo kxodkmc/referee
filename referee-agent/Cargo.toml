@@ -6,8 +6,9 @@ description = "开箱即用的完整 Agent 业务封装：基于 referee-ai 地�
 license = "MIT"
 
 [features]
-default = ["xiaomi", "deepseek", "agnes"]
+default = ["xiaomi", "deepseek", "agnes", "kimi"]
 agnes    = ["referee-ai/agnes"]
+kimi     = ["referee-ai/kimi"]
 xiaomi   = ["referee-ai/xiaomi"]
 deepseek = ["referee-ai/deepseek"]
 openai   = ["referee-ai/openai"]

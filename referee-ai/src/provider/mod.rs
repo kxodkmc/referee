@@ -26,6 +26,8 @@ pub mod openai_compat;
 pub mod agnes;
 #[cfg(feature = "deepseek")]
 pub mod deepseek;
+#[cfg(feature = "kimi")]
+pub mod kimi;
 #[cfg(feature = "xiaomi")]
 pub mod xiaomi;
 
@@ -73,6 +75,19 @@ impl std::fmt::Display for ProviderId {
     }
 }
 
+/// 模型规模规格 — 每个模型固有（与厂商能力无关）
+///
+/// 与 [`ProviderCapabilities`] 分离：能力声明表达「该厂商是否支持某特性」，
+/// 而上下文窗口 / 最大输出是**模型**的出厂参数，不同模型取值不同。
+/// 上层上限校验 / 预算治理依据 [`LLMProvider::model_spec`] 而非厂商共享值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelSpec {
+    /// 上下文窗口 token 数（所有模型必须记录准确值）
+    pub context_window_tokens: usize,
+    /// 单次响应最大输出 token 数
+    pub max_output_tokens: usize,
+}
+
 /// 厂商能力声明 — 上层据此自动降级，不写死厂商分支
 ///
 /// 例：`parallel_tool_calls=false` → 调度层（P2）将工具调用串行化；
@@ -87,10 +102,6 @@ pub struct ProviderCapabilities {
     pub streaming: bool,
     /// 厂商是否在响应中返回 usage 字段；不返回时走 P6 估算
     pub usage_reported: bool,
-    /// 单次响应最大输出 token 数
-    pub max_output_tokens: usize,
-    /// 上下文窗口 token 数（所有模型必须记录准确值，供上限校验/预算治理）
-    pub context_window_tokens: usize,
     /// 多模态能力声明（图片/音频/视频/文件上传）— 上层据此降级
     pub multimodal: MultimodalCapabilities,
 }
@@ -573,6 +584,9 @@ pub trait LLMProvider: Send + Sync {
 
     /// 能力声明（决定上层降级行为）
     fn capabilities(&self) -> &ProviderCapabilities;
+
+    /// 当前模型的规模规格（上下文窗口 / 最大输出）— 按模型而非厂商定义
+    fn model_spec(&self) -> ModelSpec;
 
     /// 一次性调用
     async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, LlmError>;

@@ -9,8 +9,9 @@ license = "MIT"
 path = "src/lib.rs"
 
 [features]
-default = ["xiaomi", "deepseek", "agnes"]
+default = ["xiaomi", "deepseek", "agnes", "kimi"]
 agnes    = []
+kimi     = []
 xiaomi   = []
 deepseek = []
 openai   = []

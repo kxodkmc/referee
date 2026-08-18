@@ -20,8 +20,8 @@ use referee_agent::tool::AgentTool;
 use referee_agent::AgentRuntime;
 use referee_ai::engine::{Engine, EngineConfig};
 use referee_ai::provider::{
-    ChatRequest, ChatResponse, FinishReason, LLMProvider, LlmError, Message, ProviderCapabilities,
-    ProviderId, StreamChunk, TokenUsage, ToolCall, ToolCallFunction,
+    ChatRequest, ChatResponse, FinishReason, LLMProvider, LlmError, Message, ModelSpec,
+    ProviderCapabilities, ProviderId, StreamChunk, TokenUsage, ToolCall, ToolCallFunction,
 };
 use referee_ai::session::{ChatOptions, ChatPayload, SessionId, SessionMessage, SessionReply};
 use referee_ai::tool::{ExecutorConfig, Tool, ToolContext, ToolRegistry};
@@ -88,11 +88,17 @@ fn caps() -> &'static ProviderCapabilities {
         system_role: true,
         streaming: false,
         usage_reported: true,
-        max_output_tokens: 4096,
-        context_window_tokens: 4096,
         multimodal: referee_ai::provider::MultimodalCapabilities::NONE,
     };
     &CAPS
+}
+
+/// mock 模型规格
+fn model_spec() -> ModelSpec {
+    ModelSpec {
+        context_window_tokens: 4096,
+        max_output_tokens: 4096,
+    }
 }
 
 #[async_trait]
@@ -103,6 +109,10 @@ impl LLMProvider for PeerMockProvider {
 
     fn capabilities(&self) -> &ProviderCapabilities {
         caps()
+    }
+
+    fn model_spec(&self) -> ModelSpec {
+        model_spec()
     }
 
     async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, LlmError> {

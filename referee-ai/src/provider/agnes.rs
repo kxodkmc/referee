@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 
 use crate::provider::openai_compat::{build_common_body, OpenAiCompatClient, OpenAiCompatConfig};
 use crate::provider::{
-    ChatRequest, ChatResponse, LLMProvider, LlmError, ProviderCapabilities, ProviderId,
+    ChatRequest, ChatResponse, LLMProvider, LlmError, ModelSpec, ProviderCapabilities, ProviderId,
     RetryPolicy, StreamChunk,
 };
 
@@ -59,6 +59,16 @@ impl AgnesModel {
     pub fn provider_id(&self) -> ProviderId {
         match self {
             Self::V25Flash => ids::AGNES_2_5_FLASH,
+        }
+    }
+
+    /// 模型规模规格（上下文窗口 512K / 最大输出 65.5K）
+    pub fn spec(&self) -> ModelSpec {
+        match self {
+            Self::V25Flash => ModelSpec {
+                context_window_tokens: CONTEXT_WINDOW_TOKENS,
+                max_output_tokens: MAX_OUTPUT_TOKENS,
+            },
         }
     }
 }
@@ -124,8 +134,6 @@ impl AgnesProvider {
                 system_role: true,
                 streaming: true,
                 usage_reported: true,
-                max_output_tokens: MAX_OUTPUT_TOKENS,
-                context_window_tokens: CONTEXT_WINDOW_TOKENS,
                 // `agnes-2.5-flash`：图片 URL 多模态；不支持音频/视频
                 multimodal: crate::provider::MultimodalCapabilities {
                     image: true,
@@ -174,6 +182,10 @@ impl LLMProvider for AgnesProvider {
 
     fn capabilities(&self) -> &ProviderCapabilities {
         &self.capabilities
+    }
+
+    fn model_spec(&self) -> ModelSpec {
+        self.model.spec()
     }
 
     async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, LlmError> {

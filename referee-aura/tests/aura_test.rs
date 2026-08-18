@@ -14,8 +14,8 @@ use futures::stream::{self, BoxStream};
 use futures::StreamExt;
 use referee_ai::engine::EngineConfig;
 use referee_ai::provider::{
-    ChatRequest, ChatResponse, FinishReason, LLMProvider, LlmError, Message, ProviderCapabilities,
-    ProviderId, StreamChunk, TokenUsage,
+    ChatRequest, ChatResponse, FinishReason, LLMProvider, LlmError, Message, ModelSpec,
+    ProviderCapabilities, ProviderId, StreamChunk, TokenUsage,
 };
 use referee_ai::session::{ChatOptions, ChatPayload, SessionId};
 use referee_aura::instance::{InstanceManager, InstanceManagerConfig};
@@ -59,11 +59,17 @@ fn caps() -> &'static ProviderCapabilities {
         system_role: true,
         streaming: true,
         usage_reported: true,
-        max_output_tokens: 4096,
-        context_window_tokens: 4096,
         multimodal: referee_ai::provider::MultimodalCapabilities::NONE,
     };
     &C
+}
+
+/// mock 模型规格
+fn model_spec() -> ModelSpec {
+    ModelSpec {
+        context_window_tokens: 4096,
+        max_output_tokens: 4096,
+    }
 }
 
 #[async_trait]
@@ -73,6 +79,9 @@ impl LLMProvider for MockProvider {
     }
     fn capabilities(&self) -> &ProviderCapabilities {
         caps()
+    }
+    fn model_spec(&self) -> ModelSpec {
+        model_spec()
     }
     async fn chat(&self, _req: ChatRequest) -> Result<ChatResponse, LlmError> {
         if let Some(d) = self.delay {

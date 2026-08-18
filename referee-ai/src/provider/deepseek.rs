@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 
 use crate::provider::openai_compat::{build_common_body, OpenAiCompatClient, OpenAiCompatConfig};
 use crate::provider::{
-    ChatRequest, ChatResponse, LLMProvider, LlmError, ProviderCapabilities, ProviderId,
+    ChatRequest, ChatResponse, LLMProvider, LlmError, ModelSpec, ProviderCapabilities, ProviderId,
     ReasoningEffort, RetryPolicy, StreamChunk,
 };
 
@@ -67,6 +67,16 @@ impl DeepSeekModel {
         match self {
             Self::V4Flash => ids::DEEPSEEK_V4_FLASH,
             Self::V4Pro => ids::DEEPSEEK_V4_PRO,
+        }
+    }
+
+    /// 模型规模规格（上下文窗口 1M / 最大输出 384K；两模型当前一致）
+    pub fn spec(&self) -> ModelSpec {
+        match self {
+            Self::V4Flash | Self::V4Pro => ModelSpec {
+                context_window_tokens: CONTEXT_WINDOW_TOKENS,
+                max_output_tokens: MAX_OUTPUT_TOKENS,
+            },
         }
     }
 }
@@ -132,8 +142,6 @@ impl DeepSeekProvider {
                 system_role: true,
                 streaming: true,
                 usage_reported: true,
-                max_output_tokens: MAX_OUTPUT_TOKENS,
-                context_window_tokens: CONTEXT_WINDOW_TOKENS,
                 multimodal: crate::provider::MultimodalCapabilities::NONE,
             },
         })
@@ -177,6 +185,10 @@ impl LLMProvider for DeepSeekProvider {
 
     fn capabilities(&self) -> &ProviderCapabilities {
         &self.capabilities
+    }
+
+    fn model_spec(&self) -> ModelSpec {
+        self.model.spec()
     }
 
     async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, LlmError> {
