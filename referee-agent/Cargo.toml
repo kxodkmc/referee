@@ -6,10 +6,11 @@ description = "开箱即用的完整 Agent 业务封装：基于 referee-ai 地�
 license = "MIT"
 
 [features]
-default = ["xiaomi", "deepseek"]
-xiaomi    = ["referee-ai/xiaomi"]
-deepseek  = ["referee-ai/deepseek"]
-openai    = ["referee-ai/openai"]
+default = ["xiaomi", "deepseek", "agnes"]
+agnes    = ["referee-ai/agnes"]
+xiaomi   = ["referee-ai/xiaomi"]
+deepseek = ["referee-ai/deepseek"]
+openai   = ["referee-ai/openai"]
 anthropic = ["referee-ai/anthropic"]
 responses = ["referee-ai/responses"]
 # MCP 2.0 stdio 客户端桥（按需拓展，默认不加载；stdio 桥零新增依赖）

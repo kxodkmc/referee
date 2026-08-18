@@ -64,7 +64,10 @@ pub const TOKEN_PLAN_BASE_URL_SGP: &str = "https://token-plan-sgp.xiaomimimo.com
 /// Token Plan 订阅计划接入端点（欧洲集群）
 pub const TOKEN_PLAN_BASE_URL_AMS: &str = "https://token-plan-ams.xiaomimimo.com/v1";
 
-/// MiMo 单次响应最大输出 token 数（pro 与 v2.5 相同）
+/// MiMo 上下文窗口 token 数（pro 与 v2.5 相同，1M）
+pub const CONTEXT_WINDOW_TOKENS: usize = 1024 * 1024;
+
+/// MiMo 单次响应最大输出 token 数（pro 与 v2.5 相同，128K）
 pub const MAX_OUTPUT_TOKENS: usize = 128 * 1024;
 
 /// MiMo 模型枚举（决定 model 字段与 ProviderId）
@@ -171,6 +174,7 @@ impl XiaomiProvider {
                 streaming: true,
                 usage_reported: true,
                 max_output_tokens: MAX_OUTPUT_TOKENS,
+                context_window_tokens: CONTEXT_WINDOW_TOKENS,
                 multimodal: match model {
                     // `mimo-v2.5-pro`：纯文本 + 深度思考 + 工具调用，无多模态
                     XiaomiModel::MimoV25Pro => crate::provider::MultimodalCapabilities::NONE,

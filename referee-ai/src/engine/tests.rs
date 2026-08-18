@@ -44,6 +44,7 @@ fn caps() -> &'static ProviderCapabilities {
         streaming: false,
         usage_reported: true,
         max_output_tokens: 1024,
+        context_window_tokens: 1024,
         multimodal: crate::provider::MultimodalCapabilities::NONE,
     };
     &C
@@ -879,6 +880,7 @@ fn caps_streaming() -> &'static ProviderCapabilities {
         streaming: true,
         usage_reported: true,
         max_output_tokens: 1024,
+        context_window_tokens: 1024,
         multimodal: crate::provider::MultimodalCapabilities::NONE,
     };
     &C
@@ -1060,6 +1062,7 @@ fn caps_serial() -> &'static ProviderCapabilities {
         streaming: false,
         usage_reported: true,
         max_output_tokens: 1024,
+        context_window_tokens: 1024,
         multimodal: crate::provider::MultimodalCapabilities::NONE,
     };
     &C

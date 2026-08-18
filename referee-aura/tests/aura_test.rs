@@ -60,6 +60,7 @@ fn caps() -> &'static ProviderCapabilities {
         streaming: true,
         usage_reported: true,
         max_output_tokens: 4096,
+        context_window_tokens: 4096,
         multimodal: referee_ai::provider::MultimodalCapabilities::NONE,
     };
     &C

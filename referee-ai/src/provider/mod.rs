@@ -22,6 +22,8 @@
 pub mod content;
 pub mod openai_compat;
 
+#[cfg(feature = "agnes")]
+pub mod agnes;
 #[cfg(feature = "deepseek")]
 pub mod deepseek;
 #[cfg(feature = "xiaomi")]
@@ -87,6 +89,8 @@ pub struct ProviderCapabilities {
     pub usage_reported: bool,
     /// 单次响应最大输出 token 数
     pub max_output_tokens: usize,
+    /// 上下文窗口 token 数（所有模型必须记录准确值，供上限校验/预算治理）
+    pub context_window_tokens: usize,
     /// 多模态能力声明（图片/音频/视频/文件上传）— 上层据此降级
     pub multimodal: MultimodalCapabilities,
 }
