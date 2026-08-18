@@ -1,8 +1,8 @@
 [package]
-name = "referee-harness"
+name = "referee-aura"
 version = "0.1.0"
 edition = "2021"
-description = "Referee Harness — 智能体入口/宿主层：常驻 daemon，多实例并行管理 + 崩溃恢复 + TCP JSON-RPC 2.0"
+description = "Referee Aura — 智能体运行气场：常驻 daemon，多实例并行管理 + 崩溃恢复 + TCP JSON-RPC 2.0"
 license = "MIT"
 
 [features]
@@ -44,8 +44,8 @@ async-trait = "0.1"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 
 [[bin]]
-name = "referee-harness"
-path = "src/bin/referee-harness.rs"
+name = "referee-aura"
+path = "src/bin/referee-aura.rs"
 
 [[bin]]
 name = "referee-tui"

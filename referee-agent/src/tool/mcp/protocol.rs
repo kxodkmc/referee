@@ -198,6 +198,24 @@ pub enum ContentBlock {
     Resource { uri: String, text: Option<String> },
 }
 
+/// 从错误响应中提取错误信息：优先 `message` 字段；缺失或为空时兜底
+/// `content[0].text`（部分服务器将错误详情放在文本块中而非 `message` 字段）。
+fn extract_error_message(result: &Value) -> Option<String> {
+    result
+        .get("message")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            result
+                .get("content")
+                .and_then(|c| c.as_array())
+                .and_then(|arr| arr.iter().find_map(|b| b.get("text").and_then(|t| t.as_str())))
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        })
+}
+
 /// 从 `tools/call` 结果解析为三态
 pub fn parse_tool_result(result: &Value) -> Result<ToolCallResult, String> {
     // 1. MRTR：resultType == input_required
@@ -219,21 +237,14 @@ pub fn parse_tool_result(result: &Value) -> Result<ToolCallResult, String> {
 
     // 2. 显式错误：resultType == error
     if result.get("resultType").and_then(|v| v.as_str()) == Some("error") {
-        let message = result
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown error")
-            .to_string();
+        let message = extract_error_message(result).unwrap_or_else(|| "unknown error".to_string());
         return Ok(ToolCallResult::Error { message });
     }
 
     // 3. complete（可能带 isError: true）
     if result.get("isError").and_then(|v| v.as_bool()) == Some(true) {
-        let message = result
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("tool execution error")
-            .to_string();
+        let message = extract_error_message(result)
+            .unwrap_or_else(|| "tool execution error".to_string());
         return Ok(ToolCallResult::Error { message });
     }
 
@@ -273,44 +284,46 @@ fn parse_content_block(v: &Value) -> Option<ContentBlock> {
     }
 }
 
+/// 渲染单个内容块为文本（图片/音频转 data URI 摘要；资源链接保留 uri）
+fn render_block(block: &ContentBlock) -> String {
+    match block {
+        ContentBlock::Text(s) => s.clone(),
+        ContentBlock::Image { data, mime_type } => {
+            let mime = mime_type.as_deref().unwrap_or("image/png");
+            format!("data:{mime};base64,{data}")
+        }
+        ContentBlock::Audio { data, mime_type } => {
+            let mime = mime_type.as_deref().unwrap_or("audio/wav");
+            format!("data:{mime};base64,{data}")
+        }
+        ContentBlock::ResourceLink { uri, name } => match name {
+            Some(n) => format!("{n} ({uri})"),
+            None => uri.clone(),
+        },
+        ContentBlock::Resource { uri, text } => match text {
+            Some(t) => format!("{uri}\n{t}"),
+            None => uri.clone(),
+        },
+    }
+}
+
 /// 将内容块渲染为单文本表示（`ToolOutput.content` 是字符串）
 ///
-/// 文本块直接拼接；结构化内容序列化为 JSON；图片/音频转 data URI 摘要；
-/// 资源链接保留 uri。
+/// `structuredContent` 与文本块描述同一结果：同时存在时优先结构化表示
+/// （紧凑、机器可读，供 AI 直接消费），跳过同源的文本块以消除重复输出，
+/// 仅保留无法由 structured 表达的非文本块（图片/音频/资源）；无结构化
+/// 结果时完整拼接全部内容块。
 pub fn render_content(content: &[ContentBlock], structured: Option<&Value>) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    for block in content {
-        match block {
-            ContentBlock::Text(s) => parts.push(s.clone()),
-            ContentBlock::Image { data, mime_type } => {
-                let mime = mime_type.as_deref().unwrap_or("image/png");
-                parts.push(format!("data:{mime};base64,{data}"));
-            }
-            ContentBlock::Audio { data, mime_type } => {
-                let mime = mime_type.as_deref().unwrap_or("audio/wav");
-                parts.push(format!("data:{mime};base64,{data}"));
-            }
-            ContentBlock::ResourceLink { uri, name } => {
-                parts.push(match name {
-                    Some(n) => format!("{n} ({uri})"),
-                    None => uri.clone(),
-                });
-            }
-            ContentBlock::Resource { uri, text } => {
-                parts.push(match text {
-                    Some(t) => format!("{uri}\n{t}"),
-                    None => uri.clone(),
-                });
-            }
-        }
-    }
     if let Some(s) = structured {
-        if !parts.is_empty() {
-            parts.push(s.to_string());
-        } else {
-            return s.to_string();
-        }
+        let mut parts: Vec<String> = content
+            .iter()
+            .filter(|b| !matches!(b, ContentBlock::Text(_)))
+            .map(render_block)
+            .collect();
+        parts.push(s.to_string());
+        return parts.join("\n");
     }
+    let parts: Vec<String> = content.iter().map(render_block).collect();
     parts.join("\n")
 }
 
@@ -372,8 +385,74 @@ mod tests {
     }
 
     #[test]
+    fn render_prefers_structured_skips_duplicated_text() {
+        let content = vec![ContentBlock::Text("mean=83.15".into())];
+        let structured = Some(&json!({"mean": 83.15}));
+        // 结构化与文本块同源：只输出结构化 JSON，不重复拼接文本
+        assert_eq!(render_content(&content, structured), r#"{"mean":83.15}"#);
+    }
+
+    #[test]
+    fn render_keeps_non_text_blocks_with_structured() {
+        let content = vec![
+            ContentBlock::Text("dup".into()),
+            ContentBlock::Image {
+                data: "AAA".into(),
+                mime_type: Some("image/png".into()),
+            },
+        ];
+        let structured = Some(&json!({"chart": "ok"}));
+        let out = render_content(&content, structured);
+        assert!(out.starts_with("data:image/png;base64,AAA\n"));
+        assert!(out.ends_with(r#"{"chart":"ok"}"#));
+    }
+
+    #[test]
+    fn render_joins_all_blocks_without_structured() {
+        let content = vec![ContentBlock::Text("a".into()), ContentBlock::Text("b".into())];
+        assert_eq!(render_content(&content, None), "a\nb");
+    }
+
+    #[test]
     fn parse_is_error_true_maps_to_error() {
         let v = tool_result(r#"{"resultType":"complete","isError":true,"message":"boom"}"#);
+        let r = parse_tool_result(&v).unwrap();
+        match r {
+            ToolCallResult::Error { message } => assert_eq!(message, "boom"),
+            _ => panic!("expected error"),
+        }
+    }
+
+    #[test]
+    fn parse_is_error_falls_back_to_content_text() {
+        // socstat 风格：错误详情在 content[0].text，`message` 字段缺失
+        let v = tool_result(
+            r#"{"resultType":"complete","isError":true,"content":[{"type":"text","text":"dataset 'x' not found; load it first with `load_dataset`"}]}"#,
+        );
+        let r = parse_tool_result(&v).unwrap();
+        match r {
+            ToolCallResult::Error { message } => {
+                assert_eq!(message, "dataset 'x' not found; load it first with `load_dataset`");
+            }
+            _ => panic!("expected error"),
+        }
+    }
+
+    #[test]
+    fn parse_error_ignores_empty_message_uses_content_text() {
+        let v = tool_result(
+            r#"{"resultType":"complete","isError":true,"message":"","content":[{"type":"text","text":"real error"}]}"#,
+        );
+        let r = parse_tool_result(&v).unwrap();
+        match r {
+            ToolCallResult::Error { message } => assert_eq!(message, "real error"),
+            _ => panic!("expected error"),
+        }
+    }
+
+    #[test]
+    fn parse_result_type_error_falls_back_to_content_text() {
+        let v = tool_result(r#"{"resultType":"error","content":[{"type":"text","text":"boom"}]}"#);
         let r = parse_tool_result(&v).unwrap();
         match r {
             ToolCallResult::Error { message } => assert_eq!(message, "boom"),

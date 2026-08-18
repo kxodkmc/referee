@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::provider::{
-    ChatResponse, FinishReason, LLMProvider, LlmError, Message, ProviderCapabilities, ProviderId,
-    StreamChunk, TokenUsage,
+    ChatResponse, FinishReason, LLMProvider, LlmError, Message, ModelSpec, ProviderCapabilities,
+    ProviderId, StreamChunk, TokenUsage,
 };
 use crate::session::{ChatOptions, ChatPayload, SessionConfig, TimeoutConfig};
 use crate::tool::{
@@ -43,10 +43,17 @@ fn caps() -> &'static ProviderCapabilities {
         system_role: true,
         streaming: false,
         usage_reported: true,
-        max_output_tokens: 1024,
         multimodal: crate::provider::MultimodalCapabilities::NONE,
     };
     &C
+}
+
+/// mock 模型规格（上下文窗口 / 最大输出一致）
+fn model_spec() -> ModelSpec {
+    ModelSpec {
+        context_window_tokens: 1024,
+        max_output_tokens: 1024,
+    }
 }
 
 fn resp(text: &str, tool_calls: Vec<crate::provider::ToolCall>) -> ChatResponse {
@@ -103,6 +110,10 @@ impl LLMProvider for MockProvider {
     }
     fn capabilities(&self) -> &ProviderCapabilities {
         caps()
+    }
+
+    fn model_spec(&self) -> ModelSpec {
+        model_spec()
     }
     async fn chat(&self, req: crate::provider::ChatRequest) -> Result<ChatResponse, LlmError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
@@ -389,6 +400,10 @@ impl LLMProvider for PendingProvider {
     }
     fn capabilities(&self) -> &ProviderCapabilities {
         caps()
+    }
+
+    fn model_spec(&self) -> ModelSpec {
+        model_spec()
     }
     async fn chat(&self, _req: crate::provider::ChatRequest) -> Result<ChatResponse, LlmError> {
         std::future::pending::<Result<ChatResponse, LlmError>>().await
@@ -878,7 +893,6 @@ fn caps_streaming() -> &'static ProviderCapabilities {
         system_role: true,
         streaming: true,
         usage_reported: true,
-        max_output_tokens: 1024,
         multimodal: crate::provider::MultimodalCapabilities::NONE,
     };
     &C
@@ -892,6 +906,11 @@ impl LLMProvider for StreamMockProvider {
     fn capabilities(&self) -> &ProviderCapabilities {
         caps_streaming()
     }
+
+    fn model_spec(&self) -> ModelSpec {
+        model_spec()
+    }
+
     async fn chat(&self, _req: crate::provider::ChatRequest) -> Result<ChatResponse, LlmError> {
         Err(LlmError::BadRequest("use chat_stream".into()))
     }
@@ -1059,7 +1078,6 @@ fn caps_serial() -> &'static ProviderCapabilities {
         system_role: true,
         streaming: false,
         usage_reported: true,
-        max_output_tokens: 1024,
         multimodal: crate::provider::MultimodalCapabilities::NONE,
     };
     &C
@@ -1073,6 +1091,11 @@ impl LLMProvider for SerialProvider {
     fn capabilities(&self) -> &ProviderCapabilities {
         caps_serial()
     }
+
+    fn model_spec(&self) -> ModelSpec {
+        model_spec()
+    }
+
     async fn chat(&self, _req: crate::provider::ChatRequest) -> Result<ChatResponse, LlmError> {
         self.responses
             .lock()

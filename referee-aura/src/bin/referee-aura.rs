@@ -1,4 +1,4 @@
-//! referee-harness 常驻 daemon 入口
+//! referee-aura 常驻 daemon 入口
 //!
 //! 职责：参数解析 + 装配（`server::Server`）+ 生命周期（启动/优雅关闭）。
 //! 只启动后端监听器，不承载任何前端；前端（TUI / Web）经 TCP/HTTP 连接。
@@ -14,7 +14,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use referee_harness::server::{Server, ServerConfig};
+use referee_aura::server::{Server, ServerConfig};
 
 /// HTTP 监听缺省地址
 const DEFAULT_HTTP_BIND: &str = "127.0.0.1:7101";
@@ -61,8 +61,8 @@ async fn async_main(args: Args) {
     // 4. 等待监听器退出（shutdown 触发优雅关闭）
     let tcp_result = match tcp_task.await {
         Ok(r) => r,
-        Err(e) => Err(referee_harness::protocol::ServerError::new(
-            referee_harness::protocol::ERR_INTERNAL,
+        Err(e) => Err(referee_aura::protocol::ServerError::new(
+            referee_aura::protocol::ERR_INTERNAL,
             format!("tcp task join: {e}"),
         )),
     };
@@ -181,6 +181,6 @@ fn tracing_subscriber_env() {
 
 fn print_usage() {
     eprintln!(
-        "USAGE: referee-harness [--state-dir <dir>] [--bind <addr>] [--http-bind [<addr>]] [--max-instances <N>] [--max-sessions <N>]"
+        "USAGE: referee-aura [--state-dir <dir>] [--bind <addr>] [--http-bind [<addr>]] [--max-instances <N>] [--max-sessions <N>]"
     );
 }

@@ -52,7 +52,7 @@ pub async fn serve_http(
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await
         .map_err(|e| ServerError::new(err::ERR_INTERNAL, format!("bind {bind_addr}: {e}")))?;
-    tracing::info!(addr = %bind_addr, "referee-harness listening on http");
+    tracing::info!(addr = %bind_addr, "referee-aura listening on http");
     axum::serve(listener, router(instances))
         .with_graceful_shutdown(async move {
             let _ = shutdown.changed().await;

@@ -1,6 +1,6 @@
-//! referee-harness HTTP + SSE 集成测试（feature `http`）
+//! referee-aura HTTP + SSE 集成测试（feature `http`）
 //!
-//! 覆盖 REFEREE_HARNESS_IMPL_P2.md §10 的 9 个用例。对话类用例用 MockProvider
+//! 覆盖 REFEREE_AURA_IMPL_P2.md §10 的 9 个用例。对话类用例用 MockProvider
 //! 直连（不触网）；管理类用例用真实 DeepSeek 构造（build_provider 不发起网络请求）。
 #![cfg(feature = "http")]
 
@@ -14,13 +14,13 @@ use futures::stream::{self, BoxStream};
 use futures::StreamExt;
 use referee_ai::engine::EngineConfig;
 use referee_ai::provider::{
-    ChatRequest, ChatResponse, FinishReason, LLMProvider, LlmError, Message, ProviderCapabilities,
-    ProviderId, StreamChunk, TokenUsage,
+    ChatRequest, ChatResponse, FinishReason, LLMProvider, LlmError, Message, ModelSpec,
+    ProviderCapabilities, ProviderId, StreamChunk, TokenUsage,
 };
-use referee_harness::http::serve_http;
-use referee_harness::instance::{InstanceManager, InstanceManagerConfig};
-use referee_harness::protocol::{InstanceSpec, InstanceTools, ProviderConfig};
-use referee_harness::transport::serve_tcp;
+use referee_aura::http::serve_http;
+use referee_aura::instance::{InstanceManager, InstanceManagerConfig};
+use referee_aura::protocol::{InstanceSpec, InstanceTools, ProviderConfig};
+use referee_aura::transport::serve_tcp;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -56,10 +56,17 @@ fn caps() -> &'static ProviderCapabilities {
         system_role: true,
         streaming: true,
         usage_reported: true,
-        max_output_tokens: 4096,
         multimodal: referee_ai::provider::MultimodalCapabilities::NONE,
     };
     &C
+}
+
+/// mock 模型规格
+fn model_spec() -> ModelSpec {
+    ModelSpec {
+        context_window_tokens: 4096,
+        max_output_tokens: 4096,
+    }
 }
 
 #[async_trait]
@@ -69,6 +76,9 @@ impl LLMProvider for MockProvider {
     }
     fn capabilities(&self) -> &ProviderCapabilities {
         caps()
+    }
+    fn model_spec(&self) -> ModelSpec {
+        model_spec()
     }
     async fn chat(&self, _req: ChatRequest) -> Result<ChatResponse, LlmError> {
         if let Some(d) = self.delay {

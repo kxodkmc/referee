@@ -1869,24 +1869,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "referee-core"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "dashmap",
- "futures",
- "metrics",
- "parking_lot",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "referee-harness"
+name = "referee-aura"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -1905,6 +1888,23 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-width",
+ "uuid",
+]
+
+[[package]]
+name = "referee-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "dashmap",
+ "futures",
+ "metrics",
+ "parking_lot",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

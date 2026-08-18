@@ -28,7 +28,7 @@
 referee-agent = { path = "referee-agent", features = ["xiaomi", "deepseek", "mcp-stdio", "skills"] }
 ```
 
-`xiaomi` / `deepseek` / `openai` / `anthropic` / `responses` 通过 `referee-agent` 转发到
+`agnes` / `kimi` / `xiaomi` / `deepseek` / `openai` / `anthropic` / `responses` 通过 `referee-agent` 转发到
 `referee-ai` 裁剪厂商适配器；`mcp-stdio` / `skills` 为协议与技能注入（默认关闭）。
 
 ## 2. 架构
