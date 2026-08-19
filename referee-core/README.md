@@ -1,7 +1,7 @@
 # Referee Core — 微内核模块
 
 > 工业级防护能力的轻量微内核引擎。只做**通信与治理**，不承载业务逻辑；扩展按需组合。
-> 当前进度：**Phase 1 ~ 6 全部完成，34 条测试全绿**。详见 [核心能力](#2-核心能力) 与 [验证](#8-验证)。
+> 当前进度：**Phase 1 ~ 6 全部完成，33 条测试全绿**。详见 [核心能力](#2-核心能力) 与 [验证](#8-验证)。
 
 ---
 
@@ -320,8 +320,8 @@ referee-core/
 ## 8. 验证
 
 ```bash
-cargo test -p referee-core -- --nocapture     # 34 条测试（Phase 1 ~ 6 + 监督治理加固）
-cargo test --workspace                        # 全量回归（core 34 + base 121 + agent 31 = 186 条）
+cargo test -p referee-core -- --nocapture     # 33 条测试（Phase 1 ~ 6 + 监督治理加固）
+cargo test --workspace                        # 全量回归（core 33 + ai 134 + agent 81 + aura 20 = 268 条）
 cargo clippy --all-targets -- -D warnings     # 零警告
 cargo fmt --check                             # 格式整洁
 ```
@@ -341,5 +341,4 @@ cargo fmt --check                             # 格式整洁
 | [`../README.md`](../README.md) | 仓库总览（目录 / 大纲） |
 | [`../referee-ai/README.md`](../referee-ai/README.md) | 核心支撑层模块描述（会话引擎 / 流式 / 会话生命周期 / 提示词分段编排 / 用量计量） |
 | [`../referee-agent/README.md`](../referee-agent/README.md) | 业务封装层模块描述 |
-| [`../PHASE_STATUS.md`](../PHASE_STATUS.md) | Phase 状态跟踪（含关键设计决策与偏差记录） |
 | [`../AGENTS.md`](../AGENTS.md) | 工程约束（设计思想 / 依赖清单 / 工作纪律） |

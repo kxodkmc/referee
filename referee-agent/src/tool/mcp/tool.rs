@@ -84,12 +84,22 @@ impl McpToolClient {
         self.mrtr = mrtr;
         self
     }
+
+    /// 优雅停机：关闭共享下的子进程传输（多个 MCP 工具共享同一 `McpClient`，
+    /// 底层 `StdioTransport::shutdown` 以 `child.take()` 收敛为一次有效关闭，幂等）。
+    pub async fn shutdown(&self) {
+        self.client.shutdown().await;
+    }
 }
 
 #[async_trait]
 impl Tool for McpToolClient {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
     fn description(&self) -> &str {

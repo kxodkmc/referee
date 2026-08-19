@@ -318,6 +318,25 @@ impl Extension for AgentRuntime {
 
         Ok(())
     }
+
+    /// 停机钩子：内核停机 / 扩展移除时调用。回收外部子进程资源。
+    ///
+    /// 当前回收经 `mcp-stdio` 注册进引擎的 MCP 子进程（对 `McpToolClient` 下行
+    /// 转型后调用其 shutdown，多工具共享同一 `McpClient`，底层 `child.take()`
+    /// 保证只做一次有效关闭）。未启用 `mcp-stdio` 时无可回收资源，钩子为空。
+    async fn shutdown(&self) {
+        #[cfg(feature = "mcp-stdio")]
+        {
+            use crate::tool::mcp::McpToolClient;
+            if let Some(registry) = self.engine.tools() {
+                for tool in registry.all() {
+                    if let Some(mcp) = tool.as_any().downcast_ref::<McpToolClient>() {
+                        mcp.shutdown().await;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// 获取 SessionMessage 类型标签（tracing span）

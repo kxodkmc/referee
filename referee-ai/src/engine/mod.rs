@@ -237,6 +237,11 @@ impl Engine {
             .register(tool)
     }
 
+    /// 已启用的工具注册表（供上层枚举/清理，如停机时回收外部工具资源）
+    pub fn tools(&self) -> Option<&ToolRegistry> {
+        self.tools.as_ref()
+    }
+
     /// 注入共享全局 Token 计数器（多引擎合并系统级总预算）
     pub fn with_global_budget(mut self, counter: Arc<AtomicU64>) -> Self {
         self.total_consumed_tokens = counter;

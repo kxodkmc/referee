@@ -9,7 +9,7 @@
 
 | 模块 | 职责 |
 |------|------|
-| `provider` | 厂商唯一 I/O 边界：`LLMProvider` trait、纯数据模型、错误归一与重试、能力声明、OpenAI 兼容底座 + 厂商适配器；`TokenUsage` 含输入/输出/推理/**缓存命中计量**（`cache_read/write_tokens`） |
+| `provider` | 厂商唯一 I/O 边界：`LLMProvider` trait、纯数据模型、错误归一与重试、能力声明、OpenAI 兼容底座 + 厂商适配器（DeepSeek / Xiaomi·MiMo / agnes / kimi）；`ProviderRegistry` 按 `ProviderId` 注册/查找/列举/批量健康检查；`TokenUsage` 含输入/输出/推理/**缓存命中计量**（`cache_read/write_tokens`） |
 | `session` | 会话状态机（Idle/Thinking/AwaitingCalls）、超时、终态自管（`run_turn`） |
 | `tool` | 工具抽象 `Tool` + 有界注册表 + 并行/截断/panic 隔离/超时执行器 + 同步/异步派发（`wait` 分流）+ **白名单过滤**（`declarations_visible`） |
 | `store` | 通用有界 KV 存储抽象（成果/大结果落库），后端可替换 |
@@ -17,14 +17,15 @@
 | `prompt` | **提示词分段编排**：`SystemSection`（稳定/易变 + 空则省略）+ `assemble`（条件省略 → 稳定排前 → 预算截断）；`build_prompt` 兼容保留 |
 | `cache` | LRU + TTL 语义缓存，流式一致性合成 |
 | `observe` | 可观测门面（tracing span、metrics、计时、LLM 重试计数） |
-| `engine` | 会话引擎：最小闭环收敛到单任务顺序异步流程；流式输出（`chat_stream`）与会话生命周期管理（快照/枚举/删除/空闲回收） |
+| `engine` | 会话引擎：最小闭环收敛到单任务顺序异步流程；流式输出（`chat_stream`）与会话生命周期管理（快照/枚举/删除/空闲回收）；`restore_session_history` 崩溃恢复；`EngineReply::Error` 携带结构化 `EngineError` |
 
 ## 快速上手
 
 ```rust
 use referee_ai::{Engine, EngineConfig, LLMProvider, ...};
 
-// provider 由适配器构造（如 XiaomiProvider / DeepSeekProvider / 自实现）
+// provider 由适配器构造，或经 ProviderRegistry 注册后按 ProviderId 查找
+// （XiaomiProvider / DeepSeekProvider / AgnesProvider / KimiProvider / 自实现）
 let engine = Engine::new(provider, EngineConfig::default());
 
 // 发起一轮会话（快速返回句柄）
@@ -95,6 +96,16 @@ let req = assemble(AssembleParts {
 - **空闲回收**：`start_idle_reaper()` 启动后台任务，周期移除「Idle 且空闲超时」的会话
   （Thinking / AwaitingCalls 在途任务不受影响），返回 `ReaperHandle`（`stop()` 优雅退出）。
 
+## 厂商注册表 · 会话恢复 · 结构化错误
+
+- **`ProviderRegistry`**：`Arc<dyn LLMProvider>` 的有界集合，按 `ProviderId` 注册 / 查找 /
+  列举，并提供 `health_check_all` 并行批量探活；daemon 启动时集中注册，运行时按 id 路由。
+- **崩溃恢复**：`restore_session_history(session_id, messages)` 在会话缺失时自动创建会话，
+  逐条重放已确认的 `Message` 恢复中断的上下文（容量满即截断，保留已确认前缀）。
+- **结构化错误**：`EngineReply::Error` 携带 `EngineError`（BudgetExceeded / ProviderError /
+  ToolFailed / SessionNotFound / MaxRetriesExhausted / Internal），错误不再压平成字符串，
+  供上层程序化处理与结构化响应。
+
 ## 设计约束
 
 - 分层单向依赖；模块间只经 trait。
@@ -118,7 +129,7 @@ let req = assemble(AssembleParts {
 ## 验证
 
 ```bash
-cargo test -p referee-ai            # 121 条
+cargo test -p referee-ai            # 134 条
 cargo test -p referee-ai prompt     # 提示词分段编排（assemble / 截断 / 稳定性排序）
 cargo clippy -p referee-ai --all-targets -- -D warnings
 ```

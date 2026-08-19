@@ -13,5 +13,5 @@ pub use extension::dlq::{DlqSink, InMemoryDlq};
 pub use extension::{CapabilityId, Extension, KernelContext, MessageContext};
 pub use kernel::wal::{InMemoryWal, WalSink};
 pub use kernel::{
-    ExtensionInfo, ExtensionState, Kernel, RegisterOptions, SupervisionPolicy,
+    ExtensionHandle, ExtensionInfo, ExtensionState, Kernel, RegisterOptions, SupervisionPolicy,
 };

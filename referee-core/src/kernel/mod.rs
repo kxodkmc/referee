@@ -79,6 +79,27 @@ impl RegisterOptions {
     }
 }
 
+/// 扩展注册句柄 — 持有者可移除并停机该扩展
+#[derive(Clone)]
+pub struct ExtensionHandle {
+    id: CapabilityId,
+    kernel: Kernel,
+}
+
+impl ExtensionHandle {
+    /// 句柄对应的扩展 id
+    pub fn id(&self) -> CapabilityId {
+        self.id
+    }
+
+    /// 移除扩展：注销路由条目 → Sender drop → 通道关闭 → 监督循环退出并调用
+    /// `Extension::shutdown()` 释放资源。移除后对其的 `emit` / `invoke` 返回
+    /// `TargetUnreachable`。
+    pub async fn remove(&self) -> KernelResult<()> {
+        self.kernel.unregister(self.id).await
+    }
+}
+
 impl Kernel {
     /// 默认实现：内存环形死信队列（容量 1024），无 WAL
     pub fn new() -> Self {
@@ -164,6 +185,28 @@ impl Kernel {
             self.shutdown_tx.subscribe(),
         ));
         Ok(())
+    }
+
+    /// 注册扩展并返回可回收句柄（`register` 的句柄版本）
+    pub async fn register_handle(
+        &self,
+        ext: Box<dyn Extension>,
+        queue_size: usize,
+        policy: SupervisionPolicy,
+    ) -> KernelResult<ExtensionHandle> {
+        self.register_with_handle(ext, RegisterOptions::new(queue_size, policy))
+            .await
+    }
+
+    /// 注册扩展（完整配置）并返回可回收句柄（`register_with` 的句柄版本）
+    pub async fn register_with_handle(
+        &self,
+        ext: Box<dyn Extension>,
+        opts: RegisterOptions,
+    ) -> KernelResult<ExtensionHandle> {
+        let id = ext.id();
+        self.register_with(ext, opts).await?;
+        Ok(ExtensionHandle { id, kernel: self.clone() })
     }
 
     /// 扩展自省快照 — 路由表全量条目（id / 状态 / 队列深度 / 重启计数）
