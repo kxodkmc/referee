@@ -40,7 +40,7 @@ pub use skill::{
 
 use std::sync::Arc;
 
-use referee_ai::engine::{ChatHandle, Engine, EngineReply, EngineStartError, SessionSnapshot};
+use referee_ai::engine::{ChatHandle, Engine, EngineError, EngineReply, EngineStartError, SessionSnapshot};
 use referee_ai::session::{ChatPayload, SessionId, SessionMessage, SessionReply};
 use referee_core::extension::{CapabilityId, Extension, KernelContext};
 use referee_core::Envelope;
@@ -133,7 +133,18 @@ impl AgentRuntime {
         self.engine.interrupt(session_id)
     }
 
-    /// 回放已确认的会话事实到指定会话历史（崩溃恢复用，不触发 LLM）
+    /// 恢复会话历史（崩溃恢复用，不触发 LLM）
+    pub fn restore_session_history(
+        &self,
+        session_id: SessionId,
+        messages: Vec<referee_ai::provider::Message>,
+    ) -> Result<usize, EngineError> {
+        self.engine.restore_session_history(session_id, messages)
+    }
+
+    /// 回放会话历史（向后兼容别名）
+    #[deprecated(note = "use `restore_session_history` instead")]
+    #[allow(deprecated)]
     pub fn replay_history(
         &self,
         session_id: SessionId,
@@ -227,7 +238,7 @@ impl AgentRuntime {
                     let reply = handle
                         .wait()
                         .await
-                        .unwrap_or(EngineReply::Error("chat channel closed".into()));
+                        .unwrap_or(EngineReply::Error(EngineError::ChannelClosed));
                     let _ = ctx.reply(SessionReply::from(reply).to_envelope());
                 });
             }

@@ -1,0 +1,38 @@
+﻿==== referee\referee-core referee-core[1] (top)  vs  referee\referee-core referee-core[0] (nested) ====
+  content-diff: 2;  top-only: 0;  nested-only: 0
+  --- changed:
+      ~ src\extension\mod.rs
+      ~ src\kernel\supervisor.rs
+==== referee\referee-ai referee-ai[1] (top)  vs  referee\referee-ai referee-ai[0] (nested) ====
+  content-diff: 17;  top-only: 0;  nested-only: 1
+  --- changed:
+      ~ Cargo.toml
+      ~ src\budget\mod.rs
+      ~ src\cache\mod.rs
+      ~ src\engine\mod.rs
+      ~ src\lib.rs
+      ~ src\observe\mod.rs
+      ~ src\provider\deepseek.rs
+      ~ src\provider\mod.rs
+      ~ src\provider\openai_compat.rs
+      ~ src\provider\xiaomi.rs
+      ~ src\session\message.rs
+      ~ src\session\mod.rs
+      ~ src\session\task.rs
+      ~ src\session\timeout.rs
+      ~ src\store\mod.rs
+      ~ src\tool\definition.rs
+      ~ src\tool\mod.rs
+  --- nested-only:
+      - src\provider\registry.rs
+==== referee\referee-agent referee-agent[1] (top)  vs  referee\referee-agent referee-agent[0] (nested) ====
+  content-diff: 2;  top-only: 0;  nested-only: 0
+  --- changed:
+      ~ Cargo.toml
+      ~ src\lib.rs
+==== referee\referee-aura referee-aura[1] (top)  vs  referee\referee-aura referee-aura[0] (nested) ====
+  content-diff: 0;  top-only: 0;  nested-only: 0
+ROOT: PRODUCTION_PLAN.md  (top-missing, nested present)
+ROOT: referee\PRODUCTION_PLAN.md  (in nested; top has same-name? test)
+ROOT: referee\multi-agent-test-report.md  (in nested; top has same-name? test)
+ROOT: referee\referee-socstat-integration-report.md  (in nested; top has same-name? test)

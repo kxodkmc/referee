@@ -21,6 +21,7 @@
 
 pub mod content;
 pub mod openai_compat;
+pub mod registry;
 
 #[cfg(feature = "agnes")]
 pub mod agnes;
@@ -32,6 +33,7 @@ pub mod kimi;
 pub mod xiaomi;
 
 pub use content::{ContentPart, MediaResolution, MediaSource, VideoParams};
+pub use registry::{ProviderRegistry, ProviderRegistryError, ProviderStatus};
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -596,4 +598,14 @@ pub trait LLMProvider: Send + Sync {
         &self,
         req: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk, LlmError>>, LlmError>;
+
+    /// 健康检查 — 轻量探针，验证厂商可达性
+    ///
+    /// 默认实现发送一个最小请求（1 token）；厂商可覆写为更高效的探针
+    /// （如 OpenAI 的 `/models` 端点）。不消耗预算、不写入历史。
+    async fn health_check(&self) -> Result<(), LlmError> {
+        let mut req = ChatRequest::simple("ping");
+        req.max_tokens = Some(1);
+        self.chat(req).await.map(|_| ())
+    }
 }

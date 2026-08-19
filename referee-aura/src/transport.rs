@@ -281,7 +281,7 @@ async fn dispatch_chat(instances: &InstanceManager, req: &JsonRpcRequest) -> Vec
             return vec![ok(id, json!(chat::reply_from_success(session_id, &resp)))];
         }
         EngineReply::Busy { .. } => return vec![error(id, ERR::ERR_SESSION_BUSY, "session busy".into())],
-        EngineReply::Error(m) => return vec![error(id, ERR::ERR_INTERNAL, m)],
+        EngineReply::Error(m) => return vec![error(id, ERR::ERR_INTERNAL, m.to_string())],
         EngineReply::Cancelled => return vec![error(id, ERR::ERR_INTERNAL, "chat cancelled".into())],
         EngineReply::Timeout => return vec![error(id, ERR::ERR_INTERNAL, "chat timeout".into())],
     };

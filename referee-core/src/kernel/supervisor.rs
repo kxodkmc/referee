@@ -114,7 +114,7 @@ impl ExtensionRuntime {
     }
 
     /// 监督循环：崩溃（Panic / 超时）后按策略重启；停机 / 通道关闭 /
-    /// 熔断超限时转储积压并终态退出。
+    /// 熔断超限时转储积压并终态退出。退出前调用 `ext.shutdown()` 释放资源。
     pub async fn run_supervised(
         self,
         mut rx: PriorityReceiver,
@@ -134,13 +134,17 @@ impl ExtensionRuntime {
             };
             match Self::run_inner_loop(deps, &mut rx, &shutdown_rx).await {
                 // 自然退出（通道关闭 / 停机排空）：状态收敛已在内层完成
-                InnerOutcome::NormalExit | InnerOutcome::Shutdown => return,
+                InnerOutcome::NormalExit | InnerOutcome::Shutdown => {
+                    self.ext.shutdown().await;
+                    return;
+                }
                 InnerOutcome::Crashed => {
                     router.set_state(id, ExtensionState::Crashed);
                     // 停机已触发：自愈无意义（重启后只会再次 drain 退出），
                     // 直接转储积压终态退出，缩短停机等待
                     if shutdown_rx.is_triggered() {
                         Self::drain_backlog_to_dlq(&self.view, &mut rx, id).await;
+                        self.ext.shutdown().await;
                         return;
                     }
                     let terminal = match &self.policy {
@@ -170,6 +174,7 @@ impl ExtensionRuntime {
                     if terminal {
                         // 终态退出：未消费积压全部转储 DLQ，绝不静默丢弃
                         Self::drain_backlog_to_dlq(&self.view, &mut rx, id).await;
+                        self.ext.shutdown().await;
                         return;
                     }
                 }
