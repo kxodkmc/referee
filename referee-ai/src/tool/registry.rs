@@ -94,6 +94,13 @@ impl ToolRegistry {
         }
     }
 
+    /// 全部已注册工具的只读快照（供上层枚举，如停机时清理外部资源）
+    ///
+    /// 快照不持锁跨 await；调用方据此 iterate，介意一致性的场景应直接读实时表。
+    pub fn all(&self) -> Vec<Arc<dyn Tool>> {
+        self.tools.iter().map(|e| e.value().clone()).collect()
+    }
+
     /// 按名称获取工具
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.get(name).map(|r| r.clone())

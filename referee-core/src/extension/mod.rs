@@ -53,4 +53,14 @@ pub trait Extension: Send + Sync {
 
     /// 核心处理逻辑 — 注入受限上下文 + 消息载荷
     async fn handle(&self, ctx: KernelContext, env: Envelope) -> KernelResult<()>;
+
+    /// 优雅停机钩子 — 内核 `remove` 时回调，供扩展释放后台资源。
+    ///
+    /// 默认空实现：无后台资源的扩展无需关心。有后台任务 / 外部连接的
+    /// 扩展覆写此方法，在内核卸载时收尾（停后台 task、关连接池等）。
+    ///
+    /// # 约束
+    /// - 必须非阻塞快速返回（≤秒级），不得等待其他扩展
+    /// - 幂等：可能被多次调用，实现需自行防重
+    async fn shutdown(&self) {}
 }

@@ -129,7 +129,9 @@ impl Instance {
 
     /// 回放已确认会话事实（崩溃恢复用）
     pub fn replay_history(&self, session_id: SessionId, msgs: Vec<Message>) -> Result<usize, String> {
-        self.runtime.replay_history(session_id, msgs)
+        self.runtime
+            .restore_session_history(session_id, msgs)
+            .map_err(|e| e.to_string())
     }
 
     /// 停止实例：取消全部在飞回合 + 置 Stopped（实例仍保留供观测）

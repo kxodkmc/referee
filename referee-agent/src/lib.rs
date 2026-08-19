@@ -40,7 +40,7 @@ pub use skill::{
 
 use std::sync::Arc;
 
-use referee_ai::engine::{ChatHandle, Engine, EngineReply, EngineStartError, SessionSnapshot};
+use referee_ai::engine::{ChatHandle, Engine, EngineError, EngineReply, EngineStartError, SessionSnapshot};
 use referee_ai::session::{ChatPayload, SessionId, SessionMessage, SessionReply};
 use referee_core::extension::{CapabilityId, Extension, KernelContext};
 use referee_core::Envelope;
@@ -133,7 +133,18 @@ impl AgentRuntime {
         self.engine.interrupt(session_id)
     }
 
-    /// 回放已确认的会话事实到指定会话历史（崩溃恢复用，不触发 LLM）
+    /// 恢复会话历史（崩溃恢复用，不触发 LLM）
+    pub fn restore_session_history(
+        &self,
+        session_id: SessionId,
+        messages: Vec<referee_ai::provider::Message>,
+    ) -> Result<usize, EngineError> {
+        self.engine.restore_session_history(session_id, messages)
+    }
+
+    /// 回放会话历史（向后兼容别名）
+    #[deprecated(note = "use `restore_session_history` instead")]
+    #[allow(deprecated)]
     pub fn replay_history(
         &self,
         session_id: SessionId,
@@ -227,7 +238,7 @@ impl AgentRuntime {
                     let reply = handle
                         .wait()
                         .await
-                        .unwrap_or(EngineReply::Error("chat channel closed".into()));
+                        .unwrap_or(EngineReply::Error(EngineError::ChannelClosed));
                     let _ = ctx.reply(SessionReply::from(reply).to_envelope());
                 });
             }
@@ -306,6 +317,25 @@ impl Extension for AgentRuntime {
         .await;
 
         Ok(())
+    }
+
+    /// 停机钩子：内核停机 / 扩展移除时调用。回收外部子进程资源。
+    ///
+    /// 当前回收经 `mcp-stdio` 注册进引擎的 MCP 子进程（对 `McpToolClient` 下行
+    /// 转型后调用其 shutdown，多工具共享同一 `McpClient`，底层 `child.take()`
+    /// 保证只做一次有效关闭）。未启用 `mcp-stdio` 时无可回收资源，钩子为空。
+    async fn shutdown(&self) {
+        #[cfg(feature = "mcp-stdio")]
+        {
+            use crate::tool::mcp::McpToolClient;
+            if let Some(registry) = self.engine.tools() {
+                for tool in registry.all() {
+                    if let Some(mcp) = tool.as_any().downcast_ref::<McpToolClient>() {
+                        mcp.shutdown().await;
+                    }
+                }
+            }
+        }
     }
 }
 

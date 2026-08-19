@@ -78,6 +78,27 @@ impl Default for EngineConfig {
     }
 }
 
+/// 引擎错误 — 结构化错误类型，取代裸 `String`
+///
+/// 将引擎执行中可能遇到的错误归一为枚举变体，上层可按类型决策
+///（如 `Llm` 中的 `RateLimited` 可回传 `retry_after`，`StateConflict`
+/// 映射 HTTP 409 等），不再需要解析错误字符串。
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum EngineError {
+    /// LLM 调用错误（网络/限流/认证/协议等）— 透传最终 `LlmError`
+    #[error("llm error: {0}")]
+    Llm(#[from] LlmError),
+    /// 会话状态冲突（如 resume 时非 AwaitingCalls 状态）
+    #[error("state conflict: {0}")]
+    StateConflict(&'static str),
+    /// 回合异常结束（未产出响应、未取消、未超时，但无成功结果）
+    #[error("turn ended without success")]
+    TurnIncomplete,
+    /// 内部通道关闭（派生任务意外终止）
+    #[error("chat channel closed")]
+    ChannelClosed,
+}
+
 /// 引擎回信 — `chat` 的执行产物
 pub enum EngineReply {
     /// 正常完成（含缓存命中；缓存命中不计量 Token）
@@ -87,7 +108,7 @@ pub enum EngineReply {
     /// 会话忙碌：已有回合进行中，拒绝并发 Chat
     Busy { turn_id: u64 },
     /// 会话不存在 / 预算超限 / 回合异常
-    Error(String),
+    Error(EngineError),
     /// 已取消（Interrupt 生效）
     Cancelled,
     /// 回合超时未完成
@@ -102,7 +123,7 @@ impl std::fmt::Debug for EngineReply {
             EngineReply::Busy { turn_id } => {
                 f.debug_struct("Busy").field("turn_id", turn_id).finish()
             }
-            EngineReply::Error(msg) => f.debug_tuple("Error").field(msg).finish(),
+            EngineReply::Error(e) => f.debug_tuple("Error").field(e).finish(),
             EngineReply::Cancelled => f.write_str("Cancelled"),
             EngineReply::Timeout => f.write_str("Timeout"),
         }
@@ -216,6 +237,11 @@ impl Engine {
             .register(tool)
     }
 
+    /// 已启用的工具注册表（供上层枚举/清理，如停机时回收外部工具资源）
+    pub fn tools(&self) -> Option<&ToolRegistry> {
+        self.tools.as_ref()
+    }
+
     /// 注入共享全局 Token 计数器（多引擎合并系统级总预算）
     pub fn with_global_budget(mut self, counter: Arc<AtomicU64>) -> Self {
         self.total_consumed_tokens = counter;
@@ -261,17 +287,18 @@ impl Engine {
         session_mgmt::list_sessions(&self.sessions)
     }
 
-    /// 回放已确认的会话事实到指定会话历史（崩溃恢复用）
+    /// 恢复会话历史 — 崩溃恢复入口
     ///
+    /// 接受 `(session_id, Vec<Message>)`，忠实重建上下文（仅追加，不调 LLM）。
     /// 自动创建会话（受 `max_sessions` 有界约束）；逐条 `push_history`，
-    /// 返回成功追加条数。用于恢复到已确认前缀（不触发 LLM，忠实重建上下文）。
-    pub fn replay_history(
+    /// 返回成功追加条数。容量满时停止，保留已恢复前缀。
+    pub fn restore_session_history(
         &self,
         session_id: SessionId,
         messages: Vec<crate::provider::Message>,
-    ) -> Result<usize, String> {
+    ) -> Result<usize, EngineError> {
         if !self.ensure_session(session_id) {
-            return Err("max sessions reached, cannot restore session".into());
+            return Err(EngineError::StateConflict("max sessions reached"));
         }
         let mut n = 0usize;
         if let Some(mut s) = self.sessions.get_mut(&session_id) {
@@ -283,6 +310,17 @@ impl Engine {
             }
         }
         Ok(n)
+    }
+
+    /// 回放会话历史（向后兼容别名，错误映射为 `String`）
+    #[deprecated(note = "use `restore_session_history` instead")]
+    pub fn replay_history(
+        &self,
+        session_id: SessionId,
+        messages: Vec<crate::provider::Message>,
+    ) -> Result<usize, String> {
+        self.restore_session_history(session_id, messages)
+            .map_err(|e| e.to_string())
     }
 
     /// 查询单个会话的运行快照（不存在返回 None）
@@ -483,7 +521,7 @@ impl Engine {
                         .and_then(|mut s| s.resume_thinking())
                     {
                         Some(x) => x,
-                        None => return EngineReply::Error("resume failed (not awaiting)".into()),
+                        None => return EngineReply::Error(EngineError::StateConflict("resume failed (not awaiting)")),
                     }
                 }
             };
@@ -536,6 +574,11 @@ impl Engine {
 
             // 记录是否超时（outcome 即将被收敛消费）
             let timed_out = matches!(&outcome, TurnOutcome::Timeout);
+            // 捕获 LLM 错误（finish_thinking 会消费 outcome 但不回传错误）
+            let llm_error = match &outcome {
+                TurnOutcome::Error(e) => Some(e.clone()),
+                _ => None,
+            };
 
             // 终态收敛（session 内累加 consumed_tokens；guard 短暂持有后立即释放）
             let action = self
@@ -559,7 +602,11 @@ impl Engine {
                     if timed_out {
                         return EngineReply::Timeout;
                     }
-                    return EngineReply::Error("turn ended without success".into());
+                    // LLM 错误透传（结构化，不再丢失）
+                    if let Some(e) = llm_error {
+                        return EngineReply::Error(EngineError::Llm(e));
+                    }
+                    return EngineReply::Error(EngineError::TurnIncomplete);
                 }
                 FinishAction::AwaitingCalls {
                     response,
@@ -823,7 +870,9 @@ impl From<EngineReply> for SessionReply {
                 message: "streaming reply must be consumed directly, not over envelope".into(),
             },
             EngineReply::Busy { turn_id } => SessionReply::Busy { turn_id },
-            EngineReply::Error(msg) => SessionReply::Error { message: msg },
+            EngineReply::Error(e) => SessionReply::Error {
+                message: e.to_string(),
+            },
             EngineReply::Cancelled => SessionReply::Cancelled,
             EngineReply::Timeout => SessionReply::Error {
                 message: "turn timeout".into(),

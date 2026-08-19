@@ -176,6 +176,14 @@ pub trait Tool: Send + Sync {
             parameters: self.input_schema(),
         }
     }
+
+    /// 向下转型钩子（供上层按需把 `Arc<dyn Tool>` 还原为具体类型，用于清理 / 配置）。
+    ///
+    /// 默认不可转型（调用即 panic 提示未实现）；需要下行转型的具体工具覆写为 `self` 即可。
+    /// 例如 MCP 工具在停机时据此还原为具体类型以回收外部子进程资源。
+    fn as_any(&self) -> &dyn std::any::Any {
+        panic!("Tool::as_any not implemented for {}", self.name())
+    }
 }
 
 #[cfg(test)]

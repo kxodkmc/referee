@@ -357,3 +357,76 @@ async fn introspection_snapshot_reports_state_depth_and_restarts() {
     assert_eq!(panicky_info.state, ExtensionState::Crashed);
     assert_eq!(panicky_info.restarts, 0);
 }
+
+/// 停机记录扩展 — `shutdown` 钩子被调用即置位
+struct ShutdownTracker {
+    id: CapabilityId,
+    shutdown_called: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Extension for ShutdownTracker {
+    fn id(&self) -> CapabilityId {
+        self.id
+    }
+
+    async fn handle(&self, _ctx: KernelContext, _env: Envelope) -> KernelResult<()> {
+        Ok(())
+    }
+
+    async fn shutdown(&self) {
+        self.shutdown_called.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// `ExtensionHandle`：注册返回句柄 → `remove()` 注销路由并触发 `shutdown` 钩子
+#[tokio::test]
+async fn extension_handle_removes_and_shuts_down() {
+    let kernel = Kernel::new();
+    let shutdown_called = Arc::new(AtomicUsize::new(0));
+    let ext_id = CapabilityId::new();
+
+    let handle = kernel
+        .register_handle(
+            Box::new(ShutdownTracker {
+                id: ext_id,
+                shutdown_called: shutdown_called.clone(),
+            }),
+            8,
+            SupervisionPolicy::Transient,
+        )
+        .await
+        .expect("register_handle ok");
+
+    assert_eq!(handle.id(), ext_id);
+
+    // 注册后可正常 emit
+    kernel.emit(ext_id, Envelope::new()).await.expect("emit before remove ok");
+
+    // 移除 → Sender drop → 通道关闭 → 监督循环 NormalExit → 调用 ext.shutdown()
+    handle.remove().await.expect("remove ok");
+    // 给后台监督任务一点时间执行 shutdown
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        shutdown_called.load(Ordering::SeqCst),
+        1,
+        "extension shutdown hook must be invoked after remove"
+    );
+
+    // 移除后对目标 emit 返回 TargetUnreachable
+    let err = kernel
+        .emit(ext_id, Envelope::new())
+        .await
+        .expect_err("emit after remove must fail");
+    assert!(matches!(err, KernelError::TargetUnreachable));
+
+    // 扩展已从路由表注销
+    assert_eq!(
+        kernel
+            .extensions()
+            .iter()
+            .filter(|i| i.id == ext_id)
+            .count(),
+        0
+    );
+}
