@@ -49,7 +49,7 @@ pub mod timeout;
 pub use log::{LogError, SessionLog};
 #[cfg(feature = "persist")]
 pub use log::{PersistedSessionLog, SessionLogSink};
-pub use message::{ChatOptions, ChatPayload, SessionId, SessionMessage, SessionReply};
+pub use message::{ChatOptions, ChatPayload, ErrorKind, SessionId, SessionMessage, SessionReply};
 pub use task::{run_turn, TurnOutcome};
 pub use timeout::TimeoutConfig;
 

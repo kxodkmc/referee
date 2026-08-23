@@ -42,12 +42,12 @@ pub mod tool;
 
 // 便捷重导出
 pub use engine::{
-    ChatHandle, Engine, EngineConfig, EngineError, EngineReply, EngineStartError, ReaperHandle,
-    SessionPhase, SessionSnapshot,
+    ChatHandle, Engine, EngineConfig, EngineError, EngineObserver, EngineReply, EngineStartError,
+    ReaperHandle, SessionPhase, SessionSnapshot,
 };
 pub use provider::{
     LLMProvider, Message, ProviderRegistry, ProviderRegistryError, ProviderStatus, Role,
 };
-pub use session::{ChatOptions, ChatPayload, SessionId, SessionMessage, SessionReply};
+pub use session::{ChatOptions, ChatPayload, ErrorKind, SessionId, SessionMessage, SessionReply};
 pub use store::{InMemoryStore, Store, StoreConfig, StoreError, StoredValue};
-pub use tool::{Tool, ToolCategory, ToolContext, ToolError, ToolOutput, ToolRegistry};
+pub use tool::{Tool, ToolCategory, ToolContext, ToolError, ToolOutcome, ToolOutput, ToolRegistry};

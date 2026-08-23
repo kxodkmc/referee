@@ -104,6 +104,26 @@ pub enum MessageError {
     Decode(#[from] serde_json::Error),
 }
 
+/// 回合级错误分类 — 供上游程序化分支（重试 / 退避 / 直接报错）
+///
+/// serde 兼容：`Default = Internal`，配合 [`SessionReply::Error`] 的
+/// `#[serde(default)]`，旧 JSON（缺 `kind`）可解码（延续既有兜底约定）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorKind {
+    /// 回合超时（thinking / 等待类工具批次总 deadline）
+    Timeout,
+    /// LLM 限流（429；`retry_after_ms` 携带建议退避时长）
+    RateLimited,
+    /// LLM 调用错误（网络 / 认证 / 协议等，非限流）
+    Llm,
+    /// 预算超限（Session / Global）
+    Budget,
+    /// 其余内部错误（状态冲突 / 通道关闭 / 解码失败等兜底）
+    #[default]
+    Internal,
+}
+
 /// 会话回信 — `ctx.reply()` 的载荷格式
 ///
 /// 通过 `Envelope.metadata["_reply"]` 传递（JSON 字符串）。
@@ -122,7 +142,16 @@ pub enum SessionReply {
     /// 会话忙碌（正在 Thinking 或 AwaitingCalls），拒绝新 Chat
     Busy { turn_id: u64 },
     /// 调用失败（错误/超时/panic）
-    Error { message: String },
+    Error {
+        /// 人读错误信息（保留，供日志与直出展示）
+        message: String,
+        /// 程序化错误分类（旧 JSON 缺省解码为 `Internal`）
+        #[serde(default)]
+        kind: ErrorKind,
+        /// 限流建议退避时长（毫秒；仅 `kind = RateLimited` 时可能携带）
+        #[serde(default)]
+        retry_after_ms: Option<u64>,
+    },
     /// 已取消（Interrupt 生效）
     Cancelled,
     /// 消息无法处理（如 P2 消息在 P1 阶段收到）
@@ -255,6 +284,45 @@ mod tests {
         match msg {
             SessionMessage::Chat { payload, .. } => assert_eq!(payload.peer_depth, 0),
             other => panic!("expected Chat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_reply_old_json_defaults_internal() {
+        // 旧 JSON（无 kind / retry_after_ms）→ Internal / None（serde 兼容兜底）
+        let json = r#"{"reply":"error","message":"boom"}"#;
+        match serde_json::from_str::<SessionReply>(json).unwrap() {
+            SessionReply::Error {
+                message,
+                kind,
+                retry_after_ms,
+            } => {
+                assert_eq!(message, "boom");
+                assert_eq!(kind, ErrorKind::Internal);
+                assert_eq!(retry_after_ms, None);
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_reply_roundtrip_with_kind_and_retry_after() {
+        let reply = SessionReply::Error {
+            message: "rate limited".into(),
+            kind: ErrorKind::RateLimited,
+            retry_after_ms: Some(1200),
+        };
+        let json = serde_json::to_string(&reply).unwrap();
+        match serde_json::from_str::<SessionReply>(&json).unwrap() {
+            SessionReply::Error {
+                kind,
+                retry_after_ms,
+                ..
+            } => {
+                assert_eq!(kind, ErrorKind::RateLimited);
+                assert_eq!(retry_after_ms, Some(1200));
+            }
+            other => panic!("expected Error, got {other:?}"),
         }
     }
 }

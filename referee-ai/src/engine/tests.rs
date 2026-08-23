@@ -12,13 +12,14 @@ use crate::provider::{
     ChatResponse, FinishReason, LLMProvider, LlmError, Message, ModelSpec, ProviderCapabilities,
     ProviderId, StreamChunk, TokenUsage,
 };
-use crate::session::{ChatOptions, ChatPayload, SessionConfig, TimeoutConfig};
+use crate::session::{ChatOptions, ChatPayload, ErrorKind, SessionConfig, SessionReply, TimeoutConfig};
 use crate::tool::{
-    ExecutorConfig, RegistryConfig, Tool, ToolContext, ToolError, ToolOutput, ToolRegistry,
+    ExecutorConfig, RegistryConfig, Tool, ToolContext, ToolError, ToolOutcome, ToolOutput,
+    ToolRegistry,
 };
 use crate::{
-    budget::BudgetConfig, ChatHandle, Engine, EngineConfig, EngineReply, EngineStartError,
-    SessionPhase,
+    budget::{BudgetConfig, BudgetError}, ChatHandle, Engine, EngineConfig, EngineError,
+    EngineObserver, EngineReply, EngineStartError, SessionPhase,
 };
 use futures::stream::{self, BoxStream};
 use futures::StreamExt;
@@ -1170,5 +1171,541 @@ async fn serial_tool_execution_when_parallel_unsupported() {
     assert!(
         elapsed >= Duration::from_millis(90),
         "parallel-unsupported provider must serialize tools, took {elapsed:?}"
+    );
+}
+
+// ─────────────────────────────────────────────
+// SessionReply 错误类型化（P0）— 两条转换路径的分类
+// ─────────────────────────────────────────────
+
+#[test]
+fn engine_reply_error_kind_classification() {
+    // Timeout → kind=Timeout
+    match SessionReply::from(EngineReply::Timeout) {
+        SessionReply::Error {
+            kind,
+            retry_after_ms,
+            ..
+        } => {
+            assert_eq!(kind, ErrorKind::Timeout);
+            assert_eq!(retry_after_ms, None);
+        }
+        other => panic!("expected Error, got {other:?}"),
+    }
+    // Llm RateLimited → kind=RateLimited + retry_after 毫秒透传
+    let reply = EngineReply::Error(EngineError::Llm(LlmError::RateLimited {
+        retry_after: Some(Duration::from_millis(500)),
+    }));
+    match SessionReply::from(reply) {
+        SessionReply::Error {
+            kind,
+            retry_after_ms,
+            ..
+        } => {
+            assert_eq!(kind, ErrorKind::RateLimited);
+            assert_eq!(retry_after_ms, Some(500));
+        }
+        other => panic!("expected Error, got {other:?}"),
+    }
+    // 其余 Llm 错误 → kind=Llm
+    let reply = EngineReply::Error(EngineError::Llm(LlmError::BadRequest("bad".into())));
+    match SessionReply::from(reply) {
+        SessionReply::Error { kind, .. } => assert_eq!(kind, ErrorKind::Llm),
+        other => panic!("expected Error, got {other:?}"),
+    }
+    // 非 Llm 错误（StateConflict / TurnIncomplete / ChannelClosed）→ kind=Internal
+    for reply in [
+        EngineReply::Error(EngineError::StateConflict("resume failed")),
+        EngineReply::Error(EngineError::TurnIncomplete),
+        EngineReply::Error(EngineError::ChannelClosed),
+    ] {
+        match SessionReply::from(reply) {
+            SessionReply::Error { kind, .. } => assert_eq!(kind, ErrorKind::Internal),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn engine_start_error_kind_classification() {
+    // Budget → Budget；MaxSessions / Busy → Internal（agent 层构造 kind 的依据）
+    assert_eq!(
+        ErrorKind::from(EngineStartError::Budget(BudgetError::SessionExceeded {
+            used: 10,
+            limit: 5
+        })),
+        ErrorKind::Budget
+    );
+    assert_eq!(
+        ErrorKind::from(EngineStartError::Budget(BudgetError::GlobalExceeded {
+            used: 10,
+            limit: 5
+        })),
+        ErrorKind::Budget
+    );
+    assert_eq!(ErrorKind::from(EngineStartError::MaxSessions), ErrorKind::Internal);
+    assert_eq!(ErrorKind::from(EngineStartError::Busy), ErrorKind::Internal);
+}
+
+// ─────────────────────────────────────────────
+// awaiting_calls_timeout 落地（P1）— 单轮等待类批次总 deadline
+// ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn awaiting_calls_deadline_converges_and_session_not_stuck() {
+    // 快工具（20ms）+ 慢工具（10s，远超批次 deadline 且不触发单工具 timeout）；
+    // awaiting_calls_timeout=150ms：快工具真实收敛、慢工具超时消息收敛，
+    // 回合正常走完（resume → 最终回复），会话恢复 Idle、次轮 chat 可正常进入。
+    struct FastTool;
+    #[async_trait::async_trait]
+    impl Tool for FastTool {
+        fn name(&self) -> &str {
+            "fast"
+        }
+        fn description(&self) -> &str {
+            "fast tool"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn default_wait(&self) -> bool {
+            true
+        }
+        async fn execute(
+            &self,
+            _c: ToolContext,
+            _a: serde_json::Value,
+        ) -> Result<ToolOutput, ToolError> {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok(ToolOutput::text("fast_result"))
+        }
+    }
+
+    struct VerySlowTool;
+    #[async_trait::async_trait]
+    impl Tool for VerySlowTool {
+        fn name(&self) -> &str {
+            "very_slow"
+        }
+        fn description(&self) -> &str {
+            "very slow tool"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn default_wait(&self) -> bool {
+            true
+        }
+        async fn execute(
+            &self,
+            _c: ToolContext,
+            _a: serde_json::Value,
+        ) -> Result<ToolOutput, ToolError> {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok(ToolOutput::text("never"))
+        }
+    }
+
+    let registry = ToolRegistry::new(RegistryConfig::default());
+    registry.register(Arc::new(FastTool)).unwrap();
+    registry.register(Arc::new(VerySlowTool)).unwrap();
+    let executor = crate::tool::ToolExecutor::new(ExecutorConfig {
+        max_per_turn: 10,
+        tool_timeout: Duration::from_secs(30), // 不触发单工具 timeout
+        max_concurrency: 5,
+    });
+
+    let mut cfg = config();
+    cfg.session.timeout.awaiting_calls_timeout = Duration::from_millis(150);
+    // 第三条响应供次轮 chat 使用（验证会话不悬空）
+    let provider = mock(vec![
+        Ok(resp("", vec![tool_call("fast"), tool_call("very_slow")])),
+        Ok(resp("done", vec![])),
+        Ok(resp("next round ok", vec![])),
+    ]);
+    let engine = Engine::new(provider.clone(), cfg).with_tools(registry, executor);
+    let sid = session_id();
+
+    // 回合应在批次 deadline 附近收敛（远小于慢工具 10s / 单工具 30s）
+    let start = Instant::now();
+    let reply = wait_with_timeout(engine.chat(sid, chat_payload("go")).unwrap()).await;
+    let elapsed = start.elapsed();
+    match reply {
+        EngineReply::Success(r) => assert_eq!(r.message.content.as_text().unwrap(), "done"),
+        other => panic!("expected Success, got {other:?}"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "turn must converge at batch deadline, took {elapsed:?}"
+    );
+
+    // 部分完成 + 部分超时收敛：第二轮请求同时含快工具真实结果与超时收敛消息
+    let reqs = provider.requests.lock();
+    let second = &reqs[1];
+    assert!(second.contains("fast_result"), "fast result kept: {second}");
+    assert!(
+        second.contains("batch deadline"),
+        "slow tool converged with deadline message: {second}"
+    );
+    drop(reqs);
+
+    // 会话不悬空：状态 Idle，次轮 chat 正常进入并完成
+    assert_eq!(
+        engine.session_info(sid).map(|s| s.state),
+        Some(SessionPhase::Idle)
+    );
+    let reply2 = wait_with_timeout(engine.chat(sid, chat_payload("again")).unwrap()).await;
+    match reply2 {
+        EngineReply::Success(r) => {
+            assert_eq!(r.message.content.as_text().unwrap(), "next round ok")
+        }
+        other => panic!("second chat must start normally, got {other:?}"),
+    }
+}
+
+// ─────────────────────────────────────────────
+// EngineObserver 事件钩子（P2）— mock observer 五场景
+// ─────────────────────────────────────────────
+
+/// 观测事件记录（usage 简化为 total_tokens）
+#[derive(Debug, Clone, PartialEq)]
+enum Observed {
+    TurnStarted(u64),
+    ThinkingDelta(String),
+    TextDelta(String),
+    ToolStarted(String),
+    ToolFinished(String, ToolOutcome, u64),
+    TurnFinished(u64, Option<usize>),
+}
+
+/// mock observer — Mutex push（测试内轻量操作，满足非阻塞契约）
+#[derive(Clone, Default)]
+struct Recorder {
+    events: std::sync::Arc<parking_lot::Mutex<Vec<Observed>>>,
+}
+
+impl Recorder {
+    fn events(&self) -> Vec<Observed> {
+        self.events.lock().clone()
+    }
+}
+
+impl EngineObserver for Recorder {
+    fn on_turn_started(&self, _sid: crate::SessionId, turn_id: u64) {
+        self.events.lock().push(Observed::TurnStarted(turn_id));
+    }
+    fn on_thinking_delta(&self, _sid: crate::SessionId, delta: &str) {
+        self.events
+            .lock()
+            .push(Observed::ThinkingDelta(delta.to_string()));
+    }
+    fn on_text_delta(&self, _sid: crate::SessionId, delta: &str) {
+        self.events.lock().push(Observed::TextDelta(delta.to_string()));
+    }
+    fn on_tool_started(&self, _sid: crate::SessionId, tool_call_id: &str, _name: &str) {
+        self.events
+            .lock()
+            .push(Observed::ToolStarted(tool_call_id.to_string()));
+    }
+    fn on_tool_finished(
+        &self,
+        _sid: crate::SessionId,
+        tool_call_id: &str,
+        outcome: ToolOutcome,
+        duration_ms: u64,
+    ) {
+        self.events
+            .lock()
+            .push(Observed::ToolFinished(tool_call_id.to_string(), outcome, duration_ms));
+    }
+    fn on_turn_finished(&self, _sid: crate::SessionId, turn_id: u64, usage: Option<TokenUsage>) {
+        self.events
+            .lock()
+            .push(Observed::TurnFinished(turn_id, usage.map(|u| u.total_tokens)));
+    }
+}
+
+/// 双模流式提供器：chat 报错（内部流式收敛启用时不得调用），chat_stream 返回脚本
+struct DualStreamProvider {
+    chunks: Vec<Result<StreamChunk, LlmError>>,
+}
+
+#[async_trait::async_trait]
+impl LLMProvider for DualStreamProvider {
+    fn id(&self) -> ProviderId {
+        ProviderId::new("dual")
+    }
+    fn capabilities(&self) -> &ProviderCapabilities {
+        caps_streaming()
+    }
+    fn model_spec(&self) -> ModelSpec {
+        model_spec()
+    }
+    async fn chat(&self, _req: crate::provider::ChatRequest) -> Result<ChatResponse, LlmError> {
+        Err(LlmError::BadRequest(
+            "chat() must not be called when observer enables internal streaming".into(),
+        ))
+    }
+    async fn chat_stream(
+        &self,
+        _req: crate::provider::ChatRequest,
+    ) -> Result<BoxStream<'static, Result<StreamChunk, LlmError>>, LlmError> {
+        Ok(Box::pin(stream::iter(self.chunks.clone())))
+    }
+}
+
+/// chat 优先提供器：chat 正常返回，chat_stream 返回空流（内部收敛若被误用必失败）
+struct ChatFirstStreamProvider {
+    call_count: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl LLMProvider for ChatFirstStreamProvider {
+    fn id(&self) -> ProviderId {
+        ProviderId::new("chat-first")
+    }
+    fn capabilities(&self) -> &ProviderCapabilities {
+        caps_streaming()
+    }
+    fn model_spec(&self) -> ModelSpec {
+        model_spec()
+    }
+    async fn chat(&self, _req: crate::provider::ChatRequest) -> Result<ChatResponse, LlmError> {
+        self.call_count.fetch_add(1, Ordering::SeqCst);
+        Ok(resp("from chat", vec![]))
+    }
+    async fn chat_stream(
+        &self,
+        _req: crate::provider::ChatRequest,
+    ) -> Result<BoxStream<'static, Result<StreamChunk, LlmError>>, LlmError> {
+        Ok(Box::pin(stream::empty()))
+    }
+}
+
+fn finish_chunk(total: usize) -> Result<StreamChunk, LlmError> {
+    Ok(StreamChunk::Finish {
+        finish_reason: FinishReason::Stop,
+        usage: Some(TokenUsage {
+            total_tokens: total,
+            ..Default::default()
+        }),
+    })
+}
+
+#[tokio::test]
+async fn observer_internal_stream_convergence_on_non_stream_path() {
+    // 注入 observer + 厂商流式：非流式 chat() 内部改走 chat_stream 收敛，
+    // delta 逐条回调，对外仍返回完整 ChatResponse
+    let provider = Arc::new(DualStreamProvider {
+        chunks: vec![
+            Ok(delta("Hello")),
+            Ok(delta(" world")),
+            finish_chunk(8),
+        ],
+    });
+    let recorder = Recorder::default();
+    let engine = Engine::new(provider, config()).with_observer(Arc::new(recorder.clone()));
+    let reply = wait_with_timeout(engine.chat(session_id(), chat_payload("hi")).unwrap()).await;
+    match reply {
+        EngineReply::Success(r) => assert_eq!(r.message.content.as_text().unwrap(), "Hello world"),
+        other => panic!("expected Success, got {other:?}"),
+    }
+    assert_eq!(
+        recorder.events(),
+        vec![
+            Observed::TurnStarted(1),
+            Observed::TextDelta("Hello".into()),
+            Observed::TextDelta(" world".into()),
+            Observed::TurnFinished(1, Some(8)),
+        ],
+        "turn start/finish must pair; deltas in order; usage carried"
+    );
+}
+
+#[tokio::test]
+async fn observer_non_streaming_provider_keeps_plain_chat() {
+    // observer + 厂商 streaming=false → 仍走 provider.chat()，无 delta 事件
+    let provider = mock(vec![Ok(resp("plain ok", vec![]))]);
+    let recorder = Recorder::default();
+    let engine = Engine::new(provider.clone(), config()).with_observer(Arc::new(recorder.clone()));
+    let reply = wait_with_timeout(engine.chat(session_id(), chat_payload("hi")).unwrap()).await;
+    match reply {
+        EngineReply::Success(r) => assert_eq!(r.message.content.as_text().unwrap(), "plain ok"),
+        other => panic!("expected Success, got {other:?}"),
+    }
+    assert_eq!(provider.call_count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        recorder.events(),
+        vec![
+            Observed::TurnStarted(1),
+            Observed::TurnFinished(1, Some(8)), // resp() 默认 usage total=8
+        ],
+        "non-streaming provider must not emit deltas"
+    );
+}
+
+#[tokio::test]
+async fn no_observer_keeps_plain_chat_even_if_streaming_capable() {
+    // 未注入 observer：即使厂商支持流式也保持 provider.chat()（无内部流式回归）
+    let provider = Arc::new(ChatFirstStreamProvider {
+        call_count: Arc::new(AtomicUsize::new(0)),
+    });
+    let engine = Engine::new(provider.clone(), config()); // 无 observer
+    let reply = wait_with_timeout(engine.chat(session_id(), chat_payload("hi")).unwrap()).await;
+    match reply {
+        EngineReply::Success(r) => assert_eq!(r.message.content.as_text().unwrap(), "from chat"),
+        other => panic!("expected Success, got {other:?}"),
+    }
+    assert_eq!(
+        provider.call_count.load(Ordering::SeqCst),
+        1,
+        "plain chat must be used exactly once"
+    );
+}
+
+#[tokio::test]
+async fn observer_tool_timeout_observable() {
+    // 等待类工具超时：on_tool_finished 携带 ToolOutcome::Timeout；回合事件成对
+    struct SleepyTool;
+    #[async_trait::async_trait]
+    impl Tool for SleepyTool {
+        fn name(&self) -> &str {
+            "sleepy"
+        }
+        fn description(&self) -> &str {
+            "sleeps long"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn default_wait(&self) -> bool {
+            true
+        }
+        async fn execute(
+            &self,
+            _c: ToolContext,
+            _a: serde_json::Value,
+        ) -> Result<ToolOutput, ToolError> {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok(ToolOutput::text("never"))
+        }
+    }
+
+    let registry = ToolRegistry::new(RegistryConfig::default());
+    registry.register(Arc::new(SleepyTool)).unwrap();
+    let executor = crate::tool::ToolExecutor::new(ExecutorConfig {
+        max_per_turn: 10,
+        tool_timeout: Duration::from_millis(50), // 单工具超时先于批次 deadline
+        max_concurrency: 5,
+    });
+    let provider = mock(vec![
+        Ok(resp("", vec![tool_call("sleepy")])),
+        Ok(resp("done", vec![])),
+    ]);
+    let recorder = Recorder::default();
+    let engine = Engine::new(provider, config())
+        .with_tools(registry, executor)
+        .with_observer(Arc::new(recorder.clone()));
+    let reply = wait_with_timeout(engine.chat(session_id(), chat_payload("go")).unwrap()).await;
+    assert!(matches!(reply, EngineReply::Success(_)));
+
+    let events = recorder.events();
+    // 工具事件：started + finished(Timeout)
+    assert!(events.contains(&Observed::ToolStarted("tc_sleepy".into())));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Observed::ToolFinished(id, ToolOutcome::Timeout, _)
+            if id == "tc_sleepy"
+    )));
+    // 回合事件成对（两轮思考：工具轮 + 最终轮）
+    let started = events
+        .iter()
+        .filter(|e| matches!(e, Observed::TurnStarted(_)))
+        .count();
+    let finished = events
+        .iter()
+        .filter(|e| matches!(e, Observed::TurnFinished(_, _)))
+        .count();
+    assert_eq!((started, finished), (2, 2), "turn events must pair: {events:?}");
+}
+
+#[tokio::test]
+async fn observer_dispatched_tool_finished_fires() {
+    // 派发类（wait=false）后台完成后同样触发 on_tool_finished（复用 ToolOutcome）
+    struct LazyTool;
+    #[async_trait::async_trait]
+    impl Tool for LazyTool {
+        fn name(&self) -> &str {
+            "lazy"
+        }
+        fn description(&self) -> &str {
+            "async lazy tool"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        // 不覆写 default_wait（默认 false）→ 派发类
+        async fn execute(
+            &self,
+            _c: ToolContext,
+            _a: serde_json::Value,
+        ) -> Result<ToolOutput, ToolError> {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok(ToolOutput::text("lazy_result"))
+        }
+    }
+
+    let registry = ToolRegistry::new(RegistryConfig::default());
+    registry.register(Arc::new(LazyTool)).unwrap();
+    let executor = crate::tool::ToolExecutor::new(ExecutorConfig {
+        max_per_turn: 10,
+        tool_timeout: Duration::from_secs(2),
+        max_concurrency: 5,
+    });
+    let provider = mock(vec![Ok(resp("dispatching", vec![tool_call("lazy")]))]);
+    let recorder = Recorder::default();
+    let engine = Engine::new(provider, config())
+        .with_tools(registry, executor)
+        .with_observer(Arc::new(recorder.clone()));
+    let reply = wait_with_timeout(engine.chat(session_id(), chat_payload("go")).unwrap()).await;
+    assert!(matches!(reply, EngineReply::Success(_)));
+
+    // 等待后台派发任务完成（工具 100ms + 余量）
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let events = recorder.events();
+    assert!(events.contains(&Observed::ToolStarted("tc_lazy".into())));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Observed::ToolFinished(id, ToolOutcome::Ok, _) if id == "tc_lazy"
+    )));
+}
+
+#[tokio::test]
+async fn observer_streaming_path_deltas() {
+    // chat_stream 路径：delta 回调与内部收敛路径共享同一推送点
+    let chunks = vec![Ok(delta("Hello")), Ok(delta(" world")), finish_chunk(8)];
+    let recorder = Recorder::default();
+    let engine = Engine::new(
+        Arc::new(StreamMockProvider::new(Box::pin(stream::iter(chunks)))),
+        config(),
+    )
+    .with_observer(Arc::new(recorder.clone()));
+    let sid = session_id();
+    let handle = engine.chat_stream(sid, chat_payload("hi")).unwrap();
+    let reply = wait_with_timeout(handle).await;
+    let mut stream = match reply {
+        EngineReply::Streaming(s) => s,
+        other => panic!("expected Streaming, got {other:?}"),
+    };
+    while stream.next().await.is_some() {} // 消费完转发流
+
+    assert_eq!(
+        recorder.events(),
+        vec![
+            Observed::TurnStarted(1),
+            Observed::TextDelta("Hello".into()),
+            Observed::TextDelta(" world".into()),
+            Observed::TurnFinished(1, Some(8)),
+        ]
     );
 }

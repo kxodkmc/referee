@@ -22,5 +22,5 @@ pub mod executor;
 pub mod registry;
 
 pub use definition::{Tool, ToolCategory, ToolContext, ToolError, ToolOutput};
-pub use executor::{ExecutedTool, ExecutorConfig, ToolExecutor};
+pub use executor::{ExecutedTool, ExecutorConfig, ToolOutcome, ToolExecutor};
 pub use registry::{RegistryConfig, RegistryError, ToolRegistry};

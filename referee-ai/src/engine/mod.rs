@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use futures::stream::BoxStream;
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use tracing::Instrument;
@@ -35,15 +35,18 @@ use crate::cache::{CacheConfig, InMemoryCache};
 use crate::observe;
 use crate::provider::{ChatResponse, LLMProvider, LlmError, StreamChunk};
 use crate::session::{
-    ChatPayload, FinishAction, RoundStart, Session, SessionConfig, SessionId, SessionReply,
-    TurnOutcome,
+    ChatPayload, ErrorKind, FinishAction, RoundStart, Session, SessionConfig, SessionId,
+    SessionReply, TurnOutcome,
 };
-use crate::tool::{ExecutedTool, ToolExecutor, ToolRegistry};
+use crate::tool::{ExecutedTool, ToolOutcome, ToolExecutor, ToolRegistry};
 
+pub mod observer;
 pub mod session_mgmt;
 pub mod stream;
 
+pub use observer::EngineObserver;
 pub use session_mgmt::{ReaperHandle, SessionPhase, SessionSnapshot};
+use stream::StreamAccumulator;
 
 /// 引擎配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,6 +184,8 @@ pub struct Engine {
     pub(crate) config: EngineConfig,
     tools: Option<ToolRegistry>,
     tool_executor: Option<ToolExecutor>,
+    /// 引擎观测器（行为句柄，builder 注入，不进 EngineConfig——行为不进配置数据）
+    pub(crate) observer: Option<Arc<dyn EngineObserver>>,
     pub(crate) total_consumed_tokens: Arc<AtomicU64>,
     cache: Option<Arc<InMemoryCache>>,
 }
@@ -191,6 +196,7 @@ impl std::fmt::Debug for Engine {
             .field("sessions", &self.sessions.len())
             .field("max_sessions", &self.config.max_sessions)
             .field("has_tools", &self.tools.is_some())
+            .field("has_observer", &self.observer.is_some())
             .field("total_consumed_tokens", &self.total_consumed_tokens())
             .field("cache_entries", &self.cache_len())
             .finish()
@@ -214,6 +220,7 @@ impl Engine {
             config,
             tools: None,
             tool_executor: None,
+            observer: None,
             total_consumed_tokens: Arc::new(AtomicU64::new(0)),
             cache,
         }
@@ -223,6 +230,15 @@ impl Engine {
     pub fn with_tools(mut self, registry: ToolRegistry, executor: ToolExecutor) -> Self {
         self.tools = Some(registry);
         self.tool_executor = Some(executor);
+        self
+    }
+
+    /// 注入引擎观测器（builder，与 [`with_tools`](Self::with_tools) 对称）
+    ///
+    /// 注入后：非流式路径在厂商支持流式时改走「内部流式收敛」以产生 delta 事件；
+    /// 未注入或厂商 `streaming=false` 时保持 `provider.chat()` 直调（零行为回归）。
+    pub fn with_observer(mut self, observer: Arc<dyn EngineObserver>) -> Self {
+        self.observer = Some(observer);
         self
     }
 
@@ -530,6 +546,7 @@ impl Engine {
             if self.is_interrupted(session_id) {
                 return EngineReply::Cancelled;
             }
+            self.observe_event(|o| o.on_turn_started(*session_id, turn_id));
 
             // 缓存命中检查（不调 LLM；catch_unwind 兜底降级为真实调用）
             let cache_key = self
@@ -581,11 +598,18 @@ impl Engine {
             };
 
             // 终态收敛（session 内累加 consumed_tokens；guard 短暂持有后立即释放）
+            let turn_usage = match &outcome {
+                TurnOutcome::Success(resp) | TurnOutcome::Cached(resp) => resp.usage.clone(),
+                _ => None,
+            };
             let action = self
                 .sessions
                 .get_mut(session_id)
                 .map(|mut s| s.finish_thinking(turn_id, outcome))
                 .unwrap_or(FinishAction::Idle { response: None });
+            self.observe_event(|o| {
+                o.on_turn_finished(*session_id, turn_id, turn_usage.clone());
+            });
 
             match action {
                 FinishAction::Idle {
@@ -649,7 +673,7 @@ impl Engine {
                 return TurnOutcome::Cancelled;
             }
             let outcome = self
-                .single_llm_call(request.clone(), cancel_rx, timeout)
+                .single_llm_call(session_id, request.clone(), cancel_rx, timeout)
                 .await;
             match outcome {
                 TurnOutcome::Error(e) if e.is_retryable() && attempt < max_retries => {
@@ -663,21 +687,31 @@ impl Engine {
     }
 
     /// 单次 LLM 调用：三路 select（LLM / 取消 / 超时）+ catch_unwind
+    ///
+    /// 注入 observer 且厂商支持流式时走「内部流式收敛」（delta 逐条回调，
+    /// 对外仍返回完整 `ChatResponse`，两条路径在此统一）；否则保持
+    /// `provider.chat()` 直调——不给无需可观测性的场景引入流式端点回归。
     async fn single_llm_call(
         &self,
+        session_id: &SessionId,
         request: crate::provider::ChatRequest,
         cancel_rx: &mut oneshot::Receiver<()>,
         timeout: Duration,
     ) -> TurnOutcome {
-        let fut = self.provider.chat(request);
+        let internal_stream = self.observer.is_some() && self.provider.capabilities().streaming;
         let result = AssertUnwindSafe(async {
-            tokio::select! {
-                res = fut => match res {
-                    Ok(r) => TurnOutcome::Success(Box::new(r)),
-                    Err(e) => TurnOutcome::Error(e),
-                },
-                _ = &mut *cancel_rx => TurnOutcome::Cancelled,
-                _ = tokio::time::sleep(timeout) => TurnOutcome::Timeout,
+            if internal_stream {
+                self.internal_stream_call(session_id, request, cancel_rx, timeout)
+                    .await
+            } else {
+                tokio::select! {
+                    res = self.provider.chat(request) => match res {
+                        Ok(r) => TurnOutcome::Success(Box::new(r)),
+                        Err(e) => TurnOutcome::Error(e),
+                    },
+                    _ = &mut *cancel_rx => TurnOutcome::Cancelled,
+                    _ = tokio::time::sleep(timeout) => TurnOutcome::Timeout,
+                }
             }
         })
         .catch_unwind()
@@ -685,6 +719,53 @@ impl Engine {
         match result {
             Ok(outcome) => outcome,
             Err(payload) => TurnOutcome::Panic(panic_message(payload)),
+        }
+    }
+
+    /// 内部流式收敛：消费 `chat_stream` 累积为完整 `ChatResponse`（对外仍非流式），
+    /// delta 经 [`Engine::observe_chunk_deltas`] 逐条回调；取消/超时语义与非流式一致
+    async fn internal_stream_call(
+        &self,
+        session_id: &SessionId,
+        request: crate::provider::ChatRequest,
+        cancel_rx: &mut oneshot::Receiver<()>,
+        timeout: Duration,
+    ) -> TurnOutcome {
+        let sid = *session_id;
+        tokio::select! {
+            outcome = async {
+                let mut stream = match self.provider.chat_stream(request).await {
+                    Ok(s) => s,
+                    Err(e) => return TurnOutcome::Error(e),
+                };
+                let mut acc = StreamAccumulator::new();
+                while let Some(chunk) = stream.next().await {
+                    match chunk {
+                        Ok(c) => {
+                            self.observe_chunk_deltas(&sid, &c);
+                            acc.push(c);
+                        }
+                        Err(e) => return TurnOutcome::Error(e),
+                    }
+                }
+                match acc.finish() {
+                    Some((message, finish_reason, usage)) => {
+                        let id = self.provider.id().to_string();
+                        TurnOutcome::Success(Box::new(ChatResponse {
+                            id: id.clone(),
+                            model: id,
+                            message,
+                            finish_reason,
+                            usage,
+                        }))
+                    }
+                    None => TurnOutcome::Error(LlmError::Protocol(
+                        "stream ended without finish chunk".into(),
+                    )),
+                }
+            } => outcome,
+            _ = &mut *cancel_rx => TurnOutcome::Cancelled,
+            _ = tokio::time::sleep(timeout) => TurnOutcome::Timeout,
         }
     }
 
@@ -700,7 +781,9 @@ impl Engine {
     /// - 截断项：生成引导错误消息（下一轮重发），立即收敛
     /// - 派发类（不等待）：占位结果立即收敛（保证 assistant tool_calls 与 tool 结果
     ///   配对），后台任务执行完成后结果入队，等待下一次模型调用/回合合并注入
-    /// - 等待类：同步执行（并行 + 隔离 + 超时），完成后收敛结果
+    /// - 等待类：同步执行（并行 + 隔离 + 单工具超时），批次受
+    ///   `awaiting_calls_timeout` 总 deadline 约束——未完成项以超时消息收敛，
+    ///   会话恢复一致状态，回合不被慢批次无限占用
     pub(crate) async fn run_tool_calls(
         &self,
         session_id: &SessionId,
@@ -752,6 +835,11 @@ impl Engine {
         // 2. 按等待决策分流
         let (waiting, dispatched) = executor.split_by_wait(head, &registry);
 
+        // 观测：实际执行项（等待 + 派发）触发 started（截断/深度拦截项不执行，不触发）
+        for tc in waiting.iter().chain(dispatched.iter()) {
+            self.observe_event(|o| o.on_tool_started(*session_id, &tc.id, &tc.function.name));
+        }
+
         // 3. 派发类：占位收敛 + 后台执行完成后入队注入
         if !dispatched.is_empty() {
             for tc in &dispatched {
@@ -769,8 +857,14 @@ impl Engine {
                         tool_call_id: String::new(),
                         tool_name: "<unknown>".into(),
                         result: "async tool task panicked".into(),
+                        outcome: ToolOutcome::Panic,
+                        duration_ms: 0,
                     });
                     observe::tool_completed(!r.result.is_empty());
+                    // 派发类完成事件（与等待类复用同一 ToolOutcome）
+                    engine.observe_event(|o| {
+                        o.on_tool_finished(sid, &r.tool_call_id, r.outcome, r.duration_ms)
+                    });
                     let text = format!("[async tool '{}' completed]\n{}", r.tool_name, r.result);
                     if let Some(mut s) = engine.sessions.get_mut(&sid) {
                         s.inject_tool_result(text);
@@ -779,7 +873,7 @@ impl Engine {
             });
         }
 
-        // 4. 等待类：同步执行并收敛结果
+        // 4. 等待类：同步执行并收敛结果（批次总 deadline = awaiting_calls_timeout）
         if !waiting.is_empty() {
             // 能力降级：厂商不支持并行工具时强制串行（Some(1)）
             let max_concurrent = if self.provider.capabilities().parallel_tool_calls {
@@ -795,10 +889,14 @@ impl Engine {
                     turn_id,
                     depth,
                     max_concurrent,
+                    self.config.session.timeout.awaiting_calls_timeout,
                 )
                 .await;
             for r in results {
                 observe::tool_completed(!r.result.is_empty());
+                self.observe_event(|o| {
+                    o.on_tool_finished(*session_id, &r.tool_call_id, r.outcome, r.duration_ms)
+                });
                 if let Some(mut s) = self.sessions.get_mut(session_id) {
                     s.finish_tool_call(&r.tool_call_id, r.result);
                 }
@@ -868,15 +966,46 @@ impl From<EngineReply> for SessionReply {
             EngineReply::Success(resp) => SessionReply::from_response(*resp),
             EngineReply::Streaming(_) => SessionReply::Error {
                 message: "streaming reply must be consumed directly, not over envelope".into(),
+                kind: ErrorKind::Internal,
+                retry_after_ms: None,
             },
             EngineReply::Busy { turn_id } => SessionReply::Busy { turn_id },
-            EngineReply::Error(e) => SessionReply::Error {
-                message: e.to_string(),
-            },
+            EngineReply::Error(e) => {
+                // 错误分类（回合级）：限流独立成类并透传 retry_after，
+                // 其余 LLM 错误归 Llm，非 LLM 错误（状态冲突/回合异常/通道关闭）归 Internal
+                let (kind, retry_after_ms) = match &e {
+                    EngineError::Llm(LlmError::RateLimited { retry_after }) => (
+                        ErrorKind::RateLimited,
+                        retry_after.map(|d| d.as_millis() as u64),
+                    ),
+                    EngineError::Llm(_) => (ErrorKind::Llm, None),
+                    _ => (ErrorKind::Internal, None),
+                };
+                SessionReply::Error {
+                    message: e.to_string(),
+                    kind,
+                    retry_after_ms,
+                }
+            }
             EngineReply::Cancelled => SessionReply::Cancelled,
             EngineReply::Timeout => SessionReply::Error {
                 message: "turn timeout".into(),
+                kind: ErrorKind::Timeout,
+                retry_after_ms: None,
             },
+        }
+    }
+}
+
+/// 启动阶段错误的回合级分类（供 agent 层构造 `SessionReply::Error.kind`）
+///
+/// `Budget` 独立成类（上游可提示预算耗尽而非笼统失败）；
+/// `MaxSessions` / `Busy` 属引擎并发治理，归 `Internal`。
+impl From<EngineStartError> for ErrorKind {
+    fn from(e: EngineStartError) -> Self {
+        match e {
+            EngineStartError::Budget(_) => ErrorKind::Budget,
+            EngineStartError::MaxSessions | EngineStartError::Busy => ErrorKind::Internal,
         }
     }
 }

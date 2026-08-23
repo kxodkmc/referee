@@ -1,9 +1,9 @@
-//! 超时治理 — Thinking / AwaitingCalls 双 deadline
+//! 超时治理 — Thinking / 等待类工具批次双 deadline
 //!
 //! 两类超时：
 //! - **Thinking 超时**：LLM 调用超时（`run_turn` 内 `tokio::time::timeout` 切断）
-//! - **AwaitingCalls 超时**：等待工具调用完成的超时（
-//!   超时后会话自动恢复 Idle + DLQ 记录，杜绝幽灵会话）
+//! - **AwaitingCalls 超时**：单轮等待类工具批次总 deadline（引擎工具轮施加；
+//!   到达时未完成项以超时消息收敛、会话恢复一致状态，回合不被慢批次无限占用）
 //!
 //! ## 可配置
 //! 所有超时时长通过 [`TimeoutConfig`] 配置，默认值见 [`TimeoutConfig::default`]。
@@ -21,9 +21,13 @@ pub struct TimeoutConfig {
     /// 超时后 `run_turn` 返回 `TurnOutcome::Timeout`，派生任务终态收敛为 Idle。
     pub thinking_timeout: Duration,
 
-    /// AwaitingCalls 状态超时（等待工具调用完成上限）
+    /// 单轮等待类工具批次总 deadline（区别于单工具 `tool_timeout`）
     ///
-    /// P2/P3 使用。超时后未完成的 pending 项进 DLQ，会话恢复 Idle。
+    /// 引擎在工具轮对等待类（wait=true）批次施加的总上限：deadline 到达时，
+    /// 已完成项正常收敛，未完成项以超时消息回写（下一轮对模型可见），
+    /// 会话恢复一致状态。派发类（wait=false）后台任务不受此约束。
+    /// 历史注：旧注释「AwaitingCalls 跨消息回环 → DLQ」语义在同任务内顺序
+    /// 收敛的现行架构下并不存在，本字段已重定义如上，勿按旧语义使用。
     pub awaiting_calls_timeout: Duration,
 }
 
