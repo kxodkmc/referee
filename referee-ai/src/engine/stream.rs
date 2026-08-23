@@ -75,27 +75,37 @@ async fn stream_loop(
         if engine.is_interrupted(session_id) {
             break;
         }
+        engine.observe_event(|o| o.on_turn_started(*session_id, turn_id));
 
         let stream = match engine.provider.chat_stream(request).await {
             Ok(s) => s,
             Err(e) => {
                 let _ = tx.send(Err(e)).await;
+                // started 已触发，错误出口补 finished 维持成对
+                engine.observe_event(|o| o.on_turn_finished(*session_id, turn_id, None));
                 break;
             }
         };
 
         let provider_id = engine.provider.id().to_string();
-        let outcome = consume_stream(stream, cancel_rx, timeout, &mut tx, provider_id).await;
+        let outcome = consume_stream(engine, session_id, stream, cancel_rx, timeout, &mut tx, provider_id).await;
 
         if let TurnOutcome::Success(resp) = &outcome {
             add_tokens(&engine.total_consumed_tokens, tokens_from_response(resp));
         }
 
+        let turn_usage = match &outcome {
+            TurnOutcome::Success(resp) => resp.usage.clone(),
+            _ => None,
+        };
         let action = engine
             .sessions
             .get_mut(session_id)
             .map(|mut s| s.finish_thinking(turn_id, outcome))
             .unwrap_or(FinishAction::Idle { response: None });
+        engine.observe_event(|o| {
+            o.on_turn_finished(*session_id, turn_id, turn_usage.clone());
+        });
 
         match action {
             FinishAction::Idle { .. } => break,
@@ -115,8 +125,11 @@ async fn stream_loop(
     }
 }
 
-/// 消费流：逐 chunk 转发给调用方并累积；取消逐 chunk 检查、超时覆盖整体、panic 兜底
+/// 消费流：逐 chunk 转发给调用方、触发 observer delta 并累积；取消逐 chunk 检查、
+/// 超时覆盖整体、panic 兜底
 async fn consume_stream(
+    engine: &Engine,
+    session_id: &SessionId,
     mut stream: BoxStream<'static, Result<StreamChunk, LlmError>>,
     mut cancel_rx: oneshot::Receiver<()>,
     timeout: Duration,
@@ -131,6 +144,7 @@ async fn consume_stream(
                     chunk = stream.next() => match chunk {
                         Some(Ok(c)) => {
                             let _ = tx.send(Ok(c.clone())).await;
+                            engine.observe_chunk_deltas(session_id, &c);
                             acc.push(c);
                         }
                         Some(Err(e)) => {

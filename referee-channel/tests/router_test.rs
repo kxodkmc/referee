@@ -14,7 +14,7 @@ use referee_channel::batch::BatchConfig;
 use referee_channel::message::{kind, ChannelContent, InboundMessage, OutboundCommand, SendReceipt};
 use referee_channel::{ImRouter, ImRouterConfig};
 use referee_ai::provider::{FinishReason, Message};
-use referee_ai::{SessionId, SessionMessage, SessionReply};
+use referee_ai::{ErrorKind, SessionId, SessionMessage, SessionReply};
 use referee_core::{
     CapabilityId, Envelope, Extension, Kernel, KernelContext, KernelResult, SupervisionPolicy,
 };
@@ -147,6 +147,8 @@ impl Extension for MockAgent {
                         let _ = ctx.reply(
                             SessionReply::Error {
                                 message: "mock 失败".into(),
+                                kind: ErrorKind::Internal,
+                                retry_after_ms: None,
                             }
                             .to_envelope(),
                         );

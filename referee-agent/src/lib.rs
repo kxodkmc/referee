@@ -41,7 +41,7 @@ pub use skill::{
 use std::sync::Arc;
 
 use referee_ai::engine::{ChatHandle, Engine, EngineError, EngineReply, EngineStartError, SessionSnapshot};
-use referee_ai::session::{ChatPayload, SessionId, SessionMessage, SessionReply};
+use referee_ai::session::{ChatPayload, ErrorKind, SessionId, SessionMessage, SessionReply};
 use referee_core::extension::{CapabilityId, Extension, KernelContext};
 use referee_core::Envelope;
 use tracing::info_span;
@@ -251,10 +251,14 @@ impl AgentRuntime {
                 });
             }
             Err(e) => {
-                // 启动阶段错误（busy / 预算 / 超会话）显式回信，不静默丢弃
+                // 启动阶段错误（busy / 预算 / 超会话）显式回信，不静默丢弃；
+                // kind 经 From<EngineStartError> 分类（Budget 独立成类）
+                let message = e.to_string();
                 let _ = ctx.reply(
                     SessionReply::Error {
-                        message: e.to_string(),
+                        message,
+                        kind: ErrorKind::from(e),
+                        retry_after_ms: None,
                     }
                     .to_envelope(),
                 );
@@ -289,6 +293,8 @@ impl Extension for AgentRuntime {
                 let _ = ctx.reply(
                     SessionReply::Error {
                         message: format!("decode error: {e}"),
+                        kind: ErrorKind::Internal,
+                        retry_after_ms: None,
                     }
                     .to_envelope(),
                 );

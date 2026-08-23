@@ -4,19 +4,23 @@
 //! - **并行有上限**：`Semaphore` 限制并发数；`max_per_turn` 限制每轮工具数
 //! - **截断策略**：调用方先 `truncate`，多余的发引导错误消息（引导 LLM 下轮分批）
 //! - **panic 隔离**：每个 `execute` 调用包 `catch_unwind`，panic 转为 `ToolError::Panic`
-//! - **超时治理**：每个工具独立 `tokio::time::timeout`
+//! - **超时治理**：每个工具独立 `tokio::time::timeout`；等待类批次另有总 deadline
+//!   （`execute_batch` 的 `batch_deadline`，未完成项超时收敛，绝不无限等待）
 //! - **等待/派发分流**：`split_by_wait` 按保留参数 `wait`（或工具 `default_wait`）
 //!   拆分——等待类走 `execute_batch` 同步收敛；派发类走 `dispatch_batch` 后台执行，
 //!   完成结果由调用方注入（入队，不阻塞主智能体）
 //! - **结果返回**：`execute_batch` / `dispatch_batch` 返回 `ExecutedTool`，调用方异步回写
 
+use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use futures::future::join_all;
+use futures::stream::FuturesUnordered;
 use futures::FutureExt;
+use futures::StreamExt;
 use referee_core::Kernel;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Semaphore;
 use tracing::{debug, instrument, warn};
@@ -46,13 +50,39 @@ impl Default for ExecutorConfig {
     }
 }
 
+/// 工具执行结果分类 — 数据出口，供程序化消费（observer 回调 / 上层策略）
+///
+/// 穷尽 executor 全部收敛分支：
+/// - 工具正常返回（含主动 `Err(ToolError)`，错误文本保留在 `result`）→ `Ok`
+/// - 参数解析失败不短路：降级为 Null 参数继续执行，结局由实际执行结果承载
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolOutcome {
+    /// 正常完成（含工具主动报错的可观测完成，非崩溃）
+    Ok,
+    /// 单工具执行超时
+    Timeout,
+    /// 工具或执行段 panic（含 pre-execute panic / 后台任务 join 失败）
+    Panic,
+    /// 工具未注册
+    NotFound,
+    /// 并发许可获取失败
+    PermitUnavailable,
+    /// 等待类批次总 deadline 收敛（区别于单工具超时）
+    BatchDeadline,
+}
+
 /// 工具执行结果（回写给会话的消息载荷）
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutedTool {
     pub tool_call_id: String,
     /// 工具名（异步派发完成时用于生成注入文本）
     pub tool_name: String,
     pub result: String,
+    /// 执行结果分类（结构化数据出口，替代字符串折叠）
+    pub outcome: ToolOutcome,
+    /// 执行耗时（毫秒，含许可等待）
+    pub duration_ms: u64,
 }
 
 /// 工具执行器 — 无状态，可跨 Session 共享
@@ -150,7 +180,10 @@ impl ToolExecutor {
 
     /// 批量执行工具调用，返回所有结果（仅等待类；调用方应先 `truncate`）
     ///
-    /// - 全部并行执行，`join_all` 等到最后一个（每个独立 `catch_unwind` + `timeout`）
+    /// - 全部并行执行，逐项收敛（每个独立 `catch_unwind` + 单工具 `timeout`）
+    /// - `batch_deadline`：批次总 deadline（引擎侧传 `awaiting_calls_timeout`）。
+    ///   到达时已完成项保留真实结果，未完成项以超时收敛消息合成结果
+    ///   （在飞 future 就地取消），每项输入恰对应一项输出，调用方无部分失败感知
     /// - `max_concurrency`：可选并发上限；`Some(1)` 强制串行（厂商不支持并行工具时降级），
     ///   `None` 沿用执行器默认 `max_concurrency`
     pub async fn execute_batch(
@@ -161,6 +194,7 @@ impl ToolExecutor {
         turn_id: u64,
         peer_depth: u32,
         max_concurrency: Option<usize>,
+        batch_deadline: Duration,
     ) -> Vec<ExecutedTool> {
         if tool_calls.is_empty() {
             return Vec::new();
@@ -170,10 +204,18 @@ impl ToolExecutor {
             .map(|n| Arc::new(Semaphore::new(n)))
             .unwrap_or_else(|| self.semaphore.clone());
 
-        // 并行执行
         let kernel = self.kernel.clone();
         let store = self.store.clone();
-        let futures: Vec<_> = tool_calls
+        let deadline = tokio::time::Instant::now() + batch_deadline;
+        let batch_started = Instant::now();
+
+        // 未完成项登记（id → 工具名；deadline 到达时合成超时收敛结果）
+        let mut outstanding: HashMap<String, String> = tool_calls
+            .iter()
+            .map(|tc| (tc.id.clone(), tc.function.name.clone()))
+            .collect();
+
+        let mut futures: FuturesUnordered<_> = tool_calls
             .into_iter()
             .map(|tc| {
                 let sem = sem.clone();
@@ -190,7 +232,41 @@ impl ToolExecutor {
             })
             .collect();
 
-        join_all(futures).await
+        let mut results = Vec::with_capacity(outstanding.len());
+        loop {
+            if futures.is_empty() {
+                break;
+            }
+            tokio::select! {
+                biased;
+                r = futures.next() => {
+                    // 循环顶已拦截空集，此处必为 Some
+                    let r = r.expect("non-empty FuturesUnordered yields Some");
+                    outstanding.remove(&r.tool_call_id);
+                    results.push(r);
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    // 总 deadline：未完成项合成超时收敛消息，在飞 future 就地取消
+                    let unfinished = outstanding.len();
+                    warn!(
+                        remaining = unfinished,
+                        deadline_ms = batch_deadline.as_millis() as u64,
+                        "waiting-tool batch deadline exceeded"
+                    );
+                    for (tool_call_id, tool_name) in outstanding.drain() {
+                        results.push(ExecutedTool {
+                            tool_call_id,
+                            tool_name,
+                            result: BATCH_DEADLINE_MESSAGE.to_string(),
+                            outcome: ToolOutcome::BatchDeadline,
+                            duration_ms: batch_started.elapsed().as_millis() as u64,
+                        });
+                    }
+                    break;
+                }
+            }
+        }
+        results
     }
 
     /// 派发一批工具调用（仅派发类）— 后台执行，立即返回句柄，不阻塞调用方
@@ -226,6 +302,10 @@ impl ToolExecutor {
     }
 }
 
+/// 等待类批次总 deadline 到达时，未完成项的收敛消息（回写会话，下一轮对模型可见）
+const BATCH_DEADLINE_MESSAGE: &str =
+    "Timed out: waiting-tool batch deadline exceeded. Re-issue this tool call in the next turn.";
+
 /// 单个工具调用的保护执行：外层 `catch_unwind` 兜底 pre-execute 段
 /// （参数解析 / 注册查找 / 并发槽位获取）的 panic。
 ///
@@ -246,6 +326,7 @@ async fn guarded_execute(
 ) -> ExecutedTool {
     let tool_call_id = tc.id.clone();
     let tool_name = tc.function.name.clone();
+    let started = Instant::now();
     AssertUnwindSafe(async {
         execute_single(
             registry, tc, session_id, turn_id, peer_depth, timeout, sem, kernel, store,
@@ -258,6 +339,8 @@ async fn guarded_execute(
         tool_call_id,
         tool_name,
         result: format!("{}", ToolError::Panic("<pre-execute panic>".into())),
+        outcome: ToolOutcome::Panic,
+        duration_ms: started.elapsed().as_millis() as u64,
     })
 }
 
@@ -302,8 +385,9 @@ async fn execute_single(
 ) -> ExecutedTool {
     let tool_call_id = tc.id.clone();
     let tool_name = tc.function.name.clone();
+    let started = Instant::now();
 
-    // 解析参数 + 剥离保留参数 wait
+    // 解析参数 + 剥离保留参数 wait（解析失败降级 Null 继续，结局由执行结果承载）
     let mut args: Value = serde_json::from_str(&tc.function.arguments).unwrap_or_else(|e| {
         warn!(error = %e, tool = %tool_name, "failed to parse tool arguments");
         Value::Null
@@ -318,6 +402,8 @@ async fn execute_single(
                 tool_call_id,
                 tool_name: tool_name.clone(),
                 result: format!("Tool '{}' not found", tool_name),
+                outcome: ToolOutcome::NotFound,
+                duration_ms: started.elapsed().as_millis() as u64,
             };
         }
     };
@@ -334,6 +420,8 @@ async fn execute_single(
                     tool_call_id,
                     tool_name,
                     result: "Failed to acquire concurrency permit".to_string(),
+                    outcome: ToolOutcome::PermitUnavailable,
+                    duration_ms: started.elapsed().as_millis() as u64,
                 };
             }
         }
@@ -357,20 +445,22 @@ async fn execute_single(
             .catch_unwind()
             .await;
 
-    let content = match result {
-        Ok(Ok(Ok(output))) => output.content,
+    // 结果收敛：错误文本保留在 result，分类写入 outcome（穷尽、无通配）
+    let (content, outcome) = match result {
+        Ok(Ok(Ok(output))) => (output.content, ToolOutcome::Ok),
         Ok(Ok(Err(e))) => {
             warn!(error = %e, tool = %tool_name, "tool execution failed");
-            format!("{}", e)
+            // 工具主动报错：正常可观测完成，归 Ok（区别于 Timeout/Panic 崩溃类）
+            (format!("{e}"), ToolOutcome::Ok)
         }
         Ok(Err(_)) => {
             warn!(tool = %tool_name, "tool execution timed out");
-            format!("{}", ToolError::Timeout)
+            (format!("{}", ToolError::Timeout), ToolOutcome::Timeout)
         }
         Err(panic_payload) => {
             let msg = panic_message(panic_payload);
             warn!(tool = %tool_name, panic = %msg, "tool execution panicked");
-            format!("{}", ToolError::Panic(msg))
+            (format!("{}", ToolError::Panic(msg)), ToolOutcome::Panic)
         }
     };
 
@@ -380,6 +470,8 @@ async fn execute_single(
         tool_call_id,
         tool_name,
         result: content,
+        outcome,
+        duration_ms: started.elapsed().as_millis() as u64,
     }
 }
 
@@ -503,7 +595,7 @@ mod tests {
         let exec = ToolExecutor::with_defaults();
         let calls = vec![make_call("a", "{}"), make_call("b", "{}")];
         let results = exec
-            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0, 0, None)
+            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0, 0, None, Duration::from_secs(30))
             .await;
 
         assert_eq!(results.len(), 2);
@@ -541,7 +633,7 @@ mod tests {
         let exec = ToolExecutor::with_defaults();
         let calls = vec![make_call("panic", "{}"), make_call("ok", "{}")];
         let results = exec
-            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0, 0, None)
+            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0, 0, None, Duration::from_secs(30))
             .await;
 
         assert_eq!(results.len(), 2);
@@ -568,11 +660,65 @@ mod tests {
         });
         let calls = vec![make_call("slow", "{}")];
         let results = exec
-            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0, 0, None)
+            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0, 0, None, Duration::from_secs(30))
             .await;
 
         assert_eq!(results.len(), 1);
         assert!(results[0].result.contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn batch_deadline_converges_partial_results() {
+        // 快工具（20ms）+ 慢工具（10s，远超批次 deadline 且不触发单工具 timeout）：
+        // batch_deadline=100ms 到达时快工具保留真实结果、慢工具超时收敛
+        let reg = make_registry(vec![
+            Arc::new(SlowTool {
+                name: "fast".into(),
+                delay_ms: 20,
+                result: "fast_result".into(),
+            }),
+            Arc::new(SlowTool {
+                name: "very_slow".into(),
+                delay_ms: 10_000,
+                result: "never".into(),
+            }),
+        ]);
+        let exec = ToolExecutor::new(ExecutorConfig {
+            max_per_turn: 10,
+            tool_timeout: Duration::from_secs(30),
+            max_concurrency: 5,
+        });
+        let calls = vec![make_call("fast", "{}"), make_call("very_slow", "{}")];
+        let start = std::time::Instant::now();
+        let results = exec
+            .execute_batch(
+                calls,
+                &reg,
+                uuid::Uuid::new_v4(),
+                0,
+                0,
+                None,
+                Duration::from_millis(100),
+            )
+            .await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(results.len(), 2, "each input yields exactly one result");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "batch must converge at deadline, took {elapsed:?}"
+        );
+        let fast = results.iter().find(|r| r.tool_call_id == "tc_fast").unwrap();
+        assert_eq!(fast.result, "fast_result");
+        let slow = results
+            .iter()
+            .find(|r| r.tool_call_id == "tc_very_slow")
+            .unwrap();
+        assert!(
+            slow.result.contains("batch deadline"),
+            "unfinished item must carry deadline message: {}",
+            slow.result
+        );
     }
 
     #[tokio::test]
@@ -581,7 +727,7 @@ mod tests {
         let exec = ToolExecutor::with_defaults();
         let calls = vec![make_call("nonexistent", "{}")];
         let results = exec
-            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0, 0, None)
+            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0, 0, None, Duration::from_secs(30))
             .await;
 
         assert_eq!(results.len(), 1);
@@ -609,7 +755,7 @@ mod tests {
         let calls = vec![make_call("local_a", "{}"), make_call("local_b", "{}")];
         let start = std::time::Instant::now();
         let results = exec
-            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0, 0, None)
+            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0, 0, None, Duration::from_secs(30))
             .await;
         let elapsed = start.elapsed();
 
@@ -645,7 +791,7 @@ mod tests {
         let calls = vec![make_call("r_a", "{}"), make_call("r_b", "{}")];
         let start = std::time::Instant::now();
         let results = exec
-            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0, 0, None)
+            .execute_batch(calls, &reg, uuid::Uuid::new_v4(), 0, 0, None, Duration::from_secs(30))
             .await;
         let elapsed = start.elapsed();
 
@@ -751,6 +897,7 @@ mod tests {
                 0,
                 0,
                 None,
+                Duration::from_secs(30),
             )
             .await;
         assert_eq!(results.len(), 1);

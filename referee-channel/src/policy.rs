@@ -27,7 +27,9 @@ pub fn disposition(reply: &Result<Envelope, KernelError>) -> TurnDisposition {
                 _ => TurnDisposition::Skip,
             },
             Ok(SessionReply::Busy { .. }) => TurnDisposition::Busy,
-            Ok(SessionReply::Error { message }) => TurnDisposition::Notify(format!("任务失败：{message}")),
+            Ok(SessionReply::Error { message, .. }) => {
+                TurnDisposition::Notify(format!("任务失败：{message}"))
+            }
             Ok(SessionReply::Cancelled) => TurnDisposition::Skip,
             Ok(SessionReply::Unhandled { reason }) => {
                 TurnDisposition::Notify(format!("任务未被处理：{reason}"))
