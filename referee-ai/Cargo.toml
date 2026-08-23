@@ -9,12 +9,13 @@ license = "MIT"
 path = "src/lib.rs"
 
 [features]
-default = ["xiaomi", "deepseek", "agnes", "kimi"]
+default = ["xiaomi", "deepseek", "agnes", "kimi", "openai", "openrouter"]
 agnes    = []
 kimi     = []
 xiaomi   = []
 deepseek = []
 openai   = []
+openrouter = []
 anthropic = []
 responses = []
 # 会话事实落盘 sink（可插拔，零新增依赖；默认关，不改变既有行为）

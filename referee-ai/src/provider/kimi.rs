@@ -129,6 +129,7 @@ impl KimiProvider {
             api_key: cfg.api_key,
             timeout: cfg.timeout,
             retry: cfg.retry,
+            extra_headers: Vec::new(),
         })?;
         Ok(Self {
             client,
