@@ -29,6 +29,10 @@ pub mod agnes;
 pub mod deepseek;
 #[cfg(feature = "kimi")]
 pub mod kimi;
+#[cfg(feature = "openai")]
+pub mod openai;
+#[cfg(feature = "openrouter")]
+pub mod openrouter;
 #[cfg(feature = "xiaomi")]
 pub mod xiaomi;
 

@@ -169,6 +169,7 @@ impl XiaomiProvider {
             api_key: cfg.api_key,
             timeout: cfg.timeout,
             retry: cfg.retry,
+            extra_headers: Vec::new(),
         })?;
         // 订阅计划身份：有 plan 时 ProviderId = "{plan}/{model}"（动态），否则默认静态标识
         let provider_id = match &cfg.plan {

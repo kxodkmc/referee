@@ -37,6 +37,8 @@ pub(crate) struct OpenAiCompatConfig {
     pub api_key: String,
     pub timeout: Duration,
     pub retry: RetryPolicy,
+    /// 附加请求头（如 OpenRouter 的 `HTTP-Referer` / `X-OpenRouter-Title`），默认空
+    pub extra_headers: Vec<(String, String)>,
 }
 
 /// OpenAI 兼容协议客户端（共享底座）
@@ -48,6 +50,7 @@ pub(crate) struct OpenAiCompatClient {
     base_url: String,
     api_key: String,
     retry: RetryPolicy,
+    extra_headers: Vec<(String, String)>,
 }
 
 impl OpenAiCompatClient {
@@ -62,11 +65,29 @@ impl OpenAiCompatClient {
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
             api_key: cfg.api_key,
             retry: cfg.retry,
+            extra_headers: cfg.extra_headers,
         })
     }
 
     fn endpoint(&self) -> String {
         format!("{}/chat/completions", self.base_url)
+    }
+
+    /// 构造附加请求头（非法键/值静默忽略，不阻断请求）
+    pub(crate) fn header_map(&self) -> reqwest::header::HeaderMap {
+        use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+        let mut map = HeaderMap::with_capacity(self.extra_headers.len());
+        for (k, v) in &self.extra_headers {
+            match (HeaderName::try_from(k), HeaderValue::try_from(v)) {
+                (Ok(name), Ok(value)) => {
+                    map.insert(name, value);
+                }
+                _ => {
+                    tracing::warn!(key = %k, "skip invalid extra header");
+                }
+            }
+        }
+        map
     }
 
     /// 非流式调用 — 重试仅对可恢复错误生效
@@ -96,6 +117,7 @@ impl OpenAiCompatClient {
             .http
             .post(self.endpoint())
             .bearer_auth(&self.api_key)
+            .headers(self.header_map())
             .json(body)
             .send()
             .await
@@ -143,6 +165,7 @@ impl OpenAiCompatClient {
             .http
             .post(self.endpoint())
             .bearer_auth(&self.api_key)
+            .headers(self.header_map())
             .json(body)
             .send()
             .await
