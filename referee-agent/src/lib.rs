@@ -168,6 +168,14 @@ impl AgentRuntime {
         self.engine.cache_len()
     }
 
+    /// 注册任意自定义工具（如通道层的 `im_send_text`）
+    ///
+    /// 需引擎已 `with_tools`。构造顺序要求工具依赖 router 状态（如会话映射）时，
+    /// 可在 Runtime 构造后、流量进入前调用。
+    pub fn register_tool(&self, tool: Arc<dyn referee_ai::tool::Tool>) -> Result<(), referee_ai::tool::RegistryError> {
+        self.engine.register_tool(tool)
+    }
+
     /// 注册对等 Agent（另一 Runtime 上的 Session）为 Local 工具
     ///
     /// 需引擎已 `with_tools`。注册后本 Runtime 的任意会话即可通过该工具名

@@ -1,0 +1,33 @@
+[package]
+name = "referee-channel-wechat"
+version = "0.1.0"
+edition = "2021"
+description = "微信 iLink 通道适配器：协议编解码、扫码登录、长轮询收发与限速。协议事实见 docs/wechat-clawbot-integration.md。"
+license = "MIT"
+
+[features]
+default = []
+# 终端 ASCII 二维码渲染（扫码登录 UX）；默认关闭，零新增依赖
+qr = ["qrcode"]
+
+[dependencies]
+referee-channel = { path = "../referee-channel" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4"] }
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rand = "0.8"
+base64 = "0.22"
+parking_lot = "0.12"
+tracing = "0.1"
+qrcode = { version = "0.14", optional = true }
+
+[dev-dependencies]
+referee-core = { path = "../referee-core" }
+referee-ai = { path = "../referee-ai" }
+referee-agent = { path = "../referee-agent" }
+tokio = { version = "1", features = ["full", "test-util"] }
+tracing-subscriber = "0.3"

@@ -30,6 +30,11 @@
   ACL 工件存储、成果板读取工具；MCP 2.0 stdio 客户端桥 / Agent Skills（SKILL.md）注入以
   按需 feature `mcp-stdio` / `skills` 提供（默认不加载、零新增依赖）；记忆等业务策略不预置
   （由使用方二次封装）。
+- **referee-channel（IM 通道基座）**：✅ Phase 1 代码完成——阶段 0–5（骨架 + 微信协议层、
+  统一消息模型、ChannelHost、微信适配器、ImRouter 批次/调度/交付契约、im_send_text 工具），
+  A0–A4 自动化验收全绿，A5 真机项待验（乎架 `examples/agent.rs`）。各 crate 有自己的
+  AGENTS.md。设计与验收见 `docs/channel-execution.md`，微信协议事实见
+  `docs/wechat-clawbot-integration.md`。
 
 ## 工作约束
 
@@ -37,5 +42,7 @@
 - 改动后运行对应测试（core：`tests/backpressure_test.rs`、`tests/isolation_test.rs`；base/agent：对应模块测试）与 `cargo check`。
 - 依赖仅使用规范清单内的库，不擅自引入新依赖：
   - `referee-core`：tokio、dashmap、parking_lot、serde、bytes、thiserror、async-trait、uuid、futures、tracing、metrics、tracing-subscriber[dev]
-  - `referee-ai` / `referee-agent`：上列 + `serde_json`、`reqwest`（referee-ai 专用）
+  - `referee-ai` / `referee-agent`：上列 + `serde_json`、`reqwest`（referee-ai）
+  - `referee-channel`：referee-core 清单 + `serde_json`
+  - `referee-channel-wechat`：`referee-channel` 清单 + `reqwest`、`rand`、`base64`、`qrcode`[仅 feature `qr`，默认关闭]
 - 提交前自查：是否引入无界分配？是否破坏 Panic 隔离？是否违反数据/行为分离？

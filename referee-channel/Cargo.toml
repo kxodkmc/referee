@@ -1,0 +1,23 @@
+[package]
+name = "referee-channel"
+version = "0.1.0"
+edition = "2021"
+description = "IM 通道接入基座：统一消息模型、适配器契约、ChannelHost / ImRouter 扩展与任务调度，通道差异锁进适配器。"
+license = "MIT"
+
+[dependencies]
+referee-core = { path = "../referee-core" }
+referee-ai = { path = "../referee-ai" }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tracing = "0.1"
+dashmap = "6"
+parking_lot = "0.12"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
