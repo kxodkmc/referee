@@ -18,13 +18,13 @@
 use std::time::Duration;
 
 use futures::stream::{self, BoxStream, StreamExt};
-use futures::Stream;
 use serde_json::{json, Value};
 use tracing::debug;
 
+use crate::provider::sse::parse_sse_stream;
 use crate::provider::{
-    ChatResponse, ContentPart, FinishReason, LlmError, MediaResolution, MediaSource, Message,
-    MessageContent, RetryPolicy, Role, StreamChunk, TokenUsage, ToolCall, ToolCallDelta,
+    ChatResponse, ContentPart, FinishReason, ImageDetail, LlmError, MediaResolution, MediaSource,
+    Message, MessageContent, RetryPolicy, Role, StreamChunk, TokenUsage, ToolCall, ToolCallDelta,
     ToolCallFunction, ToolCallFunctionDelta,
 };
 
@@ -284,10 +284,21 @@ fn message_to_body_json(m: &Message) -> Value {
 fn content_part_to_json(part: &ContentPart) -> Value {
     match part {
         ContentPart::Text { text } => json!({ "type": "text", "text": text }),
-        ContentPart::Image { source } => json!({
-            "type": "image_url",
-            "image_url": { "url": media_source_to_wire(source) }
-        }),
+        ContentPart::Image { source, detail } => {
+            let mut v = json!({
+                "type": "image_url",
+                "image_url": { "url": media_source_to_wire(source) }
+            });
+            if let Some(d) = detail {
+                v["image_url"]["detail"] = json!(match d {
+                    ImageDetail::Low => "low",
+                    ImageDetail::High => "high",
+                    ImageDetail::Original => "original",
+                    ImageDetail::Auto => "auto",
+                });
+            }
+            v
+        }
         ContentPart::Audio { source } => json!({
             "type": "input_audio",
             "input_audio": { "data": media_source_to_wire(source) }
@@ -521,114 +532,6 @@ fn parse_usage(u: &Value) -> TokenUsage {
         // 归一化视角：hit→read，miss→write（厂商无关）
         cache_read_tokens: prompt_cache_hit,
         cache_write_tokens: prompt_cache_miss,
-    }
-}
-
-// ───────────────────────────────────────────────
-// SSE 流解析
-// ───────────────────────────────────────────────
-
-/// 从字节流解析 SSE 事件，输出每个 `data:` 行的 JSON Value
-///
-/// 实现：`unfold` 状态机，缓冲字节直到出现 `\n\n` 事件分隔符；
-/// 提取 `data:` 字段；`[DONE]` 终止流。`BoxStream` 自身 `Unpin`，
-/// 可在 async 闭包中直接 `.next().await`。
-fn parse_sse_stream(
-    byte_stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
-) -> BoxStream<'static, Result<Value, LlmError>> {
-    let state = SseState {
-        buffer: Vec::new(),
-        inner: Box::pin(byte_stream),
-    };
-    Box::pin(stream::unfold(state, |mut state| async move {
-        loop {
-            // 1. 尝试从缓冲提取完整事件
-            if let Some((event_bytes, rest)) = take_sse_event(&state.buffer) {
-                state.buffer = rest;
-                if let Some(data) = parse_data_field(&event_bytes) {
-                    if data.trim() == "[DONE]" {
-                        return None;
-                    }
-                    match serde_json::from_str::<Value>(&data) {
-                        Ok(v) => return Some((Ok(v), state)),
-                        Err(e) => {
-                            return Some((
-                                Err(LlmError::Protocol(format!("SSE JSON parse: {e}"))),
-                                state,
-                            ))
-                        }
-                    }
-                }
-                // 非 data 事件（event:/id:/comment）— 跳过
-                continue;
-            }
-            // 2. 拉取更多字节
-            match state.inner.next().await {
-                Some(Ok(bytes)) => state.buffer.extend_from_slice(&bytes),
-                Some(Err(e)) => return Some((Err(map_reqwest_err(e)), state)),
-                None => {
-                    // 流结束：刷新残余缓冲（部分厂商不发 [DONE]）
-                    if !state.buffer.is_empty() {
-                        if let Some(data) = parse_data_field(&state.buffer) {
-                            state.buffer.clear();
-                            if data.trim() == "[DONE]" {
-                                return None;
-                            }
-                            match serde_json::from_str::<Value>(&data) {
-                                Ok(v) => return Some((Ok(v), state)),
-                                Err(e) => {
-                                    return Some((
-                                        Err(LlmError::Protocol(format!("SSE JSON parse: {e}"))),
-                                        state,
-                                    ))
-                                }
-                            }
-                        }
-                    }
-                    return None;
-                }
-            }
-        }
-    }))
-}
-
-struct SseState {
-    buffer: Vec<u8>,
-    inner: BoxStream<'static, Result<bytes::Bytes, reqwest::Error>>,
-}
-
-/// 从缓冲头部提取一个完整 SSE 事件（以 `\n\n` 分隔），返回 (事件字节, 剩余缓冲)
-fn take_sse_event(buf: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
-    // 查找 `\n\n` 分隔符
-    for i in 0..buf.len().saturating_sub(1) {
-        if buf[i] == b'\n' && buf[i + 1] == b'\n' {
-            let mut event_end = i;
-            // 兼容 `\r\n\r\n`：剔除尾部 `\r`
-            if event_end > 0 && buf[event_end - 1] == b'\r' {
-                event_end -= 1;
-            }
-            let event = buf[..event_end].to_vec();
-            let rest = buf[i + 2..].to_vec();
-            return Some((event, rest));
-        }
-    }
-    None
-}
-
-/// 从 SSE 事件字节中提取 `data:` 字段（多行 data 用 `\n` 拼接）
-fn parse_data_field(event: &[u8]) -> Option<String> {
-    let s = std::str::from_utf8(event).ok()?;
-    let mut parts: Vec<String> = Vec::new();
-    for line in s.lines() {
-        let line = line.trim_end_matches('\r');
-        if let Some(rest) = line.strip_prefix("data:") {
-            parts.push(rest.trim_start().to_string());
-        }
-    }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join("\n"))
     }
 }
 
@@ -933,6 +836,40 @@ mod tests {
             parts[4],
             json!({"type":"video_url","video_url":{"url":"https://example.mp4"},
                    "fps":2.0,"media_resolution":"max"})
+        );
+    }
+
+    #[test]
+    fn image_detail_serialized_into_image_url() {
+        use crate::provider::ImageDetail;
+        let mm_msg = crate::provider::Message::user(MessageContent::multimodal(vec![
+            ContentPart::image_with_detail(
+                MediaSource::Url {
+                    url: "https://example.png".into(),
+                },
+                ImageDetail::Low,
+            ),
+            ContentPart::image(MediaSource::Url {
+                url: "https://example2.png".into(),
+            }),
+        ]));
+        let body = build_common_body(
+            &[mm_msg],
+            &[],
+            crate::provider::ToolChoice::Auto,
+            None,
+            None,
+            "m",
+        );
+        let parts = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(
+            parts[0],
+            json!({"type":"image_url","image_url":{"url":"https://example.png","detail":"low"}})
+        );
+        // 未指定 detail → 不输出该字段
+        assert_eq!(
+            parts[1],
+            json!({"type":"image_url","image_url":{"url":"https://example2.png"}})
         );
     }
 

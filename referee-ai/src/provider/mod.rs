@@ -16,19 +16,25 @@
 //! ## 可拓展性
 //! - 新增 OpenAI 兼容厂商 = 新增 `provider/<vendor>.rs` 配置 [`crate::provider::openai_compat::OpenAiCompatClient`]
 //! - 新增非兼容厂商（Anthropic / Responses）= 新增独立 HTTP/JSON 映射实现
+//!   （Anthropic Messages 协议底座见 [`crate::provider::anthropic_compat`] 与 `sse` 抽取）
 //! - 多模态：[`MessageContent`] 的 `Multimodal(Vec<ContentPart>)` 变体承载图片/
 //!   音频/视频，既有调用方经 [`MessageContent::as_text`] 优雅降级（返回 None）
 
 pub mod content;
 pub mod openai_compat;
 pub mod registry;
+pub(crate) mod sse;
 
 #[cfg(feature = "agnes")]
 pub mod agnes;
+#[cfg(feature = "anthropic")]
+pub(crate) mod anthropic_compat;
 #[cfg(feature = "deepseek")]
 pub mod deepseek;
 #[cfg(feature = "kimi")]
 pub mod kimi;
+#[cfg(feature = "minimax")]
+pub mod minimax;
 #[cfg(feature = "openai")]
 pub mod openai;
 #[cfg(feature = "openrouter")]
@@ -36,7 +42,7 @@ pub mod openrouter;
 #[cfg(feature = "xiaomi")]
 pub mod xiaomi;
 
-pub use content::{ContentPart, MediaResolution, MediaSource, VideoParams};
+pub use content::{ContentPart, ImageDetail, MediaResolution, MediaSource, VideoParams};
 pub use registry::{ProviderRegistry, ProviderRegistryError, ProviderStatus};
 
 use std::borrow::Cow;
