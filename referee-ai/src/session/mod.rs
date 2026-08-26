@@ -170,7 +170,10 @@ impl Default for SessionConfig {
             timeout: TimeoutConfig::default(),
             default_temperature: None,
             default_max_tokens: None,
-            prompt_budget_tokens: 8000,
+            // 整请求预算（可裁上下文的收紧上限，对齐主流模型 context_window）。
+            // 当前轮输入（核心载荷）恒保留、不受此裁剪，仅 engine 依据
+            // ModelSpec.context_window_tokens 做硬上限护栏（见 EngineStartError::PromptTooLarge）。
+            prompt_budget_tokens: 128 * 1024,
             default_system_prompt: None,
             idle_timeout: None,
             #[cfg(feature = "persist")]

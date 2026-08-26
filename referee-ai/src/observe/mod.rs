@@ -39,6 +39,19 @@ pub fn tool_completed(ok: bool) {
         .increment(1);
 }
 
+/// 统计一次提示词截断 / 丢弃（kind: system/tools/history/memory/artifacts）
+///
+/// 「降级必可观测」契约的一部分：任何上下文的静默裁剪都应可被监控聚合，
+/// 避免长输入被裁却无迹象。与各截断点处的 `tracing::warn!` 成对出现。
+pub fn prompt_truncated(kind: &'static str) {
+    metrics::counter!("referee_base_prompt_truncated_total", "kind" => kind).increment(1);
+}
+
+/// 统计一次工具调用因并发上限被截断丢弃
+pub fn tool_truncated() {
+    metrics::counter!("referee_base_tool_truncated_total").increment(1);
+}
+
 /// 统计一次引擎层 LLM 重试（可恢复错误触发）
 pub fn llm_retry() {
     metrics::counter!("referee_base_llm_retry_total").increment(1);

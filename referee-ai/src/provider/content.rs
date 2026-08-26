@@ -42,6 +42,24 @@ pub enum MediaResolution {
     Max,
 }
 
+/// 图片处理细节级别（OpenAI 标准 `image_url.detail`，DeepSeek / OpenAI 等支持）
+///
+/// 控制图片输入的处理方式：不追求精细视觉细节时可降档以更快、更省 token。
+/// 不支持的厂商会忽略该字段，或由上层依据能力声明决定是否透传。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageDetail {
+    /// 推理前缩放至 512×512：更快、更省 token
+    Low,
+    /// 保留原图（DeepSeek 语义等价于 original，为兼容提供）
+    High,
+    /// 保留原图
+    Original,
+    /// 自动选择（DeepSeek 当前等价于 original）
+    #[default]
+    Auto,
+}
+
 /// 视频理解参数（MiMo `fps` + `media_resolution`）
 ///
 /// 含浮点 `fps`，故仅实现 `PartialEq`（不实现 `Eq`）。
@@ -72,8 +90,12 @@ impl VideoParams {
 pub enum ContentPart {
     /// 文本片段
     Text { text: String },
-    /// 图片
-    Image { source: MediaSource },
+    /// 图片（可选 `detail` 控制处理细节级别，OpenAI 标准 `image_url.detail`）
+    Image {
+        source: MediaSource,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<ImageDetail>,
+    },
     /// 音频
     Audio { source: MediaSource },
     /// 视频（MiMo 支持 `fps` / `media_resolution` 精调）
@@ -90,9 +112,20 @@ impl ContentPart {
         Self::Text { text: s.into() }
     }
 
-    /// 图片片段（URL 或 base64）
+    /// 图片片段（URL 或 base64），处理细节级别取厂商默认
     pub fn image(src: MediaSource) -> Self {
-        Self::Image { source: src }
+        Self::Image {
+            source: src,
+            detail: None,
+        }
+    }
+
+    /// 图片片段（URL 或 base64），可指定处理细节级别（`low` 更省 token）
+    pub fn image_with_detail(src: MediaSource, detail: ImageDetail) -> Self {
+        Self::Image {
+            source: src,
+            detail: Some(detail),
+        }
     }
 
     /// 音频片段（URL 或 base64）
@@ -109,6 +142,7 @@ impl ContentPart {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn content_part_serde_roundtrip() {
@@ -117,6 +151,13 @@ mod tests {
             ContentPart::image(MediaSource::Url {
                 url: "https://example.png".into(),
             }),
+            ContentPart::image_with_detail(
+                MediaSource::Base64 {
+                    mime: "image/png".into(),
+                    data: "aGVsbG8=".into(),
+                },
+                ImageDetail::Low,
+            ),
             ContentPart::video(
                 MediaSource::Base64 {
                     mime: "video/mp4".into(),
@@ -129,8 +170,12 @@ mod tests {
             ),
         ];
         let json = serde_json::to_value(&parts).unwrap();
-        let back: Vec<ContentPart> = serde_json::from_value(json).unwrap();
+        let back: Vec<ContentPart> = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(back, parts);
+        // detail=Some 时序列化带出；detail=None 时省略
+        let arr = json.as_array().unwrap();
+        assert!(arr[1].get("detail").is_none());
+        assert_eq!(arr[2]["detail"], json!("low"));
     }
 
     #[test]

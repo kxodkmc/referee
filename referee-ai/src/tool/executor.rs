@@ -155,6 +155,14 @@ impl ToolExecutor {
             return (tool_calls, Vec::new());
         }
         let (head, tail) = tool_calls.split_at(self.config.max_per_turn);
+        // 并发上限截断即「工具调用被丢弃」，属可观察降级，不得静默
+        warn!(
+            max_per_turn = self.config.max_per_turn,
+            requested = tool_calls.len(),
+            dropped = tail.len(),
+            "excess tool calls truncated to max_per_turn"
+        );
+        crate::observe::tool_truncated();
         (head.to_vec(), tail.to_vec())
     }
 

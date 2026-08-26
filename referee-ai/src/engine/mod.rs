@@ -142,6 +142,8 @@ pub enum EngineStartError {
     Busy,
     #[error("budget limit reached: {0}")]
     Budget(#[from] BudgetError),
+    #[error("request input exceeds model context window (estimated {estimated}, window {window})")]
+    PromptTooLarge { estimated: u64, window: usize },
 }
 
 /// Chat 句柄 — 快速返回后获取结果 / 发起取消
@@ -429,6 +431,31 @@ impl Engine {
             if options.tools.is_empty() {
                 options.tools =
                     registry.declarations_for_depth(peer_depth, self.config.max_subagent_depth);
+            }
+        }
+        // context 硬护栏：核心载荷（system + 当前轮输入）须放得进模型窗口；
+        // 放不进就立即 fail-loud —— 绝不带着注定超窗的载荷去调用 provider。
+        // 注意核对口径：此处估算的是「恒定交付的核心载荷」，与组装层中被裁减的
+        // 可裁上下文无关（后者由 prompt_budget 收紧 + WARN/metrics 观察）。
+        let window = self.provider.model_spec().context_window_tokens;
+        {
+            let session = self.sessions.get(&session_id);
+            let system = options
+                .system_prompt
+                .clone()
+                .or_else(|| session.and_then(|s| s.config().default_system_prompt.clone()));
+            let estimated = system
+                .as_deref()
+                .map(crate::budget::TokenEstimator::estimate)
+                .unwrap_or(0)
+                + crate::budget::TokenEstimator::estimate(
+                    payload.message.content.as_text().unwrap_or(""),
+                );
+            if estimated >= window as u64 {
+                return Err(EngineStartError::PromptTooLarge {
+                    estimated,
+                    window,
+                });
             }
         }
         self.sessions
@@ -1005,7 +1032,10 @@ impl From<EngineStartError> for ErrorKind {
     fn from(e: EngineStartError) -> Self {
         match e {
             EngineStartError::Budget(_) => ErrorKind::Budget,
-            EngineStartError::MaxSessions | EngineStartError::Busy => ErrorKind::Internal,
+            // MaxSessions / Busy / PromptTooLarge 均属输入侧或并发治理的启动拒绝
+            EngineStartError::MaxSessions
+            | EngineStartError::Busy
+            | EngineStartError::PromptTooLarge { .. } => ErrorKind::Internal,
         }
     }
 }

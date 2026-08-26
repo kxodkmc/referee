@@ -1,12 +1,14 @@
 //! DeepSeek 适配器（OpenAI 兼容协议）
 //!
 //! - BASE_URL: `https://api.deepseek.com`
-//! - 模型：`deepseek-v4-flash` / `deepseek-v4-pro`
+//! - 模型：`deepseek-v4-flash` / `deepseek-v4-pro` / `deepseek-v4-flash-vision-exp`
 //! - 思考开关：`extra_body.thinking.type = enabled | disabled`（默认开启）
 //! - 思考强度：`reasoning_effort = low | high | max`（默认 high）
 //! - 推理输出：`message.reasoning_content` / `delta.reasoning_content`
 //! - usage 扩展：`prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`（硬盘缓存）
 //! - 多轮工具调用：assistant 消息必须完整回传 `reasoning_content`
+//! - 多模态：`deepseek-v4-flash-vision-exp`（实验性）额外支持图片输入，
+//!   `image_url` URL / base64 直传，可选 `detail`（low/high/original/auto）控制处理级别
 //!
 //! 错误码扩展（已纳入 [`crate::provider::LlmError`] 归一，与 MiMo 共享底座）：
 //! - 402 余额不足 → `InsufficientBalance`
@@ -35,6 +37,9 @@ pub mod ids {
     pub const DEEPSEEK_V4_FLASH: ProviderId = ProviderId::new("deepseek/deepseek-v4-flash");
     /// `deepseek-v4-pro`：高能力模型
     pub const DEEPSEEK_V4_PRO: ProviderId = ProviderId::new("deepseek/deepseek-v4-pro");
+    /// `deepseek-v4-flash-vision-exp`：实验性视觉模型（额外支持图片输入）
+    pub const DEEPSEEK_V4_FLASH_VISION_EXP: ProviderId =
+        ProviderId::new("deepseek/deepseek-v4-flash-vision-exp");
 }
 
 /// DeepSeek 默认 BASE_URL
@@ -53,6 +58,8 @@ pub enum DeepSeekModel {
     V4Flash,
     /// `deepseek-v4-pro`：高能力
     V4Pro,
+    /// `deepseek-v4-flash-vision-exp`：实验性视觉模型（flash 能力 + 图片输入）
+    V4FlashVisionExp,
 }
 
 impl DeepSeekModel {
@@ -60,6 +67,7 @@ impl DeepSeekModel {
         match self {
             Self::V4Flash => "deepseek-v4-flash",
             Self::V4Pro => "deepseek-v4-pro",
+            Self::V4FlashVisionExp => "deepseek-v4-flash-vision-exp",
         }
     }
 
@@ -67,13 +75,14 @@ impl DeepSeekModel {
         match self {
             Self::V4Flash => ids::DEEPSEEK_V4_FLASH,
             Self::V4Pro => ids::DEEPSEEK_V4_PRO,
+            Self::V4FlashVisionExp => ids::DEEPSEEK_V4_FLASH_VISION_EXP,
         }
     }
 
-    /// 模型规模规格（上下文窗口 1M / 最大输出 384K；两模型当前一致）
+    /// 模型规模规格（上下文窗口 1M / 最大输出 384K；三模型当前一致）
     pub fn spec(&self) -> ModelSpec {
         match self {
-            Self::V4Flash | Self::V4Pro => ModelSpec {
+            Self::V4Flash | Self::V4Pro | Self::V4FlashVisionExp => ModelSpec {
                 context_window_tokens: CONTEXT_WINDOW_TOKENS,
                 max_output_tokens: MAX_OUTPUT_TOKENS,
             },
@@ -143,7 +152,21 @@ impl DeepSeekProvider {
                 system_role: true,
                 streaming: true,
                 usage_reported: true,
-                multimodal: crate::provider::MultimodalCapabilities::NONE,
+                multimodal: match model {
+                    // 视觉实验模型：额外支持图片输入（URL / base64，可选 detail）
+                    DeepSeekModel::V4FlashVisionExp => {
+                        crate::provider::MultimodalCapabilities {
+                            image: true,
+                            audio: false,
+                            video: false,
+                            file_upload: false,
+                        }
+                    }
+                    // 纯文本模型：无多模态
+                    DeepSeekModel::V4Flash | DeepSeekModel::V4Pro => {
+                        crate::provider::MultimodalCapabilities::NONE
+                    }
+                },
             },
         })
     }
@@ -203,5 +226,73 @@ impl LLMProvider for DeepSeekProvider {
     ) -> Result<BoxStream<'static, Result<StreamChunk, LlmError>>, LlmError> {
         let body = self.build_body(&req);
         self.client.chat_stream(body).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::{ContentPart, MediaSource, MessageContent, ThinkingConfig};
+
+    /// 视觉实验模型：模型字段 / ProviderId / image 能力声明 / 多模态请求序列化。
+    #[test]
+    fn vision_model_maps_identity_and_capabilities() {
+        let provider = DeepSeekProvider::new(
+            DeepSeekModel::V4FlashVisionExp,
+            DeepSeekConfig::new("test-key"),
+        )
+        .expect("create provider");
+
+        assert_eq!(provider.model.as_str(), "deepseek-v4-flash-vision-exp");
+        assert_eq!(
+            provider.id(),
+            ids::DEEPSEEK_V4_FLASH_VISION_EXP
+        );
+        assert!(provider.capabilities().multimodal.image);
+        assert!(!provider.capabilities().multimodal.audio);
+
+        // 多模态图片请求 body：image_url + 可选 detail 透传
+        let mut req = ChatRequest::simple(MessageContent::multimodal(vec![
+            ContentPart::text("这张图片里有什么？"),
+            ContentPart::image_with_detail(
+                MediaSource::Base64 {
+                    mime: "image/jpeg".into(),
+                    data: "aGVsbG8=".into(),
+                },
+                crate::provider::ImageDetail::High,
+            ),
+        ]));
+        req.thinking = ThinkingConfig {
+            enabled: true,
+            effort: Some(ReasoningEffort::High),
+        };
+
+        let body = provider.build_body(&req);
+
+        assert_eq!(body["model"], json!("deepseek-v4-flash-vision-exp"));
+        assert_eq!(body["reasoning_effort"], json!("high"));
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0], json!({"type": "text", "text": "这张图片里有什么？"}));
+        assert_eq!(
+            content[1],
+            json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": "data:image/jpeg;base64,aGVsbG8=",
+                    "detail": "high"
+                }
+            })
+        );
+    }
+
+    /// 纯文本模型：不声明图片能力，且不因多模态内容误声明。
+    #[test]
+    fn text_models_have_no_image_capability() {
+        for model in [DeepSeekModel::V4Flash, DeepSeekModel::V4Pro] {
+            let provider =
+                DeepSeekProvider::new(model, DeepSeekConfig::new("test-key")).expect("create");
+            assert!(!provider.capabilities().multimodal.image);
+            assert_eq!(provider.capabilities().multimodal, crate::provider::MultimodalCapabilities::NONE);
+        }
     }
 }
