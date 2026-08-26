@@ -21,7 +21,7 @@ use futures::stream::{self, BoxStream, StreamExt};
 use serde_json::{json, Value};
 use tracing::debug;
 
-use crate::provider::sse::parse_sse_stream;
+use crate::provider::sse::{parse_sse_stream, parse_wire_body, sse_fold_into_response, WireBody};
 use crate::provider::{
     ChatResponse, ContentPart, FinishReason, ImageDetail, LlmError, MediaResolution, MediaSource,
     Message, MessageContent, RetryPolicy, Role, StreamChunk, TokenUsage, ToolCall, ToolCallDelta,
@@ -126,11 +126,26 @@ impl OpenAiCompatClient {
         if !status.is_success() {
             return Err(map_http_error(resp).await);
         }
-        let json: Value = resp
-            .json()
+        // 单次读取完整响应体，随后按格式分流（JSON 直解 / SSE 事件收敛）
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        let bytes = resp
+            .bytes()
             .await
-            .map_err(|e| LlmError::Protocol(format!("response decode: {e}")))?;
-        parse_chat_response(&json)
+            .map_err(|e| LlmError::Protocol(format!("response read: {e}")))?;
+        match parse_wire_body(&bytes, content_type.as_deref())? {
+            WireBody::Json(json) => parse_chat_response(&json),
+            WireBody::Sse(events) => sse_fold_into_response(
+                events,
+                &parse_chunk_json,
+                &openai_capture_meta,
+                "",
+                "",
+            ),
+        }
     }
 
     /// 流式调用 — 仅对初始连接失败重试；已开始流出后不重试
@@ -628,6 +643,13 @@ type ChunkParts = (
     Option<TokenUsage>,
 );
 
+/// 从首个携带 `id`/`model` 的 SSE 事件收集中继标识（OpenAI chunk 常内嵌）
+fn openai_capture_meta(json: &Value) -> Option<(String, String)> {
+    let id = json.get("id")?.as_str()?.to_string();
+    let model = json.get("model")?.as_str()?.to_string();
+    Some((id, model))
+}
+
 /// 解析单个 JSON chunk：返回 (可选 Delta, 可选 finish_reason, 可选 usage)
 fn parse_chunk_json(json: &Value) -> Result<ChunkParts, LlmError> {
     let mut delta_chunk = None;
@@ -897,5 +919,41 @@ mod tests {
         );
         assert_eq!(resp.message.tool_calls.len(), 1);
         assert_eq!(resp.usage.map(|u| u.total_tokens), Some(3));
+    }
+
+    /// 非流式 SSE 回退：端点无视 stream=false 强制流式时，经真实解析器收敛出 ChatResponse
+    #[test]
+    fn sse_fallback_folds_into_response() {
+        use serde_json::json;
+        let events = vec![
+            json!({"id":"chat-1","model":"reasoner",
+                   "choices":[{"index":0,"delta":{"role":"assistant"}}]}),
+            json!({"id":"chat-1","model":"reasoner",
+                   "choices":[{"index":0,"delta":{"reasoning_content":"推理文本"}}]}),
+            json!({"id":"chat-1","model":"reasoner",
+                   "choices":[{"index":0,"delta":{"content":"回答正文"}}]}),
+            json!({"id":"chat-1","model":"reasoner",
+                   "choices":[{"index":0,"delta":{"tool_calls":[
+                       {"index":0,"id":"c","function":{"name":"f","arguments":"{\"x\":"}}]}}]}),
+            json!({"id":"chat-1","model":"reasoner",
+                   "choices":[{"index":0,"delta":{"tool_calls":[
+                       {"index":0,"function":{"arguments":"1}"}}]}}]}),
+            json!({"id":"chat-1","model":"reasoner",
+                   "choices":[{"index":0,"delta":{},"finish_reason":"stop"}],
+                   "usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}),
+        ];
+        let resp = sse_fold_into_response(events, &parse_chunk_json, &openai_capture_meta, "", "")
+            .expect("fold");
+        assert_eq!(resp.id, "chat-1");
+        assert_eq!(resp.model, "reasoner");
+        assert_eq!(resp.message.content.as_text().unwrap(), "回答正文");
+        assert_eq!(resp.message.reasoning_content.as_deref(), Some("推理文本"));
+        assert_eq!(resp.finish_reason, FinishReason::Stop);
+        assert_eq!(resp.usage.map(|u| u.total_tokens), Some(3));
+        assert_eq!(resp.message.tool_calls.len(), 1);
+        assert_eq!(
+            resp.message.tool_calls[0].function.arguments,
+            "{\"x\":1}"
+        );
     }
 }

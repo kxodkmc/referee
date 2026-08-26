@@ -600,7 +600,11 @@ pub trait LLMProvider: Send + Sync {
     /// 当前模型的规模规格（上下文窗口 / 最大输出）— 按模型而非厂商定义
     fn model_spec(&self) -> ModelSpec;
 
-    /// 一次性调用
+    /// 一次性调用（非流式，单次返回一个 [`ChatResponse`]）
+    ///
+    /// 请求侧仍发送 `stream=false`；接收侧宽容——即使端点无视该参数强制以 SSE
+    /// 流式返回（推理类网关常见），实现内置的响应解码也会自动按 SSE 累积出完整
+    /// 响应。对外始终维持非流式语义；合规 JSON 端点不受影响。
     async fn chat(&self, req: ChatRequest) -> Result<ChatResponse, LlmError>;
 
     /// 流式调用 — chunk 收敛后必须与 `chat()` 语义等价

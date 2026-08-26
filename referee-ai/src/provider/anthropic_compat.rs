@@ -28,7 +28,7 @@ use futures::stream::{self, BoxStream, StreamExt};
 use serde_json::{json, Value};
 use tracing::debug;
 
-use crate::provider::sse::parse_sse_stream;
+use crate::provider::sse::{parse_sse_stream, parse_wire_body, sse_fold_into_response, WireBody};
 use crate::provider::{
     ChatResponse, ContentPart, FinishReason, LlmError, MediaResolution, MediaSource, Message,
     MessageContent, RetryPolicy, Role, StreamChunk, TokenUsage, ToolCall, ToolCallDelta,
@@ -133,11 +133,26 @@ impl AnthropicClient {
         if !status.is_success() {
             return Err(map_http_error(resp).await);
         }
-        let json: Value = resp
-            .json()
+        // 单次读取完整响应体，随后按格式分流（JSON 直解 / SSE 事件收敛）
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        let bytes = resp
+            .bytes()
             .await
-            .map_err(|e| LlmError::Protocol(format!("response decode: {e}")))?;
-        parse_chat_response(&json)
+            .map_err(|e| LlmError::Protocol(format!("response read: {e}")))?;
+        match parse_wire_body(&bytes, content_type.as_deref())? {
+            WireBody::Json(json) => parse_chat_response(&json),
+            WireBody::Sse(events) => sse_fold_into_response(
+                events,
+                &(|v| Ok(parse_anth_chunk(v))),
+                &anth_capture_meta,
+                "",
+                "",
+            ),
+        }
     }
 
     /// 流式调用 — 仅对初始连接失败重试；已开始流出后不重试
@@ -636,6 +651,17 @@ type AnthChunkParts = (
     Option<TokenUsage>,
 );
 
+/// 从 `message_start` 事件收集中继标识（id / model 仅存在于起始事件）
+fn anth_capture_meta(json: &Value) -> Option<(String, String)> {
+    if json.get("type").and_then(|t| t.as_str()) != Some("message_start") {
+        return None;
+    }
+    let msg = json.get("message")?;
+    let id = msg.get("id")?.as_str()?.to_string();
+    let model = msg.get("model")?.as_str()?.to_string();
+    Some((id, model))
+}
+
 /// 解析单个 Anthropic SSE 事件
 ///
 /// - `content_block_start`（tool_use）→ 建立工具调用（index/id/name）
@@ -868,6 +894,40 @@ mod tests {
             }
             StreamChunk::Delta { .. } => panic!("expected finish"),
         }
+    }
+
+    /// 非流式 SSE 回退：端点到 message_start 起用 message_delta/msg 收敛终态
+    #[test]
+    fn sse_fallback_folds_into_response() {
+        use serde_json::json;
+        let events = vec![
+            json!({"type":"message_start",
+                   "message":{"id":"m-1","model":"m3","role":"assistant"}}),
+            json!({"type":"content_block_start","index":0,
+                   "content_block":{"type":"thinking","thinking":""}}),
+            json!({"type":"content_block_delta","index":0,
+                   "delta":{"type":"thinking_delta","thinking":"推理"}}),
+            json!({"type":"content_block_delta","index":1,
+                   "delta":{"type":"text_delta","text":"正文"}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},
+                   "usage":{"input_tokens":10,"output_tokens":5}}),
+            json!({"type":"message_stop"}),
+        ];
+        let resp = sse_fold_into_response(
+            events,
+            &(|v| Ok(parse_anth_chunk(v))),
+            &anth_capture_meta,
+            "",
+            "",
+        )
+        .expect("fold");
+        assert_eq!(resp.id, "m-1");
+        assert_eq!(resp.model, "m3");
+        assert_eq!(resp.message.content.as_text().unwrap(), "正文");
+        assert_eq!(resp.message.reasoning_content.as_deref(), Some("推理"));
+        assert_eq!(resp.finish_reason, FinishReason::Stop);
+        assert_eq!(resp.usage.as_ref().map(|u| u.prompt_tokens), Some(10));
+        assert_eq!(resp.usage.as_ref().map(|u| u.completion_tokens), Some(5));
     }
 
     /// 工具声明序列化为 Anthropic input_schema
