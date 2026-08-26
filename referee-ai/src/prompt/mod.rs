@@ -7,22 +7,28 @@
 //! ## 优先级（超限按序丢弃，System 最后保留）
 //! `system > 工具声明 > 对话历史 > 记忆 > 工件`
 //!
-//! ## 截断策略
-//! - **System**：最高优先级，预算不足时**按字符截断文本**（绝不整段丢弃）
-//! - **Tools**：高优先级，仅当整段超预算才整体丢弃
-//! - **History**：中优先级，滑动窗口保留最近 N 条；截断后修正首条角色
-//!   （OpenAI 协议要求首条为 system/user，残留的 assistant/tool 开头会 400）
-//! - **Memory / Artifacts**：低优先级，预算不足整体丢弃
+//! ## 截断策略（职责分离：核心载荷恒保留，可裁上下文按预算裁剪）
+//! - **System**：恒保留，预算不足时按字符截断文本（绝不整段丢弃）
+//! - **核心载荷**（history 末条的 user = 当前轮请求输入）：**恒完整保留**，
+//!   绝不因预算裁剪或 reorder；超预算仅告警
+//!   ——硬上限由 engine 依据 `ModelSpec.context_window_tokens` 兜底（fail-loud）。
+//! - **Tools**：高优先级，仅当整段超剩余预算才整体丢弃
+//! - **可裁 History / Memory / Artifacts**：按剩余预算裁剪；滑动窗口保留最近 N 条，
+//!   截断后修正首条角色（残留的 assistant/tool 开头会 400）；每次丢弃显式告警
 //!
 //! ## 设计约束
 //! - 纯函数，无 I/O 句柄；只依赖 `provider` 与 `budget`（分层单向依赖）
-//! - 截断后估算总量恒 ≤ 预算（估算系数与截断系数同源，见 [`CHARS_PER_TOKEN`]）
+//! - 可裁上下文估算 ≤ `prompt_budget`；核心载荷恒保留、可超预算受 engine 护栏约束
+//! - 所有截断 / 丢弃均为**可观测降级**（`tracing::warn!` + metrics），杜绝静默丢失
+//!   （估算系数与截断系数同源，见 [`CHARS_PER_TOKEN`]）
 
 use crate::budget::TokenEstimator;
+use crate::observe::prompt_truncated;
 use crate::provider::{
     ChatRequest, Message, MessageContent, Role, ThinkingConfig, ToolDeclaration,
 };
 use std::collections::VecDeque;
+use tracing::warn;
 
 /// 每 Token 可容纳的字符数（由 `TokenEstimator::estimate = chars*2/3+1` 反推：
 /// 要 estimate(text) ≤ budget，须 chars ≤ (budget-1)*3/2，即约 1.5 字符/token）
@@ -41,6 +47,55 @@ pub enum PromptFragment {
     Memory(Vec<Message>),
     /// 工件（最低优先级，优先丢弃）
     Artifacts(Vec<Message>),
+}
+
+/// 分离「当前轮输入」：chat 请求的末条 user 消息恒为可交付核心，**不可裁剪**。
+///
+/// 这是职责分离的根基——请求载荷（函数的输入）与可裁剪的历史上下文（函数
+/// 的记忆）语义不同：前者必须完整交付或明确报错，后者才允许按预算裁剪。
+/// 返回 `(核心载荷, 可裁剪历史)`；末条非 user（如工具轮收尾）则无核心载荷，
+/// 全部历史视为可裁剪。
+fn split_round_input(mut history: Vec<Message>) -> (Option<Message>, Vec<Message>) {
+    if history.last().is_some_and(|m| m.role == Role::User) {
+        let core = history.pop().expect("last message exists");
+        (Some(core), history)
+    } else {
+        (None, history)
+    }
+}
+
+/// 片段类型名（日志 / metrics 标签用，不含内容）
+fn fragment_kind(f: &PromptFragment) -> &'static str {
+    match f {
+        PromptFragment::System(_) => "system",
+        PromptFragment::Tools(_) => "tools",
+        PromptFragment::History(_) => "history",
+        PromptFragment::Memory(_) => "memory",
+        PromptFragment::Artifacts(_) => "artifacts",
+    }
+}
+
+/// 组装【可裁】片段列表（Tools > History > Memory > Artifacts），空片段省略
+fn build_cuttable(
+    tools: Vec<ToolDeclaration>,
+    history: Vec<Message>,
+    memory: Vec<Message>,
+    artifacts: Vec<Message>,
+) -> Vec<PromptFragment> {
+    let mut frags = Vec::new();
+    if !tools.is_empty() {
+        frags.push(PromptFragment::Tools(tools));
+    }
+    if !history.is_empty() {
+        frags.push(PromptFragment::History(history));
+    }
+    if !memory.is_empty() {
+        frags.push(PromptFragment::Memory(memory));
+    }
+    if !artifacts.is_empty() {
+        frags.push(PromptFragment::Artifacts(artifacts));
+    }
+    frags
 }
 
 impl PromptFragment {
@@ -91,6 +146,13 @@ impl PromptFragment {
                 let mut new_msg = msg.clone();
                 new_msg.content = MessageContent::text(format!("{truncated}{SUFFIX}"));
                 let new_cost = TokenEstimator::estimate(&format!("{truncated}{SUFFIX}"));
+                warn!(
+                    budget,
+                    before_tokens = cost,
+                    after_tokens = new_cost,
+                    "system prompt truncation: text character-cropped to fit budget"
+                );
+                prompt_truncated("system");
                 Some((PromptFragment::System(new_msg), new_cost))
             }
             PromptFragment::Tools(_) => {
@@ -103,11 +165,34 @@ impl PromptFragment {
             }
             PromptFragment::History(msgs) => {
                 // 滑动窗口：从最新往前保留，直到预算耗尽
+                let total_tokens: u64 = msgs
+                    .iter()
+                    .map(|m| TokenEstimator::estimate(m.content.as_text().unwrap_or("")))
+                    .sum();
                 let mut current_tokens = 0u64;
                 let mut keep = VecDeque::new();
                 for msg in msgs.iter().rev() {
                     let cost = TokenEstimator::estimate(msg.content.as_text().unwrap_or(""));
                     if current_tokens + cost > budget {
+                        // 窗口截断不可避免（budget 是收紧上限），必须显式告警。
+                        // 若连最早一条都放不下（keep 为空），则整段可裁历史尽数丢弃——
+                        // 当前轮核心载荷仍由 finalize 恒定保留，绝不静默消失。
+                        if keep.is_empty() {
+                            warn!(
+                                budget,
+                                fragment_tokens = total_tokens,
+                                "history fragment fully dropped: budget too small to fit earliest message"
+                            );
+                        } else {
+                            warn!(
+                                budget,
+                                kept_tokens = current_tokens,
+                                dropped_msgs = msgs.len() - keep.len(),
+                                dropped_tokens = total_tokens - current_tokens,
+                                "history truncation: earliest messages dropped to fit budget"
+                            );
+                        }
+                        prompt_truncated("history");
                         break;
                     }
                     current_tokens += cost;
@@ -291,10 +376,16 @@ pub fn build_prompt(parts: PromptParts) -> ChatRequest {
     )
 }
 
-/// 统一截断与组装 — 按优先级截断，生成 `ChatRequest`
+/// 统一截断与组装 — 按职责分离：核心载荷恒保留，可裁上下文按剩余预算裁剪
 ///
-/// 返回的 `ChatRequest` 保证：片段总估算 ≤ `prompt_budget`（System 按字符
-/// 截断兜底，其余按优先级丢弃）。
+/// 三层职责（详见模块文档）：
+/// - **核心载荷**（system + 当前轮 user 消息）：恒保留；system 超预算按字符截断
+///   兜底，当前轮输入恒完整交付、绝不裁剪。二者超出 `prompt_budget` **仅告警**——
+///   `prompt_budget` 是"可裁上下文"的收紧上限，不是核心载荷的交付门槛。
+/// - **可裁上下文**（tools + 可裁历史 + memory + artifacts）：按剩余预算裁剪，
+///   每次丢弃 / 截断显式 `WARN` + metrics（不再静默）。
+/// - **context 硬护栏**由 engine 依据 `ModelSpec.context_window_tokens` 兜底：
+///   核心载荷放不进模型窗口时显式报错（`EngineStartError::PromptTooLarge`）。
 fn finalize(
     system: Option<Message>,
     tools: Vec<ToolDeclaration>,
@@ -325,48 +416,77 @@ fn finalize(
         };
     }
 
-    // 1. 按优先级组装片段列表：System > Tools > History > Memory > Artifacts
-    let mut fragments: Vec<PromptFragment> = Vec::new();
+    // 1. 剥离当前轮核心载荷（末条 user，不可裁剪）；余下为可裁历史
+    let (core, history) = split_round_input(history);
+
+    // 2. System 恒保留，最高优先：超预算按字符截断兜底（绝不整段丢弃）
+    let mut sys_msg: Option<Message> = None;
+    let mut sys_cost = 0u64;
     if let Some(sys) = system {
-        fragments.push(PromptFragment::System(sys));
-    }
-    if !tools.is_empty() {
-        fragments.push(PromptFragment::Tools(tools));
-    }
-    if !history.is_empty() {
-        fragments.push(PromptFragment::History(history));
-    }
-    if !memory.is_empty() {
-        fragments.push(PromptFragment::Memory(memory));
-    }
-    if !artifacts.is_empty() {
-        fragments.push(PromptFragment::Artifacts(artifacts));
-    }
-
-    // 2. 预算分配与截断（System 优先获得预算，其余按序缩减）
-    let mut remaining = prompt_budget as u64;
-    let mut messages: Vec<Message> = Vec::new();
-    let mut final_tools: Vec<ToolDeclaration> = Vec::new();
-
-    for fragment in fragments {
-        if remaining == 0 {
-            break;
+        if let Some((PromptFragment::System(m), cost)) =
+            PromptFragment::System(sys).truncate(prompt_budget as u64)
+        {
+            sys_msg = Some(m);
+            sys_cost = cost;
         }
+    }
+
+    // 3. 核心载荷恒保留：超预算仅告警（预算 = 可裁上下文收紧上限，非交付门槛；
+    //    模型窗口这一硬上限由 engine 的 context 护栏兜底）
+    let core_cost = core
+        .as_ref()
+        .map(|m| TokenEstimator::estimate(m.content.as_text().unwrap_or("")))
+        .unwrap_or(0);
+    if core_cost > prompt_budget as u64 {
+        warn!(
+            budget = prompt_budget,
+            core_tokens = core_cost,
+            "current-round request input kept in full despite exceeding prompt budget \
+             (hard limit enforced by engine context-window guard)"
+        );
+    }
+
+    // 4. 可裁上下文预算 = 总预算 − system。核心载荷是恒交付载荷，`remaining`
+    //    不减 core——否则超大输入会把 tools / 上下文一并连坐丢弃。其窗口硬上限
+    //    由 engine 依据 `context_window_tokens` 兜底（fail-loud）。
+    let mut remaining = (prompt_budget as u64).saturating_sub(sys_cost);
+
+    // 5. system 恒保留，置首；当前轮核心载荷在可裁上下文落定后按原始相对位置
+    //    （对话末尾）追加——只豁免裁剪，不改变消息顺序
+    let mut messages: Vec<Message> = Vec::new();
+    if let Some(m) = sys_msg {
+        messages.push(m);
+    }
+
+    // 6. 可裁上下文分段截断（Tools > History > Memory > Artifacts）
+    let mut final_tools: Vec<ToolDeclaration> = Vec::new();
+    for fragment in build_cuttable(tools, history, memory, artifacts) {
         match fragment.truncate(remaining) {
             Some((kept, cost)) => {
                 match kept {
-                    PromptFragment::System(msg) => messages.insert(0, msg),
                     PromptFragment::Tools(t) => final_tools = t,
                     PromptFragment::History(msgs)
                     | PromptFragment::Memory(msgs)
                     | PromptFragment::Artifacts(msgs) => messages.extend(msgs),
+                    PromptFragment::System(_) => {
+                        unreachable!("system handled above, outside budget loop")
+                    }
                 }
                 remaining = remaining.saturating_sub(cost);
             }
             None => {
-                // 预算不足，丢弃该片段。System 不经过此路径（内部按字符截断兜底）。
+                warn!(
+                    kind = fragment_kind(&fragment),
+                    remaining,
+                    "cuttable fragment dropped: remaining budget exhausted"
+                );
+                prompt_truncated(fragment_kind(&fragment));
             }
         }
+    }
+    // 核心载荷恒在对话末尾交付，绝不因预算裁剪或 reorder
+    if let Some(c) = core {
+        messages.push(c);
     }
 
     ChatRequest {
@@ -437,45 +557,36 @@ mod tests {
                 description: "d".into(),
                 parameters: serde_json::json!({}),
             }],
-            vec![msg(Role::User, &text_of_tokens(200))],
-            vec![msg(Role::User, &text_of_tokens(100))],
-            vec![msg(Role::User, &text_of_tokens(100))],
+            vec![msg(Role::User, &text_of_tokens(200))], // history 末条 = 核心载荷
+            vec![msg(Role::User, &text_of_tokens(200))], // memory：可裁，超剩余预算丢弃
+            vec![msg(Role::User, &text_of_tokens(200))], // artifacts：可裁，丢弃
             None,
             None,
             ThinkingConfig::default(),
             150,
         );
 
-        // System 完整保留（首条）
-        assert_eq!(req.messages.len(), 1);
+        // 预算 150：System(≈50)+Tools(≈6) 保留；可裁上下文 History/Artifacts
+        // 预算不足被丢弃。但末条 user（history 末条，200 token）是**核心载荷**，
+        // 恒完整保留在末尾，绝不因预算丢弃。
+
+        // 核心载荷 + system 恒保留：System 在前，核心载荷在对话末尾
+        assert_eq!(req.messages.len(), 2);
         assert_eq!(req.messages[0].role, Role::System);
+        assert_eq!(
+            req.messages[1].content.as_text(),
+            Some(text_of_tokens(200).as_str()),
+            "current-round request input must be kept in full"
+        );
         // Tools 完整保留
         assert_eq!(req.tools.len(), 1);
-        // History / Artifacts 被丢弃
-        assert!(
-            req.messages.iter().all(|m| m.role != Role::User),
-            "history/artifacts must be dropped, got {:?}",
-            req.messages
-        );
-
-        // 总量恒 ≤ 预算（System + Tools 估算，与实现同源）
-        let total: u64 = req
+        // memory / artifacts（可裁上下文）被丢弃：仅核心载荷这一条 user 残留
+        let user_count = req
             .messages
             .iter()
-            .map(|m| TokenEstimator::estimate(m.content.as_text().unwrap_or("")))
-            .sum::<u64>()
-            + req
-                .tools
-                .iter()
-                .map(|t| {
-                    TokenEstimator::estimate(&t.name)
-                        + TokenEstimator::estimate(&t.description)
-                        + TokenEstimator::estimate(
-                            &serde_json::to_string(&t.parameters).unwrap_or_default(),
-                        )
-                })
-                .sum::<u64>();
-        assert!(total <= 150, "total {total} exceeds budget 150");
+            .filter(|m| m.role == Role::User)
+            .count();
+        assert_eq!(user_count, 1, "only the core request input may remain, got {req:?}");
     }
 
     #[test]
@@ -521,12 +632,35 @@ mod tests {
     }
 
     #[test]
-    fn history_sliding_window_keeps_recent() {
-        // 每条消息 7 字符 ≈ 5 token；预算 11 只够最近 2 条 → 保留最新、丢最旧
+    fn core_input_exceeding_budget_kept_in_full() {
+        // 反馈复现场景：单条 user 消息本身超预算，必须**完整保留**、绝不静默丢弃
+        // （旧实现会把该条整体截掉，模型收不到输入）。预算 5，核心载荷 ≈ 100 token，
+        // 恒保留于末尾；无 system / 工具，可裁上下文为空不受连坐。
+        let long = text_of_tokens(100);
         let req = build(
             None,
             vec![],
+            vec![msg(Role::User, &long)],
+            vec![],
+            vec![],
+            None,
+            None,
+            ThinkingConfig::default(),
+            5,
+        );
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.messages[0].content.as_text(), Some(long.as_str()));
+    }
+
+    #[test]
+    fn history_sliding_window_keeps_recent() {
+        let req = build(
+            None,
+            vec![],
+            // 每条 7 字符 ≈ 5 token；预算 11 只够 2 条 → 可裁历史保留 [old, mid]
+            //（丢 oldest）；末条 user「new msg」是核心载荷，独立恒保留于末尾
             vec![
+                msg(Role::User, "oldest msg"),
                 msg(Role::User, "old msg"),
                 msg(Role::User, "mid msg"),
                 msg(Role::User, "new msg"),
@@ -538,9 +672,10 @@ mod tests {
             ThinkingConfig::default(),
             11,
         );
-        assert_eq!(req.messages.len(), 2);
-        assert_eq!(req.messages[0].content.as_text(), Some("mid msg"));
-        assert_eq!(req.messages[1].content.as_text(), Some("new msg"));
+        assert_eq!(req.messages.len(), 3);
+        assert_eq!(req.messages[0].content.as_text(), Some("old msg"));
+        assert_eq!(req.messages[1].content.as_text(), Some("mid msg"));
+        assert_eq!(req.messages[2].content.as_text(), Some("new msg"));
     }
 
     #[test]

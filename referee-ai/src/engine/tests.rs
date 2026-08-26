@@ -1245,6 +1245,13 @@ fn engine_start_error_kind_classification() {
     );
     assert_eq!(ErrorKind::from(EngineStartError::MaxSessions), ErrorKind::Internal);
     assert_eq!(ErrorKind::from(EngineStartError::Busy), ErrorKind::Internal);
+    assert_eq!(
+        ErrorKind::from(EngineStartError::PromptTooLarge {
+            estimated: 2048,
+            window: 1024,
+        }),
+        ErrorKind::Internal
+    );
 }
 
 // ─────────────────────────────────────────────
