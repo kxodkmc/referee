@@ -87,19 +87,21 @@ struct SseState {
     inner: BoxStream<'static, Result<bytes::Bytes, reqwest::Error>>,
 }
 
-/// 从缓冲头部提取一个完整 SSE 事件（以 `\n\n` 分隔），返回 (事件字节, 剩余缓冲)
+/// 从缓冲头部提取一个完整 SSE 事件，返回 (事件字节, 剩余缓冲)
+///
+/// 兼容规范四种事件分隔符：`\n\n` / `\r\r` / `\r\n\r\n`，取最早出现者切分。
+/// 对 `\r\n\r\n` 流，事件字节天然不含尾部 `\r`（`i` 落在首个 `\r` 处）。
 fn take_sse_event(buf: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
-    // 查找 `\n\n` 分隔符
-    for i in 0..buf.len().saturating_sub(1) {
-        if buf[i] == b'\n' && buf[i + 1] == b'\n' {
-            let mut event_end = i;
-            // 兼容 `\r\n\r\n`：剔除尾部 `\r`
-            if event_end > 0 && buf[event_end - 1] == b'\r' {
-                event_end -= 1;
-            }
-            let event = buf[..event_end].to_vec();
-            let rest = buf[i + 2..].to_vec();
-            return Some((event, rest));
+    let len = buf.len();
+    for i in 0..len.saturating_sub(1) {
+        let (a, b) = (buf[i], buf[i + 1]);
+        // `\n\n` 或 `\r\r`
+        if (a == b'\n' && b == b'\n') || (a == b'\r' && b == b'\r') {
+            return Some((buf[..i].to_vec(), buf[i + 2..].to_vec()));
+        }
+        // `\r\n\r\n`
+        if a == b'\r' && b == b'\n' && i + 3 < len && buf[i + 2] == b'\r' && buf[i + 3] == b'\n' {
+            return Some((buf[..i].to_vec(), buf[i + 4..].to_vec()));
         }
     }
     None
@@ -384,6 +386,39 @@ mod tests {
         ]));
         let mut out = Vec::new();
         let mut stream = Box::pin(json_stream);
+        while let Some(item) = futures::executor::block_on(stream.next()) {
+            out.push(item.expect("ok"));
+        }
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["type"], "a");
+        assert_eq!(out[1]["type"], "b");
+    }
+
+    #[test]
+    fn parses_crlf_delimited_events() {
+        // `\r\n\r\n` 分隔（部分代理/网关）：流式路径必须能逐个切出事件，
+        // 而非堆积到流结束再合并解析（AI-2 修复锁定）。
+        let bytes =
+            format!("data: {}\r\n\r\ndata: {}\r\n\r\n", r#"{"type":"a"}"#, r#"{"type":"b"}"#);
+        let stream = futures::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(bytes))]);
+        let mut out = Vec::new();
+        let mut stream = Box::pin(parse_sse_stream(stream));
+        while let Some(item) = futures::executor::block_on(stream.next()) {
+            out.push(item.expect("ok"));
+        }
+        assert_eq!(out.len(), 2, "both CRLF events must be cut");
+        assert_eq!(out[0]["type"], "a");
+        assert_eq!(out[1]["type"], "b");
+    }
+
+    #[test]
+    fn parses_cr_cr_delimited_events() {
+        // `\r\r` 分隔同样属于规范四分隔符之一
+        let bytes =
+            format!("data: {}\r\rdata: {}\r\r", r#"{"type":"a"}"#, r#"{"type":"b"}"#);
+        let stream = futures::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(bytes))]);
+        let mut out = Vec::new();
+        let mut stream = Box::pin(parse_sse_stream(stream));
         while let Some(item) = futures::executor::block_on(stream.next()) {
             out.push(item.expect("ok"));
         }

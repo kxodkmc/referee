@@ -84,8 +84,6 @@ impl ChannelAdapter for MockAdapter {
             batch_idle_window_ms: 8000,
             max_batch_messages: 10,
             max_batch_window_ms: 30000,
-            supports_typing: false,
-            stream_update: false,
         }
     }
 

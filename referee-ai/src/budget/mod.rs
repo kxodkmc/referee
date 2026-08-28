@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::provider::ChatResponse;
+use crate::provider::{ChatResponse, Message};
 
 /// 预算配置
 ///
@@ -65,6 +65,22 @@ impl TokenEstimator {
     pub fn estimate(text: &str) -> u64 {
         let char_count = text.chars().count() as u64;
         (char_count * 2 / 3) + 1
+    }
+
+    /// 单条消息 Token 估算 — 覆盖全载荷：content / `reasoning_content` /
+    /// `tool_calls`（name + arguments）。
+    ///
+    /// 若只计 content 文本，重工具（`write_file` 类参数可达数千 token）与推理模型
+    /// （thinking 输出）场景会严重低估，预算截断在估算达标时实际已超窗。
+    pub fn estimate_message(msg: &Message) -> u64 {
+        let mut total = msg.content.as_text().map(Self::estimate).unwrap_or(0);
+        if let Some(rc) = &msg.reasoning_content {
+            total += Self::estimate(rc);
+        }
+        for tc in &msg.tool_calls {
+            total += Self::estimate(&tc.function.name) + Self::estimate(&tc.function.arguments);
+        }
+        total
     }
 }
 
@@ -133,6 +149,31 @@ mod tests {
         let a = TokenEstimator::estimate("short");
         let b = TokenEstimator::estimate("a much longer piece of text here");
         assert!(b > a);
+    }
+
+    #[test]
+    fn estimate_message_counts_tool_calls_and_reasoning() {
+        use crate::provider::{ToolCall, ToolCallFunction};
+        // 空 content 的消息：若漏计 tool_calls/reasoning，估算≈1（形同不计）
+        let mut msg = Message::assistant("");
+        assert_eq!(TokenEstimator::estimate_message(&msg), 1);
+        // 推理内容
+        msg.reasoning_content = Some("reasoning output with substantial length".into());
+        let with_reasoning = TokenEstimator::estimate_message(&msg);
+        assert!(with_reasoning > 1, "reasoning_content must be counted");
+        // 工具调用参数（重工具载荷）
+        msg.tool_calls = vec![ToolCall {
+            id: "call_1".into(),
+            function: ToolCallFunction {
+                name: "write_file".into(),
+                arguments: r#"{"path":"x","content":"large payload...."}"#.into(),
+            },
+        }];
+        let with_tools = TokenEstimator::estimate_message(&msg);
+        assert!(
+            with_tools > with_reasoning,
+            "tool_calls arguments must be counted"
+        );
     }
 
     #[test]

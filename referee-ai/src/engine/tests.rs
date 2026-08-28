@@ -308,9 +308,16 @@ async fn budget_session_rejected() {
 
 #[tokio::test]
 async fn cache_hit_skips_llm() {
-    // 缓存：两个不同会话发送完全相同的请求 → 第二次命中，LLM 仅调用 1 次
+    // 缓存：显式开启后，两个不同会话发送完全相同的请求 → 第二次命中，LLM 仅调用 1 次
+    // （缓存默认关闭，须显式配置——AI-4）
     let provider = mock(vec![Ok(resp("same", vec![]))]);
-    let engine = Engine::new(provider.clone(), config());
+    let mut cfg = config();
+    cfg.cache = crate::cache::CacheConfig {
+        enabled: true,
+        capacity: 100,
+        ttl: Duration::from_secs(60),
+    };
+    let engine = Engine::new(provider.clone(), cfg);
 
     let s1 = session_id();
     let s2 = session_id();
@@ -1347,14 +1354,16 @@ async fn awaiting_calls_deadline_converges_and_session_not_stuck() {
     );
 
     // 部分完成 + 部分超时收敛：第二轮请求同时含快工具真实结果与超时收敛消息
-    let reqs = provider.requests.lock();
-    let second = &reqs[1];
-    assert!(second.contains("fast_result"), "fast result kept: {second}");
-    assert!(
-        second.contains("batch deadline"),
-        "slow tool converged with deadline message: {second}"
-    );
-    drop(reqs);
+    // （持锁读取后立即释放，避免 guard 跨 await——clippy await_holding_lock）
+    {
+        let reqs = provider.requests.lock();
+        let second = &reqs[1];
+        assert!(second.contains("fast_result"), "fast result kept: {second}");
+        assert!(
+            second.contains("batch deadline"),
+            "slow tool converged with deadline message: {second}"
+        );
+    }
 
     // 会话不悬空：状态 Idle，次轮 chat 正常进入并完成
     assert_eq!(

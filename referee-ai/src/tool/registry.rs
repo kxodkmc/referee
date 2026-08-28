@@ -145,7 +145,7 @@ impl ToolRegistry {
     ) -> Vec<ToolDeclaration> {
         self.tools
             .iter()
-            .filter(|r| allowed.map_or(true, |a| a.contains(r.value().name())))
+            .filter(|r| allowed.is_none_or(|a| a.contains(r.value().name())))
             .filter(|r| !(r.value().depth_limited() && current_depth >= max_depth))
             .map(|r| r.value().to_declaration())
             .collect()

@@ -7,7 +7,6 @@ use rand::Rng;
 use reqwest::header::{HeaderMap, HeaderValue, InvalidHeaderValue, CONTENT_TYPE};
 use serde::Serialize;
 use serde_json::Value;
-use uuid::Uuid;
 
 use crate::types::{
     channel_version_u32, BaseInfo, GetUpdatesRequest, GetUpdatesResponse, OutboundItem,
@@ -15,6 +14,9 @@ use crate::types::{
 };
 
 pub const BASE_URL: &str = "https://ilinkai.weixin.qq.com";
+
+/// 单条消息字符上限（协议事实，社区阈值）——分段与能力声明统一引用此常量
+pub const MAX_TEXT_LEN: usize = 4000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WechatError {
@@ -129,29 +131,28 @@ impl IlinkClient {
         Ok(serde_json::from_str(trimmed)?)
     }
 
-    /// 发送文本（自动 4000 字符分段）。受理成功 ≠ 投递成功（协议文档 §12-2）。
-    pub async fn send_text(
+    /// 发送单条文本消息（不分段）。受理成功 ≠ 投递成功（协议文档 §12-2）。
+    /// `client_id` 同一条消息的重试间必须保持稳定，供服务端幂等去重。
+    pub async fn send_message(
         &self,
         to_user_id: &str,
         context_token: &str,
         text: &str,
+        client_id: &str,
     ) -> Result<(), WechatError> {
-        for chunk in split_for_wechat(text) {
-            let req = SendMessageRequest {
-                msg: OutboundMsg {
-                    to_user_id,
-                    context_token,
-                    item_list: vec![OutboundItem::text(chunk)],
-                    from_user_id: "",
-                    client_id: format!("bot-{}", Uuid::new_v4().simple()),
-                    message_type: 2,
-                    message_state: 2,
-                },
-                base_info: self.base_info(),
-            };
-            self.post_sendmessage(&req).await?;
-        }
-        Ok(())
+        let req = SendMessageRequest {
+            msg: OutboundMsg {
+                to_user_id,
+                context_token,
+                item_list: vec![OutboundItem::text(text)],
+                from_user_id: "",
+                client_id: client_id.to_owned(),
+                message_type: 2,
+                message_state: 2,
+            },
+            base_info: self.base_info(),
+        };
+        self.post_sendmessage(&req).await
     }
 
     async fn post_sendmessage(&self, req: &SendMessageRequest<'_>) -> Result<(), WechatError> {
@@ -176,14 +177,13 @@ impl IlinkClient {
     }
 }
 
-/// 社区经验：单条消息 4000 字符上限，按字符（非字节）安全分段；空文本也产出一条空消息
+/// 社区经验：单条消息 `MAX_TEXT_LEN` 字符上限，按字符（非字节）安全分段；空文本也产出一条空消息
 pub fn split_for_wechat(text: &str) -> Vec<String> {
-    const MAX_CHARS: usize = 4000;
     let mut chunks = Vec::new();
     let mut current = String::new();
     let mut len = 0;
     for ch in text.chars() {
-        if len == MAX_CHARS {
+        if len == MAX_TEXT_LEN {
             chunks.push(std::mem::take(&mut current));
             len = 0;
         }

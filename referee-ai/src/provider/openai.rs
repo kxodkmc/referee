@@ -21,7 +21,9 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use serde_json::Value;
 
-use crate::provider::openai_compat::{build_common_body, OpenAiCompatClient, OpenAiCompatConfig};
+use crate::provider::openai_compat::{
+    build_common_body, MaxTokensStyle, OpenAiCompatClient, OpenAiCompatConfig,
+};
 use crate::provider::{
     ChatRequest, ChatResponse, LLMProvider, LlmError, ModelSpec, ProviderCapabilities, ProviderId,
     RetryPolicy, StreamChunk,
@@ -135,6 +137,7 @@ impl OpenAiProvider {
             req.tool_choice,
             req.temperature,
             req.max_tokens,
+            MaxTokensStyle::Completion,
             &self.model,
         );
         // 调用方 extras（最后写入，可覆盖默认）

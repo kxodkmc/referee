@@ -60,6 +60,14 @@ pub struct Dispatcher {
     send_timeout: Duration,
 }
 
+/// host invoke 失败原因——`Kernel`(上游不可达)与 `Decode`(回信解码失败)严格区分，
+/// 避免解码 BUG 被误诊断成"队列满/降级"而排查方向错误。
+#[derive(Debug)]
+enum InvokeError {
+    Kernel(KernelError),
+    Decode(String),
+}
+
 impl Dispatcher {
     pub fn new(
         kernel: Kernel,
@@ -111,10 +119,20 @@ impl Dispatcher {
         let env = cmd.to_send_envelope(task.session_id, None);
         match self.invoke_host(env).await {
             Ok(receipt) if receipt.accepted => {}
-            other => tracing::error!(
+            Ok(receipt) => tracing::warn!(
                 peer = %task.peer.peer,
-                receipt = ?other,
+                queue_depth = receipt.queue_depth,
                 "兜底交付未被受理（出站队列满/降级）；Phase 2 补投接管"
+            ),
+            Err(InvokeError::Decode(e)) => tracing::error!(
+                peer = %task.peer.peer,
+                error = %e,
+                "host 回信解码失败，受理状态未知——非队列满"
+            ),
+            Err(InvokeError::Kernel(e)) => tracing::warn!(
+                peer = %task.peer.peer,
+                error = ?e,
+                "host invoke 失败"
             ),
         }
     }
@@ -122,20 +140,29 @@ impl Dispatcher {
     /// 系统提示（拒绝/失败通知），同样走出站队列
     async fn notify(&self, task: &Task, text: &str) {
         let cmd = outbound(task, ChannelContent::Text(text.to_owned()));
-        if let Err(e) = self.invoke_host(cmd.to_system_envelope()).await {
-            tracing::warn!(peer = %task.peer.peer, error = ?e, "im.system 通知失败");
+        match self.invoke_host(cmd.to_system_envelope()).await {
+            Ok(_) => {}
+            Err(InvokeError::Decode(e)) => tracing::error!(
+                peer = %task.peer.peer,
+                error = %e,
+                "im.system 回信解码失败"
+            ),
+            Err(InvokeError::Kernel(e)) => tracing::warn!(
+                peer = %task.peer.peer,
+                error = ?e,
+                "im.system 通知失败"
+            ),
         }
     }
 
-    async fn invoke_host(&self, env: Envelope) -> Result<SendReceipt, KernelError> {
+    /// 回信状态：解码失败时不确定是否已受理，单独成支，不折叠成"未受理"
+    async fn invoke_host(&self, env: Envelope) -> Result<SendReceipt, InvokeError> {
         let resp = self
             .kernel
             .invoke(self.host, env, self.send_timeout.as_millis() as u64)
-            .await?;
-        Ok(SendReceipt::from_envelope(&resp).unwrap_or(SendReceipt {
-            accepted: false,
-            queue_depth: 0,
-        }))
+            .await
+            .map_err(InvokeError::Kernel)?;
+        SendReceipt::from_envelope(&resp).map_err(|e| InvokeError::Decode(e.to_string()))
     }
 }
 

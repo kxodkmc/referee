@@ -79,7 +79,7 @@ async fn setup() -> (Kernel, Arc<MockHost>, ImSendText, SessionMap) {
     let router = ImRouter::new(
         kernel.clone(),
         ImRouterConfig {
-            hosts: vec![host.id()],
+            host: host.id(),
             agent: CapabilityId::new(), // 本测试不派发任务，无需真实 agent
             batch: referee_channel::BatchConfig {
                 idle_window: std::time::Duration::from_secs(8),

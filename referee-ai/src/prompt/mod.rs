@@ -121,7 +121,7 @@ impl PromptFragment {
             | PromptFragment::Memory(msgs)
             | PromptFragment::Artifacts(msgs) => msgs
                 .iter()
-                .map(|m| TokenEstimator::estimate(m.content.as_text().unwrap_or("")))
+                .map(TokenEstimator::estimate_message)
                 .sum(),
         }
     }
@@ -167,12 +167,12 @@ impl PromptFragment {
                 // 滑动窗口：从最新往前保留，直到预算耗尽
                 let total_tokens: u64 = msgs
                     .iter()
-                    .map(|m| TokenEstimator::estimate(m.content.as_text().unwrap_or("")))
+                    .map(TokenEstimator::estimate_message)
                     .sum();
                 let mut current_tokens = 0u64;
                 let mut keep = VecDeque::new();
                 for msg in msgs.iter().rev() {
-                    let cost = TokenEstimator::estimate(msg.content.as_text().unwrap_or(""));
+                    let cost = TokenEstimator::estimate_message(msg);
                     if current_tokens + cost > budget {
                         // 窗口截断不可避免（budget 是收紧上限），必须显式告警。
                         // 若连最早一条都放不下（keep 为空），则整段可裁历史尽数丢弃——
@@ -334,46 +334,24 @@ pub fn assemble(parts: AssembleParts) -> ChatRequest {
         Some(Message::system(system_text))
     };
 
-    finalize(
+    finalize(PromptParts {
         system,
         tools,
         history,
-        Vec::new(),
-        Vec::new(),
+        memory: Vec::new(),
+        artifacts: Vec::new(),
         temperature,
         max_tokens,
         thinking,
         prompt_budget,
-    )
+    })
 }
 
 /// 组装并截断 Prompt，生成最终 `ChatRequest`（legacy 入口）
 ///
 /// 委托 [`finalize`]，与 [`assemble`] 共享同一套截断逻辑。
 pub fn build_prompt(parts: PromptParts) -> ChatRequest {
-    let PromptParts {
-        system,
-        tools,
-        history,
-        memory,
-        artifacts,
-        temperature,
-        max_tokens,
-        thinking,
-        prompt_budget,
-    } = parts;
-
-    finalize(
-        system,
-        tools,
-        history,
-        memory,
-        artifacts,
-        temperature,
-        max_tokens,
-        thinking,
-        prompt_budget,
-    )
+    finalize(parts)
 }
 
 /// 统一截断与组装 — 按职责分离：核心载荷恒保留，可裁上下文按剩余预算裁剪
@@ -386,17 +364,18 @@ pub fn build_prompt(parts: PromptParts) -> ChatRequest {
 ///   每次丢弃 / 截断显式 `WARN` + metrics（不再静默）。
 /// - **context 硬护栏**由 engine 依据 `ModelSpec.context_window_tokens` 兜底：
 ///   核心载荷放不进模型窗口时显式报错（`EngineStartError::PromptTooLarge`）。
-fn finalize(
-    system: Option<Message>,
-    tools: Vec<ToolDeclaration>,
-    history: Vec<Message>,
-    memory: Vec<Message>,
-    artifacts: Vec<Message>,
-    temperature: Option<f32>,
-    max_tokens: Option<usize>,
-    thinking: ThinkingConfig,
-    prompt_budget: usize,
-) -> ChatRequest {
+fn finalize(parts: PromptParts) -> ChatRequest {
+    let PromptParts {
+        system,
+        tools,
+        history,
+        memory,
+        artifacts,
+        temperature,
+        max_tokens,
+        thinking,
+        prompt_budget,
+    } = parts;
     // 预算 0 = 不截断
     if prompt_budget == 0 {
         let mut messages = Vec::with_capacity(history.len() + memory.len() + artifacts.len());
@@ -435,7 +414,7 @@ fn finalize(
     //    模型窗口这一硬上限由 engine 的 context 护栏兜底）
     let core_cost = core
         .as_ref()
-        .map(|m| TokenEstimator::estimate(m.content.as_text().unwrap_or("")))
+        .map(TokenEstimator::estimate_message)
         .unwrap_or(0);
     if core_cost > prompt_budget as u64 {
         warn!(
@@ -847,7 +826,7 @@ mod tests {
     #[test]
     fn assemble_respects_budget() {
         // 稳定段超预算 → 按字符截断兜底（System 绝不整段丢弃）
-        let req = assemble_one(vec![SystemSection::stable(&text_of_tokens(500))], 100);
+        let req = assemble_one(vec![SystemSection::stable(text_of_tokens(500))], 100);
         let sys = req.messages[0].content.as_text().unwrap();
         assert!(sys.ends_with("[Truncated]"));
         assert!(TokenEstimator::estimate(sys) <= 100);

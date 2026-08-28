@@ -601,20 +601,19 @@ fn parse_anth_stream(
             }
             // 3. 拉取下一个事件
             match state.inner.next().await {
-                Some(Ok(json)) => match parse_anth_chunk(&json) {
-                    (delta_opt, finish_opt, usage_opt) => {
-                        if let Some(fr) = finish_opt {
-                            state.pending_finish = Some(fr);
-                        }
-                        if let Some(u) = usage_opt {
-                            state.pending_usage = Some(u);
-                        }
-                        if let Some(delta) = delta_opt {
-                            return Some((Ok(delta), state));
-                        }
-                        continue;
+                Some(Ok(json)) => {
+                    let (delta_opt, finish_opt, usage_opt) = parse_anth_chunk(&json);
+                    if let Some(fr) = finish_opt {
+                        state.pending_finish = Some(fr);
                     }
-                },
+                    if let Some(u) = usage_opt {
+                        state.pending_usage = Some(u);
+                    }
+                    if let Some(delta) = delta_opt {
+                        return Some((Ok(delta), state));
+                    }
+                    continue;
+                }
                 Some(Err(e)) => return Some((Err(e), state)),
                 None => {
                     // 流结束：若有 pending_finish 则补发 Finish

@@ -43,6 +43,8 @@ pub struct WechatConfig {
     pub poll_idle_ms: u64,
     /// 扫码二维码呈现方式
     pub qr_render: QrRender,
+    /// 扫码登录最长等待（秒）。二维码过期后服务端不再返回 token，超时即取消
+    pub qr_timeout_secs: u64,
 }
 
 impl Default for WechatConfig {
@@ -55,6 +57,7 @@ impl Default for WechatConfig {
             send_retries: 3,
             poll_idle_ms: 0,
             qr_render: QrRender::default(),
+            qr_timeout_secs: 300,
         }
     }
 }
