@@ -10,6 +10,12 @@
 //!   拆分——等待类走 `execute_batch` 同步收敛；派发类走 `dispatch_batch` 后台执行，
 //!   完成结果由调用方注入（入队，不阻塞主智能体）
 //! - **结果返回**：`execute_batch` / `dispatch_batch` 返回 `ExecutedTool`，调用方异步回写
+//!
+//! ## 保留参数 `wait`
+//! 引擎层把工具调用参数中的 `"wait": bool` 作为**引擎保留字**剥离（用于等待/派发
+//! 分流），**不传给工具实现**（`strip_wait`）。工具作者**不得**把 `wait` 用作业务
+//! 参数——否则该参数会被静默吞掉（如轮询类工具的 `wait` 语义会失效）。如需
+//! 保留业务参数，请改用其他键名。
 
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
@@ -194,6 +200,9 @@ impl ToolExecutor {
     ///   （在飞 future 就地取消），每项输入恰对应一项输出，调用方无部分失败感知
     /// - `max_concurrency`：可选并发上限；`Some(1)` 强制串行（厂商不支持并行工具时降级），
     ///   `None` 沿用执行器默认 `max_concurrency`
+    // 参数语义各自独立（批量内容 / 注册表 / 调用身份 ×3 / 并发 / deadline），
+    // 仅为单一调用点发明的打包类型得不偿失——保持显式签名。
+    #[allow(clippy::too_many_arguments)]
     pub async fn execute_batch(
         &self,
         tool_calls: Vec<ToolCall>,

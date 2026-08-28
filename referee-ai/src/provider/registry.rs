@@ -14,7 +14,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use tokio::time::Duration;
 
-use crate::provider::{LLMProvider, LlmError, ProviderId};
+use crate::provider::{LLMProvider, ProviderId};
 
 /// 厂商注册错误
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
@@ -130,7 +130,7 @@ impl ProviderRegistry {
 mod tests {
     use super::*;
     use crate::provider::{
-        ChatRequest, ChatResponse, FinishReason, Message, ModelSpec, ProviderCapabilities,
+        ChatRequest, ChatResponse, FinishReason, LlmError, Message, ModelSpec, ProviderCapabilities,
         StreamChunk,
     };
     use futures::stream::BoxStream;

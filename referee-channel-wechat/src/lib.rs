@@ -232,10 +232,11 @@ async fn poll_loop(
             }
         }
         state.advance(&resp.get_updates_buf, &tokens)?;
-        if resp.msgs.is_empty() && poll_idle_ms > 0 {
-            if sleep_or_shutdown(Duration::from_millis(poll_idle_ms), &mut shutdown).await {
-                return Ok(());
-            }
+        if resp.msgs.is_empty()
+            && poll_idle_ms > 0
+            && sleep_or_shutdown(Duration::from_millis(poll_idle_ms), &mut shutdown).await
+        {
+            return Ok(());
         }
     }
 }

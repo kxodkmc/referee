@@ -16,7 +16,9 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use serde_json::{json, Value};
 
-use crate::provider::openai_compat::{build_common_body, OpenAiCompatClient, OpenAiCompatConfig};
+use crate::provider::openai_compat::{
+    build_common_body, MaxTokensStyle, OpenAiCompatClient, OpenAiCompatConfig,
+};
 use crate::provider::{
     ChatRequest, ChatResponse, LLMProvider, LlmError, ModelSpec, ProviderCapabilities, ProviderId,
     RetryPolicy, StreamChunk,
@@ -146,7 +148,7 @@ impl AgnesProvider {
         })
     }
 
-    /// 构造 Agnes 请求 body：公共字段 + Thinking 开关 + `max_tokens` 字段名校正 + extras
+    /// 构造 Agnes 请求 body：公共字段 + Thinking 开关 + extras
     fn build_body(&self, req: &ChatRequest) -> Value {
         let mut body = build_common_body(
             &req.messages,
@@ -154,15 +156,9 @@ impl AgnesProvider {
             req.tool_choice,
             req.temperature,
             req.max_tokens,
+            MaxTokensStyle::Legacy, // 标准 OpenAI `max_tokens`（共享底座默认新式名，AI-9 修复）
             self.model.as_str(),
         );
-        // Agnes 使用标准 OpenAI `max_tokens`（非共享底座写入的 `max_completion_tokens`）
-        if let Some(m) = req.max_tokens {
-            if let Some(obj) = body.as_object_mut() {
-                obj.remove("max_completion_tokens");
-                obj.insert("max_tokens".to_string(), json!(m));
-            }
-        }
         // Thinking 模式：chat_template_kwargs.enable_thinking（effort 不受支持，忽略）
         body["chat_template_kwargs"] = json!({
             "enable_thinking": req.thinking.enabled

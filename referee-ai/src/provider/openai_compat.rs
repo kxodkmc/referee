@@ -213,6 +213,27 @@ fn compute_backoff(policy: &RetryPolicy, err: &LlmError, attempt: u32) -> Durati
 // 请求 body 公共构造（vendor 复用）
 // ───────────────────────────────────────────────
 
+/// OpenAI 兼容 `max_tokens` 参数命名风格
+///
+/// 新式网关（OpenAI 新 API / DeepSeek 等）用 `max_completion_tokens`；
+/// vLLM / Ollama / 部分国产网关只认旧式 `max_tokens`（不识新名会 400 或静默忽略）。
+/// 默认新式，厂商在 `build_common_body` 调用时按需声明（如 Agnes 用旧式）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum MaxTokensStyle {
+    #[default]
+    Completion,
+    Legacy,
+}
+
+impl MaxTokensStyle {
+    fn key(self) -> &'static str {
+        match self {
+            MaxTokensStyle::Completion => "max_completion_tokens",
+            MaxTokensStyle::Legacy => "max_tokens",
+        }
+    }
+}
+
 /// 构造 OpenAI 兼容协议的公共 body 字段
 ///
 /// 厂商适配器调用本函数后，再追加厂商特殊字段（如 `thinking` / `reasoning_effort`）
@@ -223,6 +244,7 @@ pub(crate) fn build_common_body(
     tool_choice: crate::provider::ToolChoice,
     temperature: Option<f32>,
     max_tokens: Option<usize>,
+    max_tokens_style: MaxTokensStyle,
     model: &str,
 ) -> Value {
     let messages_json: Vec<Value> = messages.iter().map(message_to_body_json).collect();
@@ -255,7 +277,7 @@ pub(crate) fn build_common_body(
         body["temperature"] = json!(t);
     }
     if let Some(m) = max_tokens {
-        body["max_completion_tokens"] = json!(m);
+        body[max_tokens_style.key()] = json!(m);
     }
     body
 }
@@ -376,13 +398,26 @@ fn map_reqwest_err(e: reqwest::Error) -> LlmError {
 
 async fn map_http_error(resp: reqwest::Response) -> LlmError {
     let status_code = resp.status().as_u16();
-    // Retry-After 必须在消费 body 前提取
-    let retry_after = resp
+    // Retry-After 必须在消费 body 前提取；仅支持整数秒，HTTP-date 等规范格式
+    // 无法解析时显式告警（回退指数退避，绝不静默忽略——AI-8 修复）。
+    let retry_after = match resp
         .headers()
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(Duration::from_secs);
+    {
+        Some(s) => match s.parse::<u64>() {
+            Ok(secs) => Some(Duration::from_secs(secs)),
+            Err(_) => {
+                tracing::warn!(
+                    header = s,
+                    "unrecognized Retry-After header (expected integer seconds), \
+                     falling back to exponential backoff"
+                );
+                None
+            }
+        },
+        None => None,
+    };
     let body = resp.text().await.unwrap_or_default();
     match status_code {
         401 | 403 => LlmError::Auth,
@@ -834,6 +869,7 @@ mod tests {
             crate::provider::ToolChoice::Auto,
             None,
             None,
+            MaxTokensStyle::Completion,
             "m",
         );
         let msgs = body["messages"].as_array().unwrap();
@@ -881,6 +917,7 @@ mod tests {
             crate::provider::ToolChoice::Auto,
             None,
             None,
+            MaxTokensStyle::Completion,
             "m",
         );
         let parts = body["messages"][0]["content"].as_array().unwrap();

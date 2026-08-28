@@ -58,7 +58,9 @@ pub struct CacheConfig {
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            // 默认关闭：多轮会话历史逐轮增长，全量哈希键命中率≈0，纯白付序列化开销
+            // （AI-4 修复）。需显式开启的典型场景：幂等重试 / 无状态问答。
+            enabled: false,
             capacity: 1000,
             ttl: Duration::from_secs(3600),
         }

@@ -38,6 +38,9 @@ pub const PRIORITY_NORMAL: u8 = 100;
 /// 状态机暂不处理，收到时返回 `Unhandled` 由上层决定）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+// 跨 crate 序列化协议类型（agent/channel 共用构造与匹配）；`Chat` 携带完整
+// `ChatPayload`，Box 化会牵动所有构造/匹配点且无栈热路径收益——保持现状。
+#[allow(clippy::large_enum_variant)]
 pub enum SessionMessage {
     /// 用户发起对话（触发 Idle → Thinking）
     Chat {

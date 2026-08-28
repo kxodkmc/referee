@@ -125,7 +125,8 @@ pub enum ToolCallAction {
 pub struct SessionConfig {
     /// history 最大消息数（有界，FIFO 淘汰最旧）
     pub max_history: usize,
-    /// 会话事实日志上限（同时受 `max_history` 窗口约束，超限返回 `CapacityExceeded`）
+    /// 会话事实日志上限（有界；满时经 `compact` 压缩头部旧事实降级，显式告警+指标，
+    /// 绝不让会话永久不可用——见 [`Session::push_history`]）
     pub max_events: usize,
     /// 超时配置
     pub timeout: TimeoutConfig,
@@ -527,6 +528,13 @@ impl Session {
     }
 
     /// 把已完成的异步工具结果作为 user 消息追加到事实源（仅非空时）
+    ///
+    /// **注入格式约定**：内容为引擎侧组装的
+    /// `"[async tool '<name>' completed]\n<result>"`（见 `engine::run_tool_calls`）。
+    /// 这是引擎的**系统约定前缀**——异步工具结果不主动触发 LLM，仅在下一回合
+    /// 构建请求时合并；模型视角下它是一条声明工具完成的 user 消息，属语义折衷
+    /// （回避"为回填结果主动调用 LLM"的开销），调用方在系统提示词中可向模型
+    /// 说明该格式的含义。
     fn flush_injections(&mut self) {
         let pending: Vec<String> = self.pending_injections.drain(..).collect();
         for content in pending {
@@ -633,12 +641,33 @@ impl Session {
     // 事实管理（append-only，有界）
     // ─────────────────────────────────────────────
 
-    /// 追加一条事实到会话日志（事实只增不减；满则返回 `CapacityExceeded`，不静默丢弃）
+    /// 追加一条事实到会话日志（事实只增不减；有界上限 `max_events`）
+    ///
+    /// **容量满时的降级路径**：压缩头部旧事实腾出空间再重试（模型可见窗口为尾部
+    /// 派生，丢头部无感），并显式 `warn!` + 指标计数——绝不静默丢弃、绝不因容量满
+    /// 拒绝新事实导致会话永久不可用。仅当无法腾出空间（`max_events` 过小）时
+    /// 返回 `CapacityExceeded` 诚实报错。
     ///
     /// 配置了落盘 sink 时，内存写入成功后尽力落盘；落盘失败显式 `error!` 记录
     /// （不吞异常、不阻塞内存会话），内存事实源仍为权威。
     pub fn push_history(&mut self, msg: Message) -> Result<(), LogError> {
-        self.log.append(msg.clone()).map(|_| ())?;
+        if let Err(full) = self.log.append(msg.clone()) {
+            // 满 → 压缩头部（保留 3/4 窗口，保证至少腾出一个槽位）→ 重试
+            let before = self.log.len();
+            self.log.compact((self.config.max_events * 3 / 4).max(1));
+            if self.log.len() < before {
+                warn!(
+                    error = ?full,
+                    max_events = self.config.max_events,
+                    "session fact log full: compacted oldest facts to admit new fact"
+                );
+                crate::observe::log_compacted();
+                self.log.append(msg.clone()).map(|_| ())?;
+            } else {
+                // 无法腾出空间（如 max_events=1 的畸形配置）→ 诚实报错
+                return Err(full);
+            }
+        }
         #[cfg(feature = "persist")]
         if let Some(sink) = &self.config.log_sink {
             if let Err(e) = sink.append(&self.session_id, &msg) {

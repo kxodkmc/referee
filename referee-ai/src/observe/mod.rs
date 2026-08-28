@@ -57,6 +57,16 @@ pub fn llm_retry() {
     metrics::counter!("referee_base_llm_retry_total").increment(1);
 }
 
+/// 统计一次会话事实日志容量满后的降级压缩（丢弃头部旧事实腾出空间）
+pub fn log_compacted() {
+    metrics::counter!("referee_base_session_log_compacted_total").increment(1);
+}
+
+/// 统计一次异步工具结果因会话已移除而被丢弃（best-effort 交付语义的缺口观测）
+pub fn tool_result_dropped() {
+    metrics::counter!("referee_base_tool_result_dropped_total").increment(1);
+}
+
 /// 统计一次预算拒绝（kind: session/global）
 pub fn budget_rejected(kind: &'static str) {
     metrics::counter!("referee_base_budget_rejected_total", "scope" => kind).increment(1);

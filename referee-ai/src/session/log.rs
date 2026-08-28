@@ -2,7 +2,9 @@
 //!
 //! 与"给模型看的窗口"分离：模型可见窗口是 [`SessionLog::tail`] 派生的有界视图，
 //! 事实本身只增不减（有界上限 `max_events`）。超限返回 [`LogError::CapacityExceeded`]，
-//! 绝不静默丢弃（背压硬约束）。数据与行为分离：本类型只存纯数据 `Message`，不含逻辑句柄。
+//! 绝不静默丢弃（背压硬约束）；容量压力的**正常降级路径**是 [`SessionLog::compact`]：
+//! 显式丢弃头部旧事实腾出空间（模型可见窗口为尾部派生，丢头部无感）。
+//! 数据与行为分离：本类型只存纯数据 `Message`，不含逻辑句柄。
 
 use crate::provider::Message;
 
@@ -45,6 +47,20 @@ impl SessionLog {
         }
         self.facts.push(msg);
         Ok(self.facts.len() - 1)
+    }
+
+    /// 压缩日志：保留最近 `keep_last` 条事实，丢弃头部更旧的（容量压力的正常降级路径）。
+    ///
+    /// 内存仍有界（`≤ keep_last < max_events`），丢弃仅影响头部旧事实——模型可见窗口
+    /// 由 [`SessionLog::tail`] 从尾部派生，丢头部对模型无感。返回压缩后的事实数；
+    /// `keep_last >= 当前长度` 时不做任何事。
+    pub fn compact(&mut self, keep_last: usize) -> usize {
+        let len = self.facts.len();
+        if len > keep_last {
+            // drain 保留容量（无再分配），O(n) 平移可接受（仅在满时触发）
+            self.facts.drain(..len - keep_last);
+        }
+        self.facts.len()
     }
 
     /// 模型可见窗口：最近 `max` 条（有界派生视图，超窗丢弃只影响"给模型看的窗口"，事实源无损）
@@ -127,12 +143,53 @@ impl PersistedSessionLog {
     }
 }
 
+/// SessionLog 默认（非 persist）单元测试
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::Message;
+
+    #[test]
+    fn compact_drops_head_keeps_tail() {
+        let mut log = SessionLog::new(8);
+        for i in 0..5 {
+            log.append(Message::user(format!("m{i}"))).unwrap();
+        }
+        // 压缩保留最近 2 条：丢弃头部 3 条
+        assert_eq!(log.compact(2), 2);
+        let facts: Vec<&str> = log
+            .snapshot()
+            .iter()
+            .filter_map(|m| m.content.as_text())
+            .collect();
+        assert_eq!(facts, vec!["m3", "m4"]);
+        // keep_last >= 当前长度时无操作
+        assert_eq!(log.compact(10), 2);
+    }
+
+    #[test]
+    fn compact_frees_room_for_append() {
+        let mut log = SessionLog::new(2);
+        log.append(Message::user("a")).unwrap();
+        log.append(Message::user("b")).unwrap();
+        // 满：压缩留出空间后仍可继续写入（降级路径前提）
+        log.compact(1);
+        log.append(Message::user("c")).unwrap();
+        assert_eq!(log.len(), 2);
+        let facts: Vec<&str> = log
+            .snapshot()
+            .iter()
+            .filter_map(|m| m.content.as_text())
+            .collect();
+        assert_eq!(facts, vec!["b", "c"]);
+    }
+}
+
 #[cfg(all(test, feature = "persist"))]
 mod persist_tests {
     use super::*;
     use crate::provider::Message;
     use std::sync::atomic::{AtomicUsize, Ordering};
-
     struct CountingSink {
         count: std::sync::Arc<AtomicUsize>,
     }

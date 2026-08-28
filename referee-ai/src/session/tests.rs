@@ -211,17 +211,23 @@ fn facts_preserved_beyond_window() {
 }
 
 #[test]
-fn fact_log_capacity_exceeded() {
+fn fact_log_capacity_degrades_by_compacting() {
     let mut session = Session::new(SessionConfig {
         max_events: 2,
         ..Default::default()
     });
     session.push_history(Message::user("a")).unwrap();
     session.push_history(Message::user("b")).unwrap();
-    let err = session.push_history(Message::user("c")).unwrap_err();
-    assert!(matches!(err, LogError::CapacityExceeded { max: 2 }));
-    // 拒绝不产生任何副作用：事实仍为前两条
+    // 满时降级：压缩头部旧事实腾出空间，新事实照常入队（拒绝会致会话永久死局）
+    session.push_history(Message::user("c")).unwrap();
     assert_eq!(session.log.len(), 2);
+    let facts: Vec<&str> = session
+        .log
+        .snapshot()
+        .iter()
+        .filter_map(|m| m.content.as_text())
+        .collect();
+    assert_eq!(facts, vec!["b", "c"], "oldest fact dropped to admit new one");
 }
 
 #[test]

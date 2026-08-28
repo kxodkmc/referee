@@ -35,7 +35,9 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use serde_json::{json, Value};
 
-use crate::provider::openai_compat::{build_common_body, OpenAiCompatClient, OpenAiCompatConfig};
+use crate::provider::openai_compat::{
+    build_common_body, MaxTokensStyle, OpenAiCompatClient, OpenAiCompatConfig,
+};
 use crate::provider::{
     ChatRequest, ChatResponse, LLMProvider, LlmError, ModelSpec, ProviderCapabilities, ProviderId,
     RetryPolicy, StreamChunk,
@@ -208,6 +210,7 @@ impl XiaomiProvider {
             req.tool_choice,
             req.temperature,
             req.max_tokens,
+            MaxTokensStyle::Completion,
             self.model.as_str(),
         );
         // MiMo 思考开关：thinking.type = enabled | disabled

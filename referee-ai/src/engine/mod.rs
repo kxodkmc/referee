@@ -707,6 +707,18 @@ impl Engine {
                     attempt += 1;
                     tracing::warn!(error = %e, attempt, "llm call failed, retrying");
                     observe::llm_retry();
+                    // 重试前必须退避：provider 层已做整条指数退避链，引擎补的这一轮
+                    // 若零间隔立即再发，限流场景会雪崩放大（AI-5 修复）。
+                    // 优先尊重 provider 透传的 Retry-After，否则指数退避，均封顶防挂起。
+                    let wait = match &e {
+                        LlmError::RateLimited {
+                            retry_after: Some(ra),
+                        } if !ra.is_zero() => (*ra).min(ENGINE_RETRY_MAX_WAIT),
+                        _ => ENGINE_RETRY_BASE_WAIT
+                            .saturating_mul(1u32 << attempt.min(5))
+                            .min(ENGINE_RETRY_MAX_WAIT),
+                    };
+                    tokio::time::sleep(wait).await;
                 }
                 other => return other,
             }
@@ -895,6 +907,15 @@ impl Engine {
                     let text = format!("[async tool '{}' completed]\n{}", r.tool_name, r.result);
                     if let Some(mut s) = engine.sessions.get_mut(&sid) {
                         s.inject_tool_result(text);
+                    } else {
+                        // 会话已移除（空闲回收 / 上层 remove）：结果无处注入。
+                        // best-effort 交付缺口必须可观测，绝不静默（AI-6 修复）。
+                        tracing::warn!(
+                            session_id = %sid,
+                            tool = %r.tool_name,
+                            "dispatch tool result dropped: session no longer exists"
+                        );
+                        observe::tool_result_dropped();
                     }
                 }
             });
@@ -948,6 +969,11 @@ const DISPATCHED_PLACEHOLDER: &str =
 /// 子智能体嵌套深度超限的拒绝消息（执行层兜底）
 const DEPTH_LIMIT_MESSAGE: &str =
     "Rejected: subagent nesting depth limit reached. This agent cannot call sub-agents.";
+
+/// 引擎层重试退避上限（避免重试等待无限期挂起回合）
+const ENGINE_RETRY_MAX_WAIT: Duration = Duration::from_secs(10);
+/// 引擎层重试基础退避（指数 ×2）
+const ENGINE_RETRY_BASE_WAIT: Duration = Duration::from_millis(250);
 
 /// 工具轮处理结果
 pub(crate) enum ToolRound {
