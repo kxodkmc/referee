@@ -88,9 +88,10 @@ impl Tool for ImSendText {
             .map_err(|e| ToolError::Execution(format!("通道不可达：{e}")))?;
         match SendReceipt::from_envelope(&resp) {
             Ok(receipt) if receipt.accepted => Ok(ToolOutput::text("已送达通道")),
-            other => Err(ToolError::Execution(format!(
-                "通道未受理：{other:?}"
-            ))),
+            Ok(_) => Err(ToolError::Execution(
+                "通道当前繁忙，消息未送达，稍后由最终回复补发".into(),
+            )),
+            Err(e) => Err(ToolError::Execution(format!("通道未受理：{e}"))),
         }
     }
 }

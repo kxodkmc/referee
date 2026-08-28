@@ -275,7 +275,7 @@ async fn setup(
     let router = ImRouter::new(
         kernel.clone(),
         ImRouterConfig {
-            hosts: vec![host.id()],
+            host: host.id(),
             agent: agent.id(),
             batch,
             concurrency,

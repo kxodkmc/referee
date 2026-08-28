@@ -28,9 +28,9 @@ pub mod ratelimit;
 pub mod state;
 pub mod types;
 
-pub use client::{split_for_wechat, IlinkClient, WechatError};
+pub use client::{split_for_wechat, IlinkClient, WechatError, MAX_TEXT_LEN};
 pub use config::{QrRender, WechatConfig};
-pub use login::{login_via_qr, LoginError, QrView};
+pub use login::{login_via_qr, render_qr, LoginError, QrView};
 pub use state::{Credentials, WechatState};
 
 use std::sync::Arc;
@@ -38,6 +38,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::{mpsc, watch};
+use uuid::Uuid;
 
 use referee_channel::adapter::{AdapterError, AdapterState, ChannelAdapter, ChannelIo};
 use referee_channel::message::{ChannelCapabilities, ChannelContent, InboundMessage, OutboundCommand};
@@ -68,7 +69,12 @@ impl WechatAdapter {
         let creds = match Credentials::load(&config.state_dir) {
             Some(creds) => creds,
             None => {
-                let creds = login_via_qr(&config.base_url, config.qr_render).await?;
+                let creds = login_via_qr(
+                    &config.base_url,
+                    Duration::from_secs(config.qr_timeout_secs),
+                    |view| render_qr(view, config.qr_render),
+                )
+                .await?;
                 creds.save(&config.state_dir)?;
                 creds
             }
@@ -101,12 +107,10 @@ impl ChannelAdapter for WechatAdapter {
 
     fn capabilities(&self) -> ChannelCapabilities {
         ChannelCapabilities {
-            max_text_len: 4000,
+            max_text_len: MAX_TEXT_LEN,
             batch_idle_window_ms: 8000,
             max_batch_messages: 10,
             max_batch_window_ms: 30000,
-            supports_typing: false,
-            stream_update: false,
         }
     }
 
@@ -151,7 +155,7 @@ impl ChannelAdapter for WechatAdapter {
 }
 
 /// 长轮询循环：回环过滤 → 投递有界入站通道（背压点）→ 游标/令牌即时落盘。
-/// 网络/协议错误不熔断通道（warn + 1s 后重试）——只有 panic 会被 host 监督捕获。
+/// 网络/协议错误不熔断通道（warn + 指数退避重试）——只有 panic 会被 host 监督捕获。
 async fn poll_loop(
     client: IlinkClient,
     state: Arc<WechatState>,
@@ -161,14 +165,20 @@ async fn poll_loop(
     poll_idle_ms: u64,
 ) -> Result<(), AdapterError> {
     let mut expired_streak = 0u32;
+    let mut backoff = Duration::from_millis(100);
     loop {
         let resp = match client.get_updates(&state.cursor()).await {
-            Ok(resp) => resp,
+            Ok(resp) => {
+                backoff = Duration::from_millis(100); // 成功即复位退避
+                resp
+            }
             Err(e) => {
-                tracing::warn!(error = %e, "get_updates failed, retry in 1s");
-                if sleep_or_shutdown(Duration::from_secs(1), &mut shutdown).await {
+                // 指数退避 + 上限：断网数小时不再每秒风暴式重试与刷日志
+                tracing::warn!(error = %e, ?backoff, "get_updates failed, retry after backoff");
+                if sleep_or_shutdown(backoff, &mut shutdown).await {
                     return Ok(());
                 }
+                backoff = (backoff * 2).min(Duration::from_secs(30));
                 continue;
             }
         };
@@ -230,7 +240,7 @@ async fn poll_loop(
     }
 }
 
-/// 出站循环：取件 → 限速 → 落线（瞬时错误重试 ≤ retries；令牌过期/服务端拒绝放弃并记录）
+/// 出站循环：取件 → 分段落线（每段受限速、可断点重试；令牌过期/服务端拒绝放弃）
 async fn send_loop(
     client: IlinkClient,
     state: Arc<WechatState>,
@@ -260,25 +270,41 @@ async fn send_loop(
             tracing::warn!(peer = %cmd.peer, "出站丢弃：媒体发送为 Phase 2 能力");
             continue;
         };
-        tokio::select! {
-            _ = limiter.wait() => {}
-            _ = shutdown.changed() => return Ok(()),
-        }
-        send_with_retry(&client, &cmd.peer, &token, &text, retries).await;
+        send_with_retry(&client, &cmd.peer, &token, &text, retries, &mut limiter, &mut shutdown).await;
     }
 }
 
+/// 分段发送 + 段级限速 + 断点重试 + 幂等 client_id（WC-1+WC-3）。
+/// 任一段失败重试仅从失败段开始重发，避免全段重复；client_id 基于段索引保持稳定供服务端幂等去重。
 async fn send_with_retry(
     client: &IlinkClient,
     peer: &str,
     token: &str,
     text: &str,
     retries: u32,
+    limiter: &mut RateLimiter,
+    shutdown: &mut watch::Receiver<bool>,
 ) {
+    let chunks = split_for_wechat(text);
+    // 整条消息共享一个 base_id，各段拼接索引保证稳定 client_id（重试 idempotent）
+    let base_id = format!("bot-{}", Uuid::new_v4().simple());
+
     let mut attempt = 0u32;
-    loop {
-        match client.send_text(peer, token, text).await {
-            Ok(()) => return,
+    let mut next_chunk = 0usize;
+
+    while next_chunk < chunks.len() {
+        // 每一段都过限速器，保证不突破安全频率（WC-3：按段不按条限速）
+        tokio::select! {
+            _ = limiter.wait() => {}
+            _ = shutdown.changed() => return,
+        }
+
+        match client.send_message(peer, token, &chunks[next_chunk], &format!("{base_id}-{next_chunk}")).await {
+            Ok(()) => {
+                // 发送成功，推进到下一段
+                next_chunk += 1;
+                attempt = 0;
+            }
             Err(WechatError::TokenExpired) => {
                 tracing::error!(peer, "出站失败：会话令牌过期（用户下次发消息自愈；补投见 Phase 2）");
                 return;
@@ -290,11 +316,12 @@ async fn send_with_retry(
             Err(e) => {
                 attempt += 1;
                 if attempt > retries {
-                    tracing::error!(peer, attempt, error = %e, "出站重试耗尽，放弃本条");
+                    tracing::error!(peer, attempt, chunk = next_chunk, error = %e, "出站重试耗尽，放弃本条");
                     return;
                 }
-                tracing::warn!(peer, attempt, error = %e, "出站瞬时错误，退避重试");
+                tracing::warn!(peer, attempt, chunk = next_chunk, error = %e, "出站瞬时错误，退避重试");
                 tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+                // 不推进 next_chunk，重试同一段 → 断点恢复，已发段不再重复（WC-1）
             }
         }
     }

@@ -178,12 +178,10 @@ pub struct SentNotice {           // im.sent 事件载荷 —— 仅观测归因
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelCapabilities {
-    pub max_text_len: usize,      // 微信 4000
-    pub batch_idle_window_ms: u64,// 微信 8000
-    pub max_batch_messages: usize,// 10
-    pub max_batch_window_ms: u64, // 30000
-    pub supports_typing: bool,    // Phase 2
-    pub stream_update: bool,      // 通道是否支持原地更新（微信待验证，先 false）
+    pub max_text_len: usize,      // 单条文本上限（adapter 声明，如微信 4000）
+    pub batch_idle_window_ms: u64,// 批次静默闭合窗口（adapter 声明，如微信 8000）
+    pub max_batch_messages: usize,// 批次条数上限（adapter 声明，如 10）
+    pub max_batch_window_ms: u64, // 批次总窗上限（adapter 声明，如 30000）
 }
 ```
 
@@ -253,7 +251,7 @@ let host = ChannelHost::new(adapter);                  // 内部 Arc，可 Clone
 let host_id = host.id();
 
 let router = ImRouter::new(kernel.clone(), ImRouterConfig {
-    hosts: vec![host_id],
+    host: host_id,
     agent: agent_runtime_id,
     batch: BatchConfig::from(caps),
     concurrency: 3,               // 全局并发上限

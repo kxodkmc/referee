@@ -25,8 +25,8 @@ use crate::policy::hit_keyword;
 const SWEEP_INTERVAL: Duration = Duration::from_millis(500);
 
 pub struct ImRouterConfig {
-    /// 可用 host——拒绝提示与兜底交付发往首个（多账号路由见 Phase 2）
-    pub hosts: Vec<CapabilityId>,
+    /// 出站 host——拒绝提示与兜底交付都发往此（多账号路由见 Phase 2）
+    pub host: CapabilityId,
     pub agent: CapabilityId,
     pub batch: BatchConfig,
     /// 全局并发上限（同时进行的回合数）
@@ -151,11 +151,7 @@ impl ImRouter {
     /// 构造即启动后台 driver（sweeper + 任务队列消费），与注册顺序无关。
     /// 组装约束（§4.5）：router 需先于 host 注册，host 的 im.inbound 才不落 DLQ。
     pub fn new(kernel: Kernel, config: ImRouterConfig) -> Self {
-        let host = config
-            .hosts
-            .first()
-            .copied()
-            .expect("ImRouterConfig.hosts 不能为空");
+        let host = config.host;
         let (events_tx, events_rx) = mpsc::channel(config.task_queue.max(1));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let core = Arc::new(RouterCore {

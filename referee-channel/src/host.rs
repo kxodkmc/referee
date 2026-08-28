@@ -155,11 +155,31 @@ fn reject(error: ChannelError) -> (SendReceipt, Option<ChannelError>) {
     )
 }
 
-/// im.send 信封附带的回合归因（工具写入）
+/// im.send 信封附带的回合归因（工具写入）；缺失/畸形时留日志，避免观测静默断链
 fn attribution(env: &Envelope) -> Option<(Uuid, u64)> {
-    let session_id = env.metadata.get(meta::SESSION_ID)?;
-    let turn_id = env.metadata.get(meta::TURN_ID)?;
-    Some((session_id.parse().ok()?, turn_id.parse().ok()?))
+    let Some(session_text) = env.metadata.get(meta::SESSION_ID) else {
+        tracing::debug!("attribution: 缺 session_id metadata");
+        return None;
+    };
+    let Some(turn_text) = env.metadata.get(meta::TURN_ID) else {
+        tracing::debug!("attribution: 缺 turn_id metadata");
+        return None;
+    };
+    let session_id = match session_text.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            tracing::debug!(value = %session_text, "attribution: session_id 解析失败");
+            return None;
+        }
+    };
+    let turn_id = match turn_text.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            tracing::debug!(value = %turn_text, "attribution: turn_id 解析失败");
+            return None;
+        }
+    };
+    Some((session_id, turn_id))
 }
 
 #[async_trait]
@@ -218,6 +238,12 @@ impl<A: ChannelAdapter + 'static> Extension for ChannelHost<A> {
                 break;
             }
             let _ = tokio::time::timeout(remain, task).await;
+        }
+        // 宽限期耗尽仍未完成的任务强制 abort，避免后台 task 泄漏
+        for task in &tasks {
+            if !task.is_finished() {
+                task.abort();
+            }
         }
         if let Err(e) = self.adapter.state().flush().await {
             tracing::error!(error = %e, "channel adapter state flush failed");

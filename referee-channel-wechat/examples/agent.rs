@@ -62,7 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let router = ImRouter::new(
         kernel.clone(),
         ImRouterConfig {
-            hosts: vec![host_id],
+            host: host_id,
             agent: agent_id,
             batch: BatchConfig {
                 idle_window: Duration::from_secs(8),

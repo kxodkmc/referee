@@ -32,9 +32,29 @@ impl Credentials {
     pub fn save(&self, dir: &Path) -> Result<(), AdapterError> {
         fs::create_dir_all(dir).map_err(|e| format!("create state dir: {e}"))?;
         let json = serde_json::to_vec_pretty(self).map_err(|e| format!("encode credentials: {e}"))?;
-        fs::write(dir.join("credentials.json"), json)
+        atomic_write(&dir.join("credentials.json"), &json)
             .map_err(|e| -> AdapterError { format!("write credentials: {e}").into() })
     }
+}
+
+/// 原子写：先写临时文件再同目录 rename 替换（POSIX/NTFS 均原子），
+/// 避免崩溃窗口产生半写文件；写入失败时旧文件保持原样。
+fn atomic_write(path: &Path, json: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, json)?;
+    fs::rename(&tmp, path)
+}
+
+/// 状态文件损坏时留存副本（`<name>.corrupt-<ts>`）便于审计，并返回错误而非静默清零
+fn corrupt_backup(path: &Path) -> AdapterError {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let backup = path.with_extension(format!("corrupt-{ts}"));
+    let copy = fs::copy(path, &backup).map_err(|e| format!("backup corrupt state: {e}"));
+    tracing::error!(path = %path.display(), backup = %backup.display(), ?copy, "状态文件损坏，已备份并拒绝静默清零");
+    format!("corrupt state file: {}", path.display()).into()
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -57,10 +77,14 @@ impl WechatState {
     pub fn load(dir: &Path) -> Result<Arc<Self>, AdapterError> {
         fs::create_dir_all(dir).map_err(|e| format!("create state dir: {e}"))?;
         let path = dir.join("bot-state.json");
-        let data = fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default();
+        let data = match fs::read_to_string(&path) {
+            Ok(text) => serde_json::from_str(&text).map_err(|e| -> AdapterError {
+                tracing::error!(path = %path.display(), error = %e, "状态文件解析失败");
+                corrupt_backup(&path)
+            })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BotData::default(),
+            Err(e) => return Err(format!("read state {}: {e}", path.display()).into()),
+        };
         Ok(Arc::new(Self {
             path,
             data: Mutex::new(data),
@@ -98,7 +122,7 @@ impl WechatState {
         self.dirty.store(true, Ordering::SeqCst);
         let json =
             serde_json::to_vec_pretty(&*self.data.lock()).map_err(|e| format!("encode state: {e}"))?;
-        fs::write(&self.path, json)
+        atomic_write(&self.path, &json)
             .map_err(|e| -> AdapterError { format!("write state: {e}").into() })?;
         self.dirty.store(false, Ordering::SeqCst);
         Ok(())

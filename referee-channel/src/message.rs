@@ -173,21 +173,18 @@ impl SentNotice {
     }
 }
 
-/// 通道能力声明——批次/分段参数的事实来源（adapter 提供，基座消费）
+/// 通道能力声明——批次/分段参数的事实来源（adapter 提供，基座消费）。
+/// 具体数值由各 adapter 按自身通道声明，基座不固化任何通道假设。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChannelCapabilities {
-    /// 单条文本上限（微信 4000 字符）
+    /// 单条文本上限
     pub max_text_len: usize,
-    /// 批次静默闭合窗口（微信 8000ms）
+    /// 批次静默闭合窗口（毫秒）
     pub batch_idle_window_ms: u64,
-    /// 批次条数上限（10）
+    /// 批次条数上限
     pub max_batch_messages: usize,
-    /// 批次总窗上限（30000ms）
+    /// 批次总窗上限（毫秒）
     pub max_batch_window_ms: u64,
-    /// 是否支持 typing 状态（Phase 2）
-    pub supports_typing: bool,
-    /// 是否支持消息原地更新（微信待验证，先 false）
-    pub stream_update: bool,
 }
 
 fn encode<T: Serialize + ?Sized>(kind: &str, msg: &T) -> Envelope {
