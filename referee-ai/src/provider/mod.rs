@@ -405,6 +405,37 @@ pub struct TokenUsage {
     pub cache_write_tokens: Option<usize>,
 }
 
+impl TokenUsage {
+    /// 逐字段饱和累加 — 用于回合级 usage 聚合（terminal 收敛时返回本回合各轮之和）。
+    ///
+    /// Option 字段任一方上报即求和（未上报视为 0）；双方均未上报保持 None。
+    pub fn merge(&mut self, other: &TokenUsage) {
+        self.prompt_tokens = self.prompt_tokens.saturating_add(other.prompt_tokens);
+        self.completion_tokens = self
+            .completion_tokens
+            .saturating_add(other.completion_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
+        self.reasoning_tokens = sum_opt(self.reasoning_tokens, other.reasoning_tokens);
+        self.prompt_cache_hit_tokens = sum_opt(
+            self.prompt_cache_hit_tokens,
+            other.prompt_cache_hit_tokens,
+        );
+        self.prompt_cache_miss_tokens = sum_opt(
+            self.prompt_cache_miss_tokens,
+            other.prompt_cache_miss_tokens,
+        );
+        self.cache_read_tokens = sum_opt(self.cache_read_tokens, other.cache_read_tokens);
+        self.cache_write_tokens = sum_opt(self.cache_write_tokens, other.cache_write_tokens);
+    }
+}
+
+fn sum_opt(a: Option<usize>, b: Option<usize>) -> Option<usize> {
+    match (a, b) {
+        (None, None) => None,
+        (a, b) => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+    }
+}
+
 /// 一次性（非流式）响应
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatResponse {

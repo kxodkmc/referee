@@ -9,7 +9,7 @@
 //! - [`tool::AgentTool`]：对等/子 Agent 协作（Agent as Tool）。
 //! - [`tool::mcp`]：MCP 2.0 stdio 客户端桥（远程 MCP 工具接入 `Tool` 抽象；
 //!   按需拓展，启用 `mcp-stdio` feature 后加载）。
-//! - [`artifact`]：带 ACL 的工件存储（业务层对等成果共享的安全能力）。
+//! - [`artifact`]：凭证式工件存储（ID 即访问凭证，业务层对等成果共享）。
 //!
 //! ## 定位
 //! referee-ai 提供「接 LLM → 组装 prompt → 调工具 → 管预算 → 回复」的地基；
@@ -50,7 +50,7 @@ use tracing::Instrument;
 /// Agent 运行时 — `referee-core` 扩展，管理 N 个会话
 ///
 /// 内部委托 [`Engine`] 驱动最小闭环；本类型负责把内核 `Envelope` 消息
-/// 转译为引擎调用，并承载业务能力（对等工具、ACL 工件存储）。
+/// 转译为引擎调用，并承载业务能力（对等工具、凭证式工件存储）。
 ///
 /// `Clone` 用于共享观测句柄（会话表 / 计数器均为 `Arc`），注册时应使用同一实例。
 #[derive(Clone)]
@@ -85,7 +85,7 @@ impl AgentRuntime {
         }
     }
 
-    /// 注入 ACL 工件存储（启用对等工具大结果落库 + 授权读取）
+    /// 注入凭证式工件存储（启用对等工具大结果落库 + ID 凭证读取）
     pub fn with_artifact_store(mut self, store: Arc<dyn ArtifactStore>) -> Self {
         self.artifact_store = Some(store);
         self

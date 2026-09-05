@@ -33,19 +33,21 @@ use tracing::Instrument;
 use crate::budget::{add_tokens, tokens_from_response, BudgetConfig, BudgetError};
 use crate::cache::{CacheConfig, InMemoryCache};
 use crate::observe;
-use crate::provider::{ChatResponse, LLMProvider, LlmError, StreamChunk};
+use crate::provider::{ChatResponse, LLMProvider, LlmError, StreamChunk, TokenUsage};
 use crate::session::{
     ChatPayload, ErrorKind, FinishAction, RoundStart, Session, SessionConfig, SessionId,
     SessionReply, TurnOutcome,
 };
-use crate::tool::{ExecutedTool, ToolOutcome, ToolExecutor, ToolRegistry};
+use crate::tool::{ToolExecutor, ToolRegistry};
 
 pub mod observer;
 pub mod session_mgmt;
 pub mod stream;
+pub mod tool_round;
 
 pub use observer::EngineObserver;
 pub use session_mgmt::{ReaperHandle, SessionPhase, SessionSnapshot};
+pub(crate) use tool_round::ToolRound;
 use stream::StreamAccumulator;
 
 /// 引擎配置
@@ -100,6 +102,9 @@ pub enum EngineError {
     /// 内部通道关闭（派生任务意外终止）
     #[error("chat channel closed")]
     ChannelClosed,
+    /// 单回合 LLM 轮数达上限（`max_rounds_per_chat`）；已发生的工具结果保留于 history
+    #[error("max rounds per chat exceeded ({rounds})")]
+    MaxRoundsExceeded { rounds: u32 },
 }
 
 /// 引擎回信 — `chat` 的执行产物
@@ -552,12 +557,24 @@ impl Engine {
         // RoundSource::First 仅在首迭代由 chat() 原子启动；此后经 resume 恢复。
         // 每迭代用 mem::replace 统一取本轮输入（fresh owned），规避跨迭代 move 累积。
         let mut src = RoundSource::First(first);
+        // 本回合已发起的 LLM 轮数（含首轮与全部工具中间轮；重试不另计）
+        let mut rounds_used: u32 = 0;
+        // 本回合各轮 usage 之和（terminal 收敛时作为返回响应的 usage）
+        let mut turn_usage_sum: Option<TokenUsage> = None;
 
         loop {
             let cur = std::mem::replace(&mut src, RoundSource::Resume);
             let (turn_id, mut cancel_rx, request) = match cur {
                 RoundSource::First(f) => (f.turn_id, f.cancel_rx, f.request),
                 RoundSource::Resume => {
+                    if self.round_limit_reached(rounds_used) {
+                        if let Some(mut s) = self.sessions.get_mut(session_id) {
+                            s.settle_tool_results();
+                        }
+                        return EngineReply::Error(EngineError::MaxRoundsExceeded {
+                            rounds: rounds_used,
+                        });
+                    }
                     match self
                         .sessions
                         .get_mut(session_id)
@@ -568,6 +585,7 @@ impl Engine {
                     }
                 }
             };
+            rounds_used += 1;
 
             // 回合级中断（轮隙间：工具执行后 / 思考间隙）
             if self.is_interrupted(session_id) {
@@ -629,6 +647,11 @@ impl Engine {
                 TurnOutcome::Success(resp) | TurnOutcome::Cached(resp) => resp.usage.clone(),
                 _ => None,
             };
+            match (&mut turn_usage_sum, &turn_usage) {
+                (Some(sum), Some(u)) => sum.merge(u),
+                (None, Some(u)) => turn_usage_sum = Some(u.clone()),
+                _ => {}
+            }
             let action = self
                 .sessions
                 .get_mut(session_id)
@@ -674,8 +697,15 @@ impl Engine {
                     match self.run_tool_calls(session_id, turn_id, tool_calls).await {
                         // 有待等待的工具 → 循环继续恢复（src 已在迭代顶部置为 Resume）
                         ToolRound::Resume => {}
-                        // 纯派发轮（全部不等待）→ 回合就此结束，返回模型原文
-                        ToolRound::Settled => return EngineReply::Success(Box::new(response)),
+                        // terminal 收敛（aggregate_usage=true，usage 取各轮之和）
+                        // 或纯派发轮（全部不等待）→ 回合就此结束，返回模型原文
+                        ToolRound::Settled { aggregate_usage } => {
+                            let mut response = response;
+                            if aggregate_usage {
+                                response.usage = turn_usage_sum;
+                            }
+                            return EngineReply::Success(Box::new(response));
+                        }
                     }
                 }
             }
@@ -815,173 +845,20 @@ impl Engine {
             .map(|s| s.is_interrupted())
             .unwrap_or(false)
     }
-    /// 一轮工具调用的完整处理：截断 → 按 wait 分流 → 等待类同步 / 派发类后台注入
-    ///
-    /// - 截断项：生成引导错误消息（下一轮重发），立即收敛
-    /// - 派发类（不等待）：占位结果立即收敛（保证 assistant tool_calls 与 tool 结果
-    ///   配对），后台任务执行完成后结果入队，等待下一次模型调用/回合合并注入
-    /// - 等待类：同步执行（并行 + 隔离 + 单工具超时），批次受
-    ///   `awaiting_calls_timeout` 总 deadline 约束——未完成项以超时消息收敛，
-    ///   会话恢复一致状态，回合不被慢批次无限占用
-    pub(crate) async fn run_tool_calls(
-        &self,
-        session_id: &SessionId,
-        turn_id: u64,
-        mut tool_calls: Vec<crate::provider::ToolCall>,
-    ) -> ToolRound {
-        let (registry, executor) = match (&self.tools, &self.tool_executor) {
-            (Some(r), Some(e)) => (r.clone(), e.clone()),
-            _ => return ToolRound::Settled,
-        };
 
-        // 0. 深度兜底（声明层过滤被绕过时的防线）：嵌套深度达上限的会话
-        //    拒绝调用子 Agent 工具（depth_limited），生成明确错误并立即收敛
-        let depth = self
-            .sessions
-            .get(session_id)
-            .map(|s| s.peer_depth())
-            .unwrap_or(0);
-        if depth >= self.config.max_subagent_depth {
-            let (blocked, rest): (Vec<_>, Vec<_>) = tool_calls.into_iter().partition(|tc| {
-                registry
-                    .get(&tc.function.name)
-                    .map(|t| t.depth_limited())
-                    .unwrap_or(false)
-            });
-            for tc in blocked {
-                if let Some(mut s) = self.sessions.get_mut(session_id) {
-                    s.finish_tool_call(&tc.id, DEPTH_LIMIT_MESSAGE.to_string());
-                }
-            }
-            tool_calls = rest;
-        }
-
-        // 1. 截断：超出 max_per_turn 的生成引导错误（由调用方统一截断一次）
-        let (head, tail) = executor.truncate(tool_calls);
-        for tc in tail {
-            if let Some(mut s) = self.sessions.get_mut(session_id) {
-                s.finish_tool_call(
-                    &tc.id,
-                    format!(
-                        "Exceeds max_tools_per_turn limit ({}). \
-                         Please re-issue this tool call in the next turn.",
-                        executor.config().max_per_turn
-                    ),
-                );
-            }
-        }
-
-        // 2. 按等待决策分流
-        let (waiting, dispatched) = executor.split_by_wait(head, &registry);
-
-        // 观测：实际执行项（等待 + 派发）触发 started（截断/深度拦截项不执行，不触发）
-        for tc in waiting.iter().chain(dispatched.iter()) {
-            self.observe_event(|o| o.on_tool_started(*session_id, &tc.id, &tc.function.name));
-        }
-
-        // 3. 派发类：占位收敛 + 后台执行完成后入队注入
-        if !dispatched.is_empty() {
-            for tc in &dispatched {
-                if let Some(mut s) = self.sessions.get_mut(session_id) {
-                    s.finish_tool_call(&tc.id, DISPATCHED_PLACEHOLDER.to_string());
-                }
-            }
-            let handles =
-                executor.dispatch_batch(dispatched, &registry, *session_id, turn_id, depth);
-            let engine = self.clone();
-            let sid = *session_id;
-            tokio::spawn(async move {
-                for h in handles {
-                    let r = h.await.unwrap_or_else(|_| ExecutedTool {
-                        tool_call_id: String::new(),
-                        tool_name: "<unknown>".into(),
-                        result: "async tool task panicked".into(),
-                        outcome: ToolOutcome::Panic,
-                        duration_ms: 0,
-                    });
-                    observe::tool_completed(!r.result.is_empty());
-                    // 派发类完成事件（与等待类复用同一 ToolOutcome）
-                    engine.observe_event(|o| {
-                        o.on_tool_finished(sid, &r.tool_call_id, r.outcome, r.duration_ms)
-                    });
-                    let text = format!("[async tool '{}' completed]\n{}", r.tool_name, r.result);
-                    if let Some(mut s) = engine.sessions.get_mut(&sid) {
-                        s.inject_tool_result(text);
-                    } else {
-                        // 会话已移除（空闲回收 / 上层 remove）：结果无处注入。
-                        // best-effort 交付缺口必须可观测，绝不静默（AI-6 修复）。
-                        tracing::warn!(
-                            session_id = %sid,
-                            tool = %r.tool_name,
-                            "dispatch tool result dropped: session no longer exists"
-                        );
-                        observe::tool_result_dropped();
-                    }
-                }
-            });
-        }
-
-        // 4. 等待类：同步执行并收敛结果（批次总 deadline = awaiting_calls_timeout）
-        if !waiting.is_empty() {
-            // 能力降级：厂商不支持并行工具时强制串行（Some(1)）
-            let max_concurrent = if self.provider.capabilities().parallel_tool_calls {
-                None
-            } else {
-                Some(1)
-            };
-            let results = executor
-                .execute_batch(
-                    waiting,
-                    &registry,
-                    *session_id,
-                    turn_id,
-                    depth,
-                    max_concurrent,
-                    self.config.session.timeout.awaiting_calls_timeout,
-                )
-                .await;
-            for r in results {
-                observe::tool_completed(!r.result.is_empty());
-                self.observe_event(|o| {
-                    o.on_tool_finished(*session_id, &r.tool_call_id, r.outcome, r.duration_ms)
-                });
-                if let Some(mut s) = self.sessions.get_mut(session_id) {
-                    s.finish_tool_call(&r.tool_call_id, r.result);
-                }
-            }
-            return ToolRound::Resume;
-        }
-
-        // 5. 纯派发轮：占位 Tool 消息落 history → Idle（回合结束）
-        if let Some(mut s) = self.sessions.get_mut(session_id) {
-            s.settle_dispatched();
-        }
-        ToolRound::Settled
+    /// 回合轮数是否已达上限（None = 不限）
+    fn round_limit_reached(&self, rounds_used: u32) -> bool {
+        self.config
+            .session
+            .max_rounds_per_chat
+            .is_some_and(|max| rounds_used >= max)
     }
 }
-
-/// 派发类（不等待）工具的占位结果 — 立即收敛进 history，满足厂商协议
-/// assistant tool_calls 与 tool 结果配对；真实结果完成后入队，在**下一次**
-/// 模型调用/回合时合并注入（绝不为此主动触发 LLM）。
-const DISPATCHED_PLACEHOLDER: &str =
-    "Task dispatched (async execution); real result will be injected into a later turn.";
-
-/// 子智能体嵌套深度超限的拒绝消息（执行层兜底）
-const DEPTH_LIMIT_MESSAGE: &str =
-    "Rejected: subagent nesting depth limit reached. This agent cannot call sub-agents.";
 
 /// 引擎层重试退避上限（避免重试等待无限期挂起回合）
 const ENGINE_RETRY_MAX_WAIT: Duration = Duration::from_secs(10);
 /// 引擎层重试基础退避（指数 ×2）
 const ENGINE_RETRY_BASE_WAIT: Duration = Duration::from_millis(250);
-
-/// 工具轮处理结果
-pub(crate) enum ToolRound {
-    /// 有待等待的工具 → 继续 resume 循环
-    Resume,
-    /// 纯派发轮（全部不等待）→ 回合就此结束
-    Settled,
-}
 
 /// 每轮输入来源
 pub(crate) enum RoundSource {
@@ -1069,3 +946,7 @@ impl From<EngineStartError> for ErrorKind {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "turn_governance_tests.rs"]
+mod turn_governance_tests;

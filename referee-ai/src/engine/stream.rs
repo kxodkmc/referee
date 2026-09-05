@@ -55,12 +55,19 @@ async fn stream_loop(
 ) {
     let timeout = engine.config.session.timeout.thinking_timeout;
     let mut src = RoundSource::First(first);
+    let mut rounds_used: u32 = 0;
 
     loop {
         let cur = std::mem::replace(&mut src, RoundSource::Resume);
         let (turn_id, cancel_rx, request) = match cur {
             RoundSource::First(f) => (f.turn_id, f.cancel_rx, f.request),
             RoundSource::Resume => {
+                if engine.round_limit_reached(rounds_used) {
+                    if let Some(mut s) = engine.sessions.get_mut(session_id) {
+                        s.settle_tool_results();
+                    }
+                    break;
+                }
                 match engine
                     .sessions
                     .get_mut(session_id)
@@ -71,6 +78,7 @@ async fn stream_loop(
                 }
             }
         };
+        rounds_used += 1;
 
         if engine.is_interrupted(session_id) {
             break;
@@ -118,7 +126,7 @@ async fn stream_loop(
                 }
                 match engine.run_tool_calls(session_id, turn_id, tool_calls).await {
                     ToolRound::Resume => {}
-                    ToolRound::Settled => break,
+                    ToolRound::Settled { .. } => break,
                 }
             }
         }

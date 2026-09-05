@@ -8,7 +8,7 @@
 ┌─────────────────────────────────────────────────────────────┐
 │ referee-agent（业务封装，开箱即用）                            │
 │   AgentRuntime (Extension) · Agent 定义/配置（agent）         │
-│   对等协作 AgentTool · ACL 工件存储 · 成果板读取工具           │
+│   对等协作 AgentTool · 凭证式工件存储 · 成果板读取工具          │
 │   MCP stdio（mcp-stdio）· Skills（skills）                   │
 ├─────────────────────────────────────────────────────────────┤
 │ referee-ai（核心支撑，地基积木）                          │
@@ -27,7 +27,7 @@
 |------|------|------|
 | [`referee-core`](referee-core/) | **微内核**：路由 / 原语 / 治理（背压、熔断、挂起治理、监督、停机、DLQ、WAL） | 33 条 |
 | [`referee-ai`](referee-ai/) | **核心支撑（地基）**：厂商抽象（含 `ProviderRegistry`）、会话引擎（最小闭环 + 流式 + 会话生命周期 + 崩溃恢复）、工具执行（同步/异步派发 + 白名单过滤）、通用 KV、预算、**提示词分段编排**、缓存、可观测、**用量/缓存命中计量** | 134 条 |
-| [`referee-agent`](referee-agent/) | **业务封装（开箱即用）**：Extension 集成、Agent 定义/配置（`agent`）、对等协作、ACL 工件存储、成果板读取工具；MCP stdio（`mcp-stdio`）与 Skills（`skills`）按需 feature | 81 条（默认） |
+| [`referee-agent`](referee-agent/) | **业务封装（开箱即用）**：Extension 集成、Agent 定义/配置（`agent`）、对等协作、凭证式工件存储、成果板读取工具；MCP stdio（`mcp-stdio`）与 Skills（`skills`）按需 feature | 81 条（默认） |
 | [`referee-aura`](referee-aura/) | **服务层（daemon）**：HTTP + TCP JSON-RPC + SSE 流式，实例/会话管理、持久化恢复、TUI | 20 条 |
 
 合计 **268 条测试全绿**（`cargo test --workspace`，默认 feature；启用 `skills` / `mcp-stdio` 后更多）。统计为当前工作树实测值。
@@ -98,7 +98,7 @@ Phase 1 骨架与背压 → Phase 2 invoke 原语 → Phase 3 容错与隔离 �
 
 - **Agent 定义/配置**：`agent` 模块提供 `AgentDefinition`（纯数据，可来自 JSON/TOML/builder）、`AgentBuilder`、`AgentRegistry`（以可调用 `AgentId` 为 key，唯一 + kebab-case 校验）、`bind` → `BoundAgent`（解析白名单 + 渲染模板）。
 - **能力白名单（封闭默认）**：每个 Agent 声明可用工具 / 技能 / MCP；`["*"]`=全部、`["a"]`=白名单、`[]`=无该能力（空则不进提示词）。
-- **对等协作**：`AgentTool`（Agent as Tool）、ACL 工件存储与成果板读取工具（`list_my_board` / `read_artifact`）。
+- **对等协作**：`AgentTool`（Agent as Tool）、凭证式工件存储（ID 即访问凭证）与成果板读取工具（`list_my_board` / `read_artifact`）。
 - **按需拓展**：MCP 2.0 stdio 客户端桥（feature `mcp-stdio`）、Agent Skills（SKILL.md）注入（feature `skills`），默认不加载、零新增依赖；记忆等业务策略不预置（由使用方二次封装）。
 
 ### referee-aura（服务层 / daemon）— 提供对外服务

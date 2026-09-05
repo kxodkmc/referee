@@ -11,8 +11,8 @@
 //! - **同步 RPC**：`execute` 经 `ToolContext.kernel.invoke` 发起请求-响应调用
 //!   （带超时）。invoke 在派生任务（引擎回合）中执行，不违反「handle 内零阻塞」。
 //! - **循环调用拒绝**：目标 Agent 忙碌时返回 `Busy` → 转为错误结果，系统不挂死。
-//! - **成果落库**：非等待模式下无论结果大小都写入带 ACL 的 [`ArtifactStore`] 并
-//!   将调用者显式加入 `allowed_readers`，仅回传 Artifact ID（主智能体只收到
+//! - **成果落库**：非等待模式下无论结果大小都写入 [`ArtifactStore`]（写入调用者=父
+//!   会话的成果板，`owner_session` 为产出子会话），仅回传 Artifact ID（主智能体只收到
 //!   「完成与否」通知，自主决定是否查看原文）；等待模式仅大结果落库。
 
 use std::sync::Arc;
@@ -40,7 +40,7 @@ pub struct AgentTool {
     target_session_id: uuid::Uuid,
     /// RPC 超时（毫秒）
     timeout_ms: u64,
-    /// 带 ACL 的工件存储（大结果落库；未注入则仅返回原文）
+    /// 凭证式工件存储（大结果落库；未注入则仅返回原文）
     artifact_store: Option<Arc<dyn ArtifactStore>>,
 }
 
@@ -68,7 +68,7 @@ impl AgentTool {
         self
     }
 
-    /// 注入 ACL 工件存储（业务层：大结果落库 + 授权读取）
+    /// 注入凭证式工件存储（业务层：大结果落库 + ID 凭证读取）
     pub fn with_artifact_store(mut self, store: Arc<dyn ArtifactStore>) -> Self {
         self.artifact_store = Some(store);
         self

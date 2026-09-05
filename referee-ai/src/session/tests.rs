@@ -404,7 +404,7 @@ fn resume_thinking_flushes_async_injections_after_tool_results() {
 }
 
 #[test]
-fn settle_dispatched_converges_pure_dispatch_round() {
+fn settle_tool_results_converges_pure_dispatch_round() {
     let mut session = Session::new(SessionConfig::default());
     let (turn_id, _rx) = session.start_thinking().expect("start ok");
     let resp = mock_tool_response("dispatching", vec![make_tool_call("tc_1", "echo")]);
@@ -415,14 +415,14 @@ fn settle_dispatched_converges_pure_dispatch_round() {
     assert!(matches!(action, ToolCallAction::AllDone));
 
     // 纯派发轮收尾：占位 Tool 消息落 history → Idle
-    assert!(session.settle_dispatched());
+    assert!(session.settle_tool_results());
     assert!(!session.is_busy());
     let req = session.build_chat_request(&ChatOptions::default());
     assert_eq!(req.messages[1].role, Role::Tool);
     assert_eq!(req.messages[1].tool_call_id.as_deref(), Some("tc_1"));
 
     // 非 AwaitingCalls 状态重复收敛返回 false
-    assert!(!session.settle_dispatched());
+    assert!(!session.settle_tool_results());
 }
 
 // ─────────────────────────────────────────────

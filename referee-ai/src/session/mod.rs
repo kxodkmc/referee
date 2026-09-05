@@ -140,6 +140,10 @@ pub struct SessionConfig {
     pub default_system_prompt: Option<String>,
     /// 会话空闲超时（None = 永不超时，默认）。超时后由空闲回收任务移除 Idle 会话。
     pub idle_timeout: Option<Duration>,
+    /// 单回合最大 LLM 轮数（None = 不限，默认）。回合内每发起一次模型调用计一轮，
+    /// 达上限时回合以 `MaxRoundsExceeded` 终止：已发生的工具结果写入 history，
+    /// 会话回 Idle（防模型循环调工具跑飞的第一类直接指标）。
+    pub max_rounds_per_chat: Option<u32>,
     /// 【persist】可插拔会话事实落盘 sink（默认 None；运行时注入，不参与序列化）
     #[cfg(feature = "persist")]
     #[serde(skip)]
@@ -177,6 +181,7 @@ impl Default for SessionConfig {
             prompt_budget_tokens: 128 * 1024,
             default_system_prompt: None,
             idle_timeout: None,
+            max_rounds_per_chat: None,
             #[cfg(feature = "persist")]
             log_sink: None,
         }
@@ -623,12 +628,13 @@ impl Session {
         }
     }
 
-    /// 纯派发轮收尾：把 AwaitingCalls 的占位工具结果追加为 Tool 消息并回到 Idle。
+    /// 工具结果收尾：把 AwaitingCalls 的工具结果（等待类真实结果 / 派发类占位）
+    /// 追加为 Tool 消息并回到 Idle，不再 resume 发起下一轮。
     ///
-    /// 本轮全部为不等待工具（无等待项可 resume），回合就此结束；占位 Tool 消息
-    /// 保证 assistant tool_calls 与 tool 结果配对（厂商协议硬约束）。
+    /// 适用于：纯派发轮收尾、terminal 工具收敛、回合轮数达上限的兜底收敛。
+    /// Tool 消息保证 assistant tool_calls 与 tool 结果配对（厂商协议硬约束）。
     /// 返回是否成功收敛（非 AwaitingCalls 返回 false）。
-    pub fn settle_dispatched(&mut self) -> bool {
+    pub fn settle_tool_results(&mut self) -> bool {
         if !matches!(self.state, SessionState::AwaitingCalls { .. }) {
             return false;
         }

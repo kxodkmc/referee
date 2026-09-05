@@ -168,6 +168,16 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// 是否为终止式工具 — 本轮全部工具执行成功且任一为 terminal 时，回合立即收敛，
+    /// 不再发起收尾轮（调用方拿到携带 tool_calls 的模型原文，usage 为本回合各轮之和）。
+    ///
+    /// 仅适用于等待类工具（执行完毕即产出最终结果，如 submit 类提交）；与派发类
+    /// （`default_wait() == false`）互斥，注册期校验拒绝。执行失败时不收敛，
+    /// 维持现有行为（发起下一轮让模型纠错）。
+    fn terminal(&self) -> bool {
+        false
+    }
+
     /// 导出为 `ToolDeclaration`（供 LLM 请求时拼装 `tools` 字段）
     fn to_declaration(&self) -> ToolDeclaration {
         ToolDeclaration {

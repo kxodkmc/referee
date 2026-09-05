@@ -2,8 +2,8 @@
 
 > 建立在 `referee-ai`（地基）之上的**业务层**：把 referee-ai 的积木（厂商抽象、
 > 会话引擎、工具执行、预算、缓存）组装为可直接使用的 Agent 运行时，并提供业务能力：
-> **Agent 定义/配置**（`agent`）、Extension 集成、对等协作（Agent as Tool）、带 ACL 的
-> 工件存储与成果板读取工具，以及 MCP 2.0 stdio 客户端桥（按需 feature `mcp-stdio`）
+> **Agent 定义/配置**（`agent`）、Extension 集成、对等协作（Agent as Tool）、凭证式
+> 工件存储（ID 即访问凭证）与成果板读取工具，以及 MCP 2.0 stdio 客户端桥（按需 feature `mcp-stdio`）
 > 与 Agent Skills 注入（按需 feature `skills`）。
 >
 > **分层**：`referee-core`（内核，通信与治理）→ `referee-ai`（核心支撑积木）
@@ -17,7 +17,7 @@
 | Agent 定义/配置 | `agent` 模块：`AgentDefinition`（纯数据）+ `AgentBuilder` + `AgentRegistry` + `bind` → `BoundAgent`；能力白名单**封闭默认**（`["*"]`=全部、`["a"]`=白名单、`[]`=无该能力） |
 | 可替换模板 | `TemplateRef::Named` 命名槽位 + `TemplateRegistry`（覆盖语义、有界）：不重编译即可替换提示词；`bind_with(templates, vars)` 传递设计（参考 DSH persona 槽位） |
 | Extension 集成 | `AgentRuntime` 实现 `referee-core::Extension`，把 referee-ai 引擎接入内核消息路由（`Chat` / `Interrupt`） |
-| 业务能力 | 对等/子 Agent 协作（`AgentTool`，Agent as Tool）、ACL 工件存储（`artifact`）、成果板读取工具（`list_my_board` / `read_artifact`） |
+| 业务能力 | 对等/子 Agent 协作（`AgentTool`，Agent as Tool）、凭证式工件存储（`artifact`）、成果板读取工具（`list_my_board` / `read_artifact`） |
 | 按需拓展 | MCP 2.0 stdio 客户端桥（`tool::mcp`）以 feature `mcp-stdio` 加载；Agent Skills 注入（`skill`）以 feature `skills` 加载，默认不编译，核心保持轻量 |
 | 不预置 | 记忆等业务策略由使用者/二次封装搭建 |
 
@@ -58,10 +58,10 @@ referee-agent = { path = "referee-agent", features = ["xiaomi", "deepseek", "mcp
 | [`agent`](src/agent/mod.rs) | **Agent 定义/配置**：`AgentId`（可调用、唯一、kebab-case 校验）、`AgentDefinition`（纯数据，可来自 JSON/TOML/builder）、`AgentBuilder`（链式）、`AgentRegistry`（以 `AgentId` 为 key，重复拒绝）、`AgentDefinition::bind` → `BoundAgent`（解析白名单 + 渲染模板为 `SystemSection`） |
 | [`agent::template`](src/agent/template.rs) | **可替换模板**（参考 DSH persona 槽位）：`TemplateRef::Named` 命名槽位 + `TemplateRegistry`（有界、`register` 覆盖替换语义）+ `interpolate`（`{{variable}}` 严格插值，未知/畸形 fail-loud） |
 | [`AgentRuntime`](src/lib.rs) | `Extension` 实现：接收 `Chat` / `Interrupt` 消息，委托 base `Engine` 驱动回合；观测（会话数 / token / 缓存）；转发会话管理（`remove_session` / `list_sessions` / `session_info`）；`chat_stream` 库级流式；`restore_session_history` 崩溃恢复（`replay_history` 为向后兼容别名）；`register_peer_tool` / `register_artifact_tools` |
-| [`tool::AgentTool`](src/tool/agent_tool.rs) | 对等/子 Agent 工具（Agent as Tool）：`Local` 分类不占 IO 槽位，同步 RPC 调用目标会话，大结果 ACL 落库；`peer_depth` 嵌套深度限制 |
-| [`tool::ArtifactReader`](src/tool/artifact_reader.rs) | 成果板读取工具：`list_my_board` 列本会话板内条目、`read_artifact` 按 ID 凭证读取成果正文（读取路径仍经 ArtifactStore ACL 校验） |
+| [`tool::AgentTool`](src/tool/agent_tool.rs) | 对等/子 Agent 工具（Agent as Tool）：`Local` 分类不占 IO 槽位，同步 RPC 调用目标会话，大结果凭证落库（写入父板，回传 ID）；`peer_depth` 嵌套深度限制 |
+| [`tool::ArtifactReader`](src/tool/artifact_reader.rs) | 成果板读取工具：`list_my_board` 列本会话板内条目、`read_artifact` 按 ID 凭证读取成果正文（持 ID 即可读，无 ACL 校验） |
 | [`tool::mcp`](src/tool/mcp/mod.rs) | MCP 2.0 stdio 客户端桥（按需 feature `mcp-stdio`）：子进程管理（有界读取/并发分发/取消/停机）、`server/discover` + `tools/list` + `tools/call`、`_meta` 注入 + 版本协商（-32022）、MRTR `InputRequiredResult` 三策略；`McpServer` 把远程工具经 `Tool` 抽象接入注册表 |
-| [`artifact`](src/artifact/mod.rs) | 带 ACL 的工件存储：owner / 授权读者读取校验，有界（数量 + 字节双上限），成果板（`BoardId`）组织 |
+| [`artifact`](src/artifact/mod.rs) | 凭证式工件存储：ID 即访问凭证（持有即可读，无 ACL / 吊销 / 过期），`owner_session` 记录产出会话，有界（数量 + 字节双上限），成果板（`BoardId`）按调用者组织 |
 | [`skill`](src/skill/mod.rs) | Agent Skills 开放标准（SKILL.md）注入（按需 feature `skills`）：极简 frontmatter 解析（零依赖 YAML）、有界注册表（`SkillRegistry`）、关键词路由（含 CJK 匹配）、`render_skill_context` 注入渲染；渐进式披露 L1 元数据 / L2 正文 / L3 资源，零新增依赖 |
 
 ## 4. Agent 定义与配置
@@ -213,13 +213,13 @@ options.system_prompt = Some(format!("你是助手。\n\n{}", render_skill_conte
 - base 保证最小闭环的并发正确性（回合内顺序异步、协作取消、无跨 await 持锁、错误显式可见），并提供流式输出与会话生命周期管理。
 - `AgentRuntime.handle` 零阻塞：只做转译 + spawn，回复在派生任务中异步完成。
 - 对等能力信任边界：`kernel` / artifact 句柄仅授予可信注册工具（`register_peer_tool`）。
-- 成果读取工具读取路径仍经 ArtifactStore ACL 强制校验（凭证式 ID 不代表越权）。
+- 成果读取为**凭证模型**：ID 即访问凭证，存储层不校验请求者——ID 泄漏（进历史 / 日志）即可读，且无吊销、无过期；仅在可信会话间传递 ID。
 - `referee-core` 零改动。
 
 ## 7. 测试
 
 ```bash
-cargo test -p referee-agent                    # 81 条（默认：agent 定义/注册/白名单 + artifact ACL + 成果读取 + peer 对等协作）
+cargo test -p referee-agent                    # 81 条（默认：agent 定义/注册/白名单 + artifact 凭证读写 + 成果读取 + peer 对等协作）
 cargo test -p referee-agent --features mcp-stdio   # +MCP 2.0 协议单测（_meta 注入 / 版本协商 / discover / tools/call / MRTR）
 cargo test -p referee-agent --features skills      # +Agent Skills（frontmatter / 注册 / 路由 / 端到端注入 build_prompt）
 cargo clippy -p referee-agent --all-targets -- -D warnings

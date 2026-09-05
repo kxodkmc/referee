@@ -59,13 +59,15 @@ impl Default for ExecutorConfig {
 /// 工具执行结果分类 — 数据出口，供程序化消费（observer 回调 / 上层策略）
 ///
 /// 穷尽 executor 全部收敛分支：
-/// - 工具正常返回（含主动 `Err(ToolError)`，错误文本保留在 `result`）→ `Ok`
+/// - 工具正常返回 → `Ok`；主动 `Err(ToolError)` → `Failed`（错误文本保留在 `result`）
 /// - 参数解析失败不短路：降级为 Null 参数继续执行，结局由实际执行结果承载
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolOutcome {
-    /// 正常完成（含工具主动报错的可观测完成，非崩溃）
+    /// 正常完成（非崩溃、非主动报错）
     Ok,
+    /// 工具主动报错（返回 `ToolError`）— 错误文本保留在 result，模型下一轮纠错
+    Failed,
     /// 单工具执行超时
     Timeout,
     /// 工具或执行段 panic（含 pre-execute panic / 后台任务 join 失败）
@@ -467,8 +469,8 @@ async fn execute_single(
         Ok(Ok(Ok(output))) => (output.content, ToolOutcome::Ok),
         Ok(Ok(Err(e))) => {
             warn!(error = %e, tool = %tool_name, "tool execution failed");
-            // 工具主动报错：正常可观测完成，归 Ok（区别于 Timeout/Panic 崩溃类）
-            (format!("{e}"), ToolOutcome::Ok)
+            // 工具主动报错：错误文本回传模型下一轮纠错；terminal 收敛视为失败
+            (format!("{e}"), ToolOutcome::Failed)
         }
         Ok(Err(_)) => {
             warn!(tool = %tool_name, "tool execution timed out");

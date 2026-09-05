@@ -54,6 +54,8 @@ pub enum RegistryError {
     Full(usize),
     #[error("tools are not enabled on this runtime (call with_tools first)")]
     NotEnabled,
+    #[error("terminal tool '{0}' must be waiting-type (default_wait = true), dispatch-type conflicts with terminal convergence")]
+    TerminalRequiresWait(String),
 }
 
 impl ToolRegistry {
@@ -74,6 +76,10 @@ impl ToolRegistry {
     /// 名称冲突或超限时返回错误，不覆盖已有注册。
     pub fn register(&self, tool: Arc<dyn Tool>) -> Result<(), RegistryError> {
         let name = tool.name().to_string();
+
+        if tool.terminal() && !tool.default_wait() {
+            return Err(RegistryError::TerminalRequiresWait(name));
+        }
 
         // 容量检查（软上限，多线程下有微小竞窗，可接受）
         if self.tools.len() >= self.config.max_tools {
